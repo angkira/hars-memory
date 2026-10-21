@@ -53,12 +53,21 @@ function parseContext(ctx: string): {
   entities: { entity: string; type?: string; description?: string }[];
   relations: { entity1: string; entity2: string; description?: string }[];
   sources: Record<string, unknown>[];
+  references: Map<string, string>;
 } {
   const entities: { entity: string; type?: string; description?: string }[] = [];
   const relations: { entity1: string; entity2: string; description?: string }[] = [];
   const sources: Record<string, unknown>[] = [];
+  const references = new Map<string, string>();
   for (const line of (ctx ?? "").split("\n")) {
     const t = line.trim();
+    // Trailing "[ref_id] path" list: the only place some chunk formats carry
+    // the document name. Without it the presentation shows "not recorded".
+    if (t.startsWith("[")) {
+      const m = /^\[([^\]]+)\]\s+(.+)$/.exec(t);
+      if (m) references.set(m[1].trim(), m[2].trim());
+      continue;
+    }
     if (!t.startsWith("{")) continue;
     try {
       const o = JSON.parse(t) as Record<string, unknown>;
@@ -70,7 +79,7 @@ function parseContext(ctx: string): {
       /* skip malformed line */
     }
   }
-  return { entities, relations, sources };
+  return { entities, relations, sources, references };
 }
 
 type XYZ = [number, number, number];
@@ -115,7 +124,7 @@ export function compileLiveTrace(
   const fc = (h["fused_chunks"] ?? []) as RawChunk[];
   if (!Array.isArray(fc) || fc.length === 0) throw new Error("live recall returned no fused_chunks");
   const ctx = typeof r["context"] === "string" ? (r["context"] as string) : "";
-  const { entities, relations, sources } = parseContext(ctx);
+  const { entities, relations, sources, references } = parseContext(ctx);
 
   // Candidate entity vocabulary: context entities known to the graph.
   const vocab = [...new Set(entities.map((e) => e.entity).filter((n) => aux.idxOf.has(n)))];
@@ -361,8 +370,17 @@ export function compileLiveTrace(
 
   const srcBlocks = sources.slice(0, 10).map((s) => {
     const body = typeof s["content"] === "string" ? (s["content"] as string) : "";
+    const refStr = String(s["reference_id"] ?? "?");
+    const provided = typeof s["doc"] === "string" ? (s["doc"] as string).trim() : "";
     const m = DOC_HDR.exec(body);
-    return { ref: String(s["reference_id"] ?? "?"), doc: m ? m[1].trim() : "unknown", preview: body.slice(0, 600) };
+    return {
+      ref: refStr,
+      // The live `context` frame carries doc/section but no content; trust the
+      // provided name, then the document header, then the trailing reference
+      // list, and only then give up.
+      doc: provided || (m ? m[1].trim() : references.get(refStr) || "unknown"),
+      preview: typeof s["preview"] === "string" ? (s["preview"] as string) : body.slice(0, 600),
+    };
   });
 
   const bullets = fc.slice(0, 3).map((c) => {

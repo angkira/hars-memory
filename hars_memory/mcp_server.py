@@ -4521,6 +4521,12 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                                         or ctx_blocks["references"].get(str(item.get("reference_id")), "")
                                     ),
                                 ),
+                                # Short plain-text preview for the presentation's
+                                # context panel; the full chunk stays out of the
+                                # trace frame to keep it small.
+                                "preview": " ".join(
+                                    str(item.get("content", "")).split()
+                                )[:300],
                             }
                             for item in ctx_blocks["sources"][:HARS_MEMORY_TRACE_HITS_CAP]
                         ],
