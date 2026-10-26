@@ -83,7 +83,9 @@ estimator; the choice is printed and stamped on every record. `usage.input` is
 never used for a budget decision.
 
 Usage:
-  KEY -> export OPENROUTER_API_KEY
+  KEY -> export OPENROUTER_API_KEY            (default --provider openrouter)
+         export ANTHROPIC_API_KEY             (--provider anthropic; ANTHROPIC_BASE_URL
+                                               is honoured via a models.json override)
   python3 run_chainreplay.py --calibrate --chains chains.fixture.jsonl --limit 1
   python3 run_chainreplay.py --chains chains.fixture.jsonl \
       --arms baseline,nc,nc-note-only --limit 1 --out runs/chains \
@@ -104,6 +106,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +134,120 @@ WORKDIR = os.path.join(BASE, "workspace")
 
 CTX_WINDOW = 32768          # models.json caps every openrouter model at this
 RESERVE_TOKENS = 2000       # pi's own compaction trigger -> ~30768 tokens
+NATIVE_TRIGGER = CTX_WINDOW - RESERVE_TOKENS   # 30768: the effective native trigger line
+
+# ---- agent / compaction / answer provider (--provider) ----------------------
+# Only the AGENT side switches (replay, compaction summarizer, answers). The
+# judge, the QA generator and the HARS extractor stay on OpenRouter.
+#   pi_flags     -> pi CLI args for the model. openrouter keeps its historical
+#                   `--model openrouter/<m> --provider openrouter`; anthropic uses the
+#                   documented `--provider anthropic --model <m>` (pi README /
+#                   docs/usage.md CLI table; built-in ids such as claude-haiku-4-5).
+#   nc_provider  -> NC_PROVIDER / NC_SUM_PROVIDER consumed by pi-agent/extensions/
+#                   neurocompact.ts (modelRegistry.find(<provider>, <model id>)).
+#   key_env      -> env var pi reads for the key (pi docs/providers.md table).
+#   ctx_window   -> the context window the model registry reports for it.
+#
+# WHY THE WINDOW DOES NOT MOVE ANY COMPACTION POINT: pi's native auto-compaction
+# (trigger contextTokens > contextWindow - reserveTokens) is DISABLED for every run
+# (write_settings: compaction.enabled=False). The only compactions are the forced
+# ones from the extension's `input` hook: threshold = max(FORCE_FLOOR, 0.8 * the
+# MEASURED input tokens of the last replay turn), armed for exactly one boundary
+# turn after each span. So the 32768 cap ("models.json caps every openrouter
+# model") was never what triggered compactions here; spans and their sizes come
+# from the dataset, and the trigger follows the model's own measured context.
+# Haiku and qwen therefore compact at the same span boundaries (each tokenizer
+# yields its own measured threshold). To keep even the DORMANT native line where
+# it is for the openrouter runs (30768), reserveTokens is derived as
+# ctx_window - NATIVE_TRIGGER (openrouter: 2000, exactly as before).
+PROVIDERS = {
+    "openrouter": {"pi_flags": "openrouter", "nc_provider": "openrouter",
+                   "key_env": "OPENROUTER_API_KEY", "ctx_window": CTX_WINDOW},
+    "anthropic": {"pi_flags": "anthropic", "nc_provider": "anthropic",
+                  "key_env": "ANTHROPIC_API_KEY", "ctx_window": 200000},
+}
+DEFAULT_PROVIDER = "openrouter"
+PROVIDER = DEFAULT_PROVIDER      # active provider; main() sets it from --provider
+CTX_WINDOW_OVERRIDE: int | None = None   # --ctx-window
+AGENT_THINKING: str | None = None        # --agent-thinking (None = pi default, no flag)
+# Judge default mirrors judge_v2.JUDGE_MODEL_DEFAULT (do not import: judge_v2 pulls
+# network helpers); override with --judge-model / NC_JUDGE_MODEL.
+JUDGE_MODEL_DEFAULT = "openai/gpt-6-luna"
+
+
+def provider_cfg(provider: str | None = None) -> dict:
+    return PROVIDERS[provider or PROVIDER]
+
+
+def ctx_window_for(provider: str | None = None, override: int | None = None) -> int:
+    ov = CTX_WINDOW_OVERRIDE if override is None else override
+    return int(ov) if ov else int(provider_cfg(provider)["ctx_window"])
+
+
+def reserve_tokens_for(provider: str | None = None, override: int | None = None) -> int:
+    """compaction.reserveTokens that keeps the native trigger line at NATIVE_TRIGGER."""
+    return max(1, ctx_window_for(provider, override) - NATIVE_TRIGGER)
+
+
+_FAMILY_RULES = (   # (substring of the lowercased model id, family); first match wins
+    ("claude", "anthropic"), ("anthropic", "anthropic"),
+    ("gpt", "openai"), ("openai", "openai"),
+    ("qwen", "qwen"), ("glm", "zai"), ("z-ai", "zai"), ("zai", "zai"),
+    ("gemini", "google"), ("gemma", "google"), ("google", "google"),
+    ("llama", "meta"), ("meta-llama", "meta"), ("mistral", "mistral"),
+    ("deepseek", "deepseek"), ("nemotron", "nvidia"), ("grok", "xai"), ("x-ai", "xai"),
+)
+
+
+def model_family(model: str | None) -> str | None:
+    """Vendor family of a model id (None = unknown). `openrouter/` / `anthropic/` route
+    prefixes are looked through only when the rest is not itself recognisable."""
+    m = (model or "").strip().lower()
+    if not m:
+        return None
+    # judge ids look like vendor/model; the model part is the better signal
+    tail = m.split("/")[-1]
+    for needle, fam in _FAMILY_RULES:
+        if needle in tail:
+            return fam
+    for needle, fam in _FAMILY_RULES:
+        if needle in m:
+            return fam
+    return None
+
+
+def family_conflict(agent_model: str, judge_model: str | None) -> str | None:
+    """Error text when judge and agent share a family (both known), else None."""
+    fa, fj = model_family(agent_model), model_family(judge_model)
+    if fa and fj and fa == fj:
+        return (f"judge model {judge_model!r} and agent model {agent_model!r} are the same "
+                f"family ({fa}); the blind judge must be a different family from the agent")
+    return None
+
+
+def key_env_problem(provider: str, environ=None) -> str | None:
+    """Message when the provider's key env var is unset/blank. Never reads or returns a value."""
+    environ = os.environ if environ is None else environ
+    name = provider_cfg(provider)["key_env"]
+    if str(environ.get(name, "")).strip():
+        return None
+    return f"{name} is not set (required by --provider {provider}); export it before a live run"
+
+
+def models_json_override(existing: dict | None, base_url: str | None) -> dict | None:
+    """models.json content with providers.anthropic.baseUrl = ANTHROPIC_BASE_URL.
+
+    pi does NOT read ANTHROPIC_BASE_URL itself: the built-in anthropic models carry an
+    explicit baseUrl (https://api.anthropic.com), which the SDK prefers over its env
+    default; the documented route is a provider override in models.json (pi
+    docs/models.md "Overriding Built-in Providers", built-in models are kept).
+    Returns None when there is nothing to override.
+    """
+    if not (base_url or "").strip():
+        return None
+    out = json.loads(json.dumps(existing or {}))
+    out.setdefault("providers", {}).setdefault("anthropic", {})["baseUrl"] = base_url.strip()
+    return out
 KEEP_RECENT = 200           # tiny on purpose: each compaction must actually DROP
                             # the span (and the previous note) so lag 3/2/1 is real
 FORCE_OFF = 10 ** 9         # force-compaction disarmed
@@ -180,6 +298,8 @@ HARS_EXTRACT_OUT = 1200.0   # per memory_compact: extractor completion tokens (e
 PRICES = {
     "qwen/qwen3.8-flash": (0.15, 0.47),
     "z-ai/glm-5.3-flash": (0.15, 0.50),
+    # Anthropic list price (USD / 1M tok), NOT fetched here: verify before relying on it
+    "claude-haiku-4-5": (1.00, 5.00),
 }
 
 ARM_ORDER = ("baseline", "nc", "nc-note-only")
@@ -344,13 +464,52 @@ def check_alignment(chain: dict) -> list[dict]:
 # HARS MCP client (same shape as run_pool's, with a caller-set timeout:
 # memory_recall on a cold session can take minutes, the 120 s default is too low)
 # ---------------------------------------------------------------------------
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+_NO_PROXY_OPENER = None
+
+
+def is_loopback_url(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in LOOPBACK_HOSTS
+
+
+def opener_for(url: str):
+    """Loopback hosts get an opener with an EMPTY ProxyHandler (http_proxy/https_proxy
+    in the environment are ignored: a proxy in front of 127.0.0.1:8307 produced the
+    HTTP 530 of batch fullB-075703). Any other host: None = the default urlopen path,
+    behaviour untouched."""
+    global _NO_PROXY_OPENER
+    if not is_loopback_url(url):
+        return None
+    if _NO_PROXY_OPENER is None:
+        _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _NO_PROXY_OPENER
+
+
+def describe_exception(e: BaseException) -> str:
+    """`Type: text` for recall_error; HTTP errors also carry the status and the response
+    Server / Via headers (they identify an intermediary, e.g. a Cloudflare 530)."""
+    if isinstance(e, urllib.error.HTTPError):
+        h = e.headers
+        server = (h.get("Server") if h is not None else None) or "-"
+        via = (h.get("Via") if h is not None else None) or "-"
+        return f"{type(e).__name__}: {e} [status={e.code} server={server} via={via}]"
+    return f"{type(e).__name__}: {e}"
+
+
 def _mcp_post(mcp_url: str, payload: dict, sid: str | None, timeout: int):
     headers = {"Content-Type": "application/json",
                "Accept": "application/json, text/event-stream"}
     if sid:
         headers["mcp-session-id"] = sid
     req = urllib.request.Request(mcp_url, data=json.dumps(payload).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    opener = opener_for(mcp_url)
+    opened = (opener.open(req, timeout=timeout) if opener is not None
+              else urllib.request.urlopen(req, timeout=timeout))
+    with opened as r:
         return r.headers.get("mcp-session-id"), r.read().decode()
 
 
@@ -371,7 +530,7 @@ def hars_status(mcp_url: str, session_id: str) -> dict:
     try:
         return mcp_call(mcp_url, "memory_session_status", {"session_id": session_id}, timeout=120)
     except Exception as e:
-        return {"compactions": -1, "error": f"{type(e).__name__}: {e}", "unreachable": True}
+        return {"compactions": -1, "error": describe_exception(e), "unreachable": True}
 
 
 def hars_recall(mcp_url: str, session_id: str, question: str, timeout: int = 600) -> dict:
@@ -383,7 +542,7 @@ def hars_recall(mcp_url: str, session_id: str, question: str, timeout: int = 600
             return {"context": "", "error": f"unexpected payload {type(d).__name__}"}
         return d
     except Exception as e:
-        return {"context": "", "error": f"{type(e).__name__}: {e}"}
+        return {"context": "", "error": describe_exception(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -1111,12 +1270,23 @@ def parse_compaction_events(stdout: str) -> list[dict]:
     return out
 
 
-def pi_args(sid: str, session_dir: str, model: str, extra: list[str], prompt: str) -> list[str]:
+def pi_model_flags(model: str, provider: str | None = None) -> list[str]:
+    prov = provider or PROVIDER
+    if prov == "anthropic":
+        # pi CLI: `--provider <name> --model <id>`; ids are the built-in Anthropic ids
+        # (claude-haiku-4-5), no provider prefix
+        return ["--provider", "anthropic", "--model", model]
+    return ["--model", f"openrouter/{model}", "--provider", "openrouter"]   # unchanged
+
+
+def pi_args(sid: str, session_dir: str, model: str, extra: list[str], prompt: str,
+            provider: str | None = None) -> list[str]:
+    think = ["--thinking", AGENT_THINKING] if AGENT_THINKING else []
     return ["-p", "--mode", "json", "--session-id", sid, "--session-dir", session_dir,
-            "--model", f"openrouter/{model}", "--provider", "openrouter", *extra, prompt]
+            *pi_model_flags(model, provider), *think, *extra, prompt]
 
 
-def sum_reasoning_default(model: str) -> str:
+def sum_reasoning_default(model: str, provider: str | None = None) -> str:
     """Summarizer NC_SUM_REASONING_EFFORT for a model.
 
     "off" keeps the visible cap as the real cap; pi maps it to
@@ -1129,13 +1299,13 @@ def sum_reasoning_default(model: str) -> str:
     the visible-answer budget. An explicit NC_SUM_REASONING_EFFORT in the
     parent environment wins over both defaults.
     """
-    if "glm" in (model or "").lower():
+    if (provider or PROVIDER) == "openrouter" and "glm" in (model or "").lower():
         return "minimal"
     return "off"
 
 
 def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str | None,
-             cap: int | None = None) -> dict:
+             cap: int | None = None, provider: str | None = None) -> dict:
     """Exact env per arm (printed verbatim by --dry-run).
 
     The ONLY env differences between baseline and nc are NC_PERSIST,
@@ -1147,13 +1317,13 @@ def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str 
     env = dict(os.environ)
     env.update({
         "PI_CODING_AGENT_DIR": AGENT_DIR,
-        "NC_PROVIDER": "openrouter",
+        "NC_PROVIDER": provider_cfg(provider)["nc_provider"],
         "NC_MODEL_ID": agent_model,
         "NC_PERSIST": "1" if arm == "nc" else "0",
         "NC_NOTE_ONLY": "1" if arm == "nc-note-only" else "0",
         "NC_SESSION_ID": sid,
         "NC_MCP_URL": mcp_url,
-        "NC_SUM_PROVIDER": "openrouter",
+        "NC_SUM_PROVIDER": provider_cfg(provider)["nc_provider"],
         "NC_SUM_MODEL_ID": sum_model or agent_model,
         "NC_SUM_MAX_TOKENS": str(CAPS[arm] if cap is None else cap),
         # deterministic hard budget for EVERY arm that summarizes: an over-long
@@ -1167,7 +1337,8 @@ def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str 
         # the endpoint accepts it; glm-5.3-flash rejects effort "none" with 400
         # (reasoning is mandatory) and gets "minimal" (sum_reasoning_default)
         "NC_SUM_REASONING_EFFORT": (os.environ.get("NC_SUM_REASONING_EFFORT")
-                                    or sum_reasoning_default(sum_model or agent_model)),
+                                    or sum_reasoning_default(sum_model or agent_model,
+                                                             provider)),
         "NC_FORCE_COMPACT_THRESHOLD": str(FORCE_OFF),
         "NC_INJECT_RECALL": "1" if arm == "nc" else "0",
     })
@@ -1215,6 +1386,42 @@ def write_mcp_url(url: str) -> str:
     st.setdefault("mcpServers", {}).setdefault("hars-memory", {})["url"] = url
     json.dump(st, open(MCP_JSON, "w"), indent=2)
     return backup
+
+
+MODELS_JSON = os.path.join(AGENT_DIR, "models.json")
+
+
+def write_models_base_url(provider: str, environ=None):
+    """For --provider anthropic with ANTHROPIC_BASE_URL set: merge a providers.anthropic.
+    baseUrl override into AGENT_DIR/models.json for the run. Returns a restore token
+    (original text or None if the file did not exist) or False when nothing was done."""
+    environ = os.environ if environ is None else environ
+    if provider != "anthropic":
+        return False
+    new = models_json_override(None, environ.get("ANTHROPIC_BASE_URL"))
+    if new is None:
+        return False
+    orig = None
+    existing: dict = {}
+    if os.path.exists(MODELS_JSON):
+        orig = open(MODELS_JSON).read()
+        existing = json.loads(orig or "{}")
+    merged = models_json_override(existing, environ.get("ANTHROPIC_BASE_URL"))
+    with open(MODELS_JSON, "w") as f:
+        json.dump(merged, f, indent=2)
+    return (orig,)
+
+
+def restore_models_json(token) -> None:
+    if token is False or token is None:
+        return
+    (orig,) = token
+    if orig is None:
+        if os.path.exists(MODELS_JSON):
+            os.remove(MODELS_JSON)
+    else:
+        with open(MODELS_JSON, "w") as f:
+            f.write(orig)
 
 
 def restore(path: str, backup: str) -> None:
@@ -1436,6 +1643,27 @@ def pack_selftest() -> int:
     return 0
 
 
+RECALL_FAIL_STATUSES = ("error", "unknown_session")     # session.status
+RECALL_FAIL_KINDS = ("session_channel", "recall_exception")   # top-level error_kind
+
+
+def recall_degraded(payload: dict) -> str | None:
+    """`session.degraded` ("lexical_only") of a memory_recall payload, else None.
+
+    Degraded = the session channel ran but scored lexically only (query embedding or
+    vector scoring failed): recall still returns content, but not the retrieval the
+    nc arm is meant to test. Distinct from recall_failure_reasons() (dead channel).
+    """
+    sess = (payload or {}).get("session") if isinstance(payload, dict) else None
+    if not isinstance(sess, dict):
+        return None
+    if sess.get("degraded"):
+        return str(sess["degraded"])
+    if str(sess.get("status") or "") == "degraded":
+        return "degraded"
+    return None
+
+
 def recall_failure_reasons(payload: dict, packed: dict) -> list[str]:
     """Why one nc recall is unusable ([] = usable). Pure; selftested offline.
 
@@ -1454,9 +1682,21 @@ def recall_failure_reasons(payload: dict, packed: dict) -> list[str]:
         why.append(f"payload error: {str(payload.get('error'))[:160]}")
     if payload.get("ok") is False:
         why.append("payload ok=false")
+    # top-level error_kind (mcp_server.memory_recall): session_channel = the session
+    # channel itself broke, recall_exception = the graph/LLM pass raised; no_hits is
+    # NOT a kind of its own failure here (an empty raw recall is flagged above)
+    kind = str(payload.get("error_kind") or "")
+    if kind in RECALL_FAIL_KINDS:
+        why.append(f"error_kind={kind}")
     sess = payload.get("session")
     if isinstance(sess, dict):
-        if sess.get("error"):
+        status = str(sess.get("status") or "")
+        if status in RECALL_FAIL_STATUSES:
+            why.append(f"session channel status={status}")
+        # a DEGRADED channel (lexical_only) also carries `error`/`error_kind`
+        # (embedding failure text): that is the distinct recall_degraded condition
+        # (recall_degraded()), not a dead channel
+        if sess.get("error") and not recall_degraded(payload):
             why.append(f"session channel error: {str(sess.get('error'))[:160]}")
         if "vectors_indexed" in sess and not int(sess.get("vectors_indexed") or 0):
             why.append("session channel vectors_indexed=0")
@@ -1465,6 +1705,81 @@ def recall_failure_reasons(payload: dict, packed: dict) -> list[str]:
     if content_units == 0:
         why.append("0 content units packed (header/wrapper only)")
     return why
+
+
+def status_gate_problems(status: dict) -> tuple[list[str], list[str]]:
+    """M4 gate on a memory_session_status dict -> (failures, warnings). Pure.
+
+    entities / vectors_indexed PRESENT and 0 is a failure; vectors_indexed ABSENT is
+    only a warning (older servers do not report it; the per-ask recall gate still
+    checks session.vectors_indexed). entities absent on a session that has persisted
+    compactions is a failure, exactly as the post-C3 gate treats it.
+    """
+    fails: list[str] = []
+    warns: list[str] = []
+    status = status if isinstance(status, dict) else {}
+    if status.get("unreachable"):
+        return [f"memory_session_status unreachable: {status.get('error')}"], warns
+    if int(status.get("compactions") or 0) <= 0:
+        warns.append("session has 0 persisted compactions: entities/vectors_indexed "
+                     "checks not applicable")
+        return fails, warns
+    if "entities" in status:
+        if not int(status.get("entities") or 0):
+            fails.append("memory_session_status.entities == 0 (empty graph: extractor "
+                         "dead or misrouted?)")
+    else:
+        fails.append("memory_session_status exposes no `entities` field")
+    if "vectors_indexed" in status:
+        if not int(status.get("vectors_indexed") or 0):
+            fails.append("memory_session_status.vectors_indexed == 0")
+    else:
+        warns.append("memory_session_status has no vectors_indexed field: vector check "
+                     "deferred to the per-ask recall gate")
+    return fails, warns
+
+
+def preflight_verdict(pf: dict, preflight_session: str | None, allow_degraded: bool = False,
+                      status: dict | None = None) -> tuple[list[str], list[str]]:
+    """Startup memory_recall probe -> (failures, warnings). Pure; selftested offline.
+
+    Without --preflight-session the probe session does not exist, so `unknown_session`
+    and a "no context retrieved" payload error are an honest empty answer, not a dead
+    channel; with one, an empty recall and unknown_session are failures. A degraded
+    session channel (lexical_only) fails the preflight unless allow_degraded.
+    """
+    pf = pf if isinstance(pf, dict) else {}
+    fails: list[str] = []
+    warns: list[str] = []
+    sess = pf.get("session") if isinstance(pf.get("session"), dict) else {}
+    sess_status = str(sess.get("status") or "")
+    sess_err = str(sess.get("error") or "")
+    pf_err = str(pf.get("error") or "")
+    probe_unknown = (sess_status == "unknown_session" and not preflight_session)
+    if "ok" not in pf:
+        fails.append(f"no `ok` field in the recall payload (transport/tool error: "
+                     f"{pf_err[:160] or 'none'})")
+    if sess_status in RECALL_FAIL_STATUSES and not probe_unknown:
+        fails.append(f"session channel status={sess_status}")
+    if sess_err and not probe_unknown and not recall_degraded(pf):
+        fails.append(f"session channel error: {sess_err[:160]}")
+    kind = str(pf.get("error_kind") or "")
+    if kind in RECALL_FAIL_KINDS and not (probe_unknown and kind == "session_channel"):
+        fails.append(f"error_kind={kind}")
+    if pf_err and not (pf_err.startswith("no context retrieved") and not preflight_session):
+        fails.append(f"payload error: {pf_err[:160]}")
+    if preflight_session and not str(pf.get("context") or "").strip():
+        fails.append("empty recall on --preflight-session")
+    deg = recall_degraded(pf)
+    if deg:
+        (warns if allow_degraded else fails).append(
+            f"session channel degraded ({deg})"
+            + (" [--allow-degraded: recorded only]" if allow_degraded else ""))
+    if status is not None:
+        f2, w2 = status_gate_problems(status)
+        fails += f2
+        warns += w2
+    return fails, warns
 
 
 def pack_injection(raw: str, sid: str, budget: int = RECALL_BUDGET_TOKENS,
@@ -1561,12 +1876,15 @@ def cap_advice(target: float, realized: float, cap: float) -> dict:
 
 def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[int],
                  require_no_clip: bool,
-                 recall_failures: dict[str, list[str]] | None = None) -> dict:
+                 recall_failures: dict[str, list[str]] | None = None,
+                 recall_degraded_by_qid: dict[str, str | None] | None = None) -> dict:
     """Per-chain realized-budget record + the parity / clip / recall verdicts.
 
     `recall_failures` maps qid -> recall_failure_reasons(); any non-empty entry
     invalidates the chain (RECALL FAIL): nc without recall is note-only in
-    disguise and must not enter the decision set.
+    disguise and must not enter the decision set. `recall_degraded_by_qid` maps
+    qid -> session.degraded; any degraded ask invalidates the chain (RECALL
+    DEGRADED k/n) unless args.allow_degraded, which keeps it valid but recorded.
     """
     def c3(arm: str) -> dict | None:
         for r in comps_by_arm.get(arm) or []:
@@ -1613,6 +1931,8 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
         "compactions_per_arm": counts,
         "valid": True, "invalid_reasons": [],
         "tokenizer": TOKENIZER, "agent_model": args.agent_model,
+        "agent_provider": getattr(args, "provider", PROVIDER),
+        "judge_model": getattr(args, "judge_model", None),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     rec["nc_memory_total"] = (None if rec["nc_note_tokens"] is None
@@ -1653,6 +1973,19 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
         first = next(iter(sorted(bad_recall)))
         reasons.append(f"RECALL FAIL {len(bad_recall)}/{len(recall_failures)} nc recalls "
                        f"unusable (e.g. {first}: {'; '.join(bad_recall[first])})")
+    degraded = {q: d for q, d in (recall_degraded_by_qid or {}).items() if d}
+    allow_deg = bool(getattr(args, "allow_degraded", False))
+    rec["recall_degraded_qids"] = sorted(degraded)
+    rec["recall_degraded_n"] = len(degraded)
+    rec["allow_degraded"] = allow_deg
+    if degraded:
+        first = sorted(degraded)[0]
+        msg = (f"RECALL DEGRADED {len(degraded)}/{len(recall_degraded_by_qid)} nc recalls "
+               f"served by a degraded session channel (e.g. {first}: {degraded[first]})")
+        if allow_deg:
+            rec["warnings"].append(msg + " [--allow-degraded: chain kept valid]")
+        else:
+            reasons.append(msg)
     if require_no_clip:
         for arm in ("baseline", "nc"):
             n, k = counts[arm], clipped[arm]
@@ -1953,6 +2286,12 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
             raise ChainFailure(f"recall for {qid} injected {packed['total_tokens']} tokens "
                                f"> the {recall_cap}-token cap derived from the C3 note")
         fail = recall_failure_reasons(payload, packed)
+        degraded = recall_degraded(payload)
+        if degraded:
+            print(f"    !!! RECALL DEGRADED {qid}: session channel {degraded} "
+                  f"({str((payload.get('session') or {}).get('error') or '')[:120]})"
+                  + (" [--allow-degraded: recorded only]"
+                     if getattr(args, "allow_degraded", False) else ""), flush=True)
         if fail:
             # not an abort: the chain is marked valid=false by chain_budget()
             # (RECALL FAIL) and its rows are still written for forensics
@@ -1961,7 +2300,11 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
                       "recall_seconds": round(recall_s, 1),
                       "recall_error": recall_error or None,
                       "recall_ok": payload.get("ok"),
-                      "recall_failure_reasons": fail}
+                      "recall_failure_reasons": fail,
+                      "recall_degraded": degraded,
+                      "recall_session_status": (payload.get("session") or {}).get("status")
+                      if isinstance(payload.get("session"), dict) else None,
+                      "recall_error_kind": payload.get("error_kind")}
         tokens.append(packed["total_tokens"])
         print(f"    [nc] {qid}: recall raw={len(raw)}ch ({count_tokens(raw)}tok) -> "
               f"packed body={packed['tokens']}tok injected={packed['total_tokens']}tok "
@@ -2064,6 +2407,12 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
             "recall_error": recall_error or None,
             "recall_failure_reasons": (packed.get("recall_failure_reasons") or [])
                                       if arm == "nc" else [],
+            "recall_degraded": (packed.get("recall_degraded") if arm == "nc" else None),
+            "recall_session_status": (packed.get("recall_session_status")
+                                      if arm == "nc" else None),
+            "recall_error_kind": (packed.get("recall_error_kind") if arm == "nc" else None),
+            "allow_degraded": bool(getattr(args, "allow_degraded", False)),
+            "agent_provider": getattr(args, "provider", PROVIDER),
             # recall wall time, separate from latency_s (= the ask turn only)
             "recall_seconds": recall_s if arm == "nc" else 0.0,
             # ---- realized ask-time memory (this arm, this ask) ----
@@ -2085,7 +2434,8 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
                 "nc_memory_total", "baseline_memory_total", "ratio", "ratio_in_window",
                 "recall_cap", "recall_cap_arithmetic", "recall_cap_clamped_low",
                 "recall_uncapped_target", "baseline_sum_max_tokens", "note_sum_max_tokens",
-                "parity_window", "require_no_clip", "baseline_cap_advice")})
+                "parity_window", "require_no_clip", "baseline_cap_advice",
+                "recall_degraded_n", "recall_degraded_qids")})
             rec["clipped_compactions"] = bctx["clipped_compactions"]
             rec["compactions_per_arm"] = bctx["compactions_per_arm"]
             rec["valid"] = bctx["valid"]
@@ -2245,15 +2595,17 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
               f"dropping {sweep_caps[2:]}")
         sweep_caps = sweep_caps[:2]
     print(f"CALIBRATE run_id={args.run_id} chain={cid} (of {len(chains)}) "
-          f"agent={args.agent_model} mcp={args.mcp} tokenizer={TOKENIZER}")
+          f"provider={args.provider} agent={args.agent_model} mcp={args.mcp} tokenizer={TOKENIZER}")
     print(f"  mem_budget={args.mem_budget} note cap={args.note_sum_max_tokens} "
           f"baseline ceiling={args.baseline_sum_max_tokens} "
           f"recall cap clamp=[{args.recall_cap_min}, {args.recall_cap_max}] "
           f"parity window=[{PARITY_LO}, {PARITY_HI}]")
     print("  no QA asks are made; recall is measured (memory_recall + pack) but never sent")
 
-    settings_backup = write_settings(RESERVE_TOKENS, KEEP_RECENT)
+    settings_backup = write_settings(reserve_tokens_for(args.provider, args.ctx_window),
+                                     KEEP_RECENT)
     mcp_backup = write_mcp_url(args.mcp)
+    models_backup = write_models_base_url(args.provider)
     rows: dict[str, dict] = {}
     sweep_rows: list[dict] = []
     comps_f = open(os.path.join(args.out, "compactions.jsonl"), "w")
@@ -2309,6 +2661,7 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
                     "recall_cap_min": args.recall_cap_min,
                     "recall_cap_max": args.recall_cap_max,
                     "tokenizer": TOKENIZER, "agent_model": args.agent_model,
+                    "agent_provider": args.provider, "judge_model": args.judge_model,
                     "qa_asks": 0, "rows": rows,
                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
         with open(os.path.join(args.out, "calibration.json"), "w") as f:
@@ -2322,6 +2675,7 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
         comps_f.close()
         restore(SETTINGS, settings_backup)
         restore(MCP_JSON, mcp_backup)
+        restore_models_json(models_backup)
 
 
 # ---------------------------------------------------------------------------
@@ -2406,6 +2760,10 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
     print(f"chains file: {args.chains}")
     print(f"agent model: {args.agent_model} | sum model: {args.sum_model or args.agent_model}"
           f" | qa model: {args.qa_model or args.agent_model}")
+    if args.provider != DEFAULT_PROVIDER:
+        print(f"agent provider: {args.provider} (pi --provider {args.provider} --model "
+              f"{args.agent_model}; key env {provider_cfg(args.provider)['key_env']}; "
+              f"judge/QA-gen/HARS extractor stay on openrouter)")
     print(f"arms: {','.join(arms)} | HARS: {args.mcp} | tokenizer: {TOKENIZER}")
     print(f"ask-time memory budget: --mem-budget {args.mem_budget} realized tokens "
           f"(parity window [{PARITY_LO}, {PARITY_HI}] nc/baseline)")
@@ -2508,7 +2866,7 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
             print("    (fork keeps the nc session id; NC_PERSIST=0 means nothing is written)")
     print()
     print("settings.json (rewritten for the duration of a run, then restored):")
-    print(f"  compaction.reserveTokens={RESERVE_TOKENS} "
+    print(f"  compaction.reserveTokens={reserve_tokens_for(args.provider, args.ctx_window)} "
           f"compaction.keepRecentTokens={KEEP_RECENT}")
     bad_total = sum(1 for c in chains for a in check_alignment(c) if not a["ok"])
     if skipped or bad_total:
@@ -2541,8 +2899,37 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="zero API calls, zero HARS writes: print the projection only")
     ap.add_argument("--out", default=os.path.join(BASE, "runs", "chains"))
+    ap.add_argument("--provider", choices=sorted(PROVIDERS), default=DEFAULT_PROVIDER,
+                    help="provider of the AGENT side only (replay, compaction summarizer, "
+                         "answers): openrouter (default, unchanged) or anthropic "
+                         "(`pi --provider anthropic --model <id>`, needs ANTHROPIC_API_KEY, "
+                         "honours ANTHROPIC_BASE_URL). Judge, QA generator and the HARS "
+                         "extractor stay on OpenRouter")
     ap.add_argument("--agent-model", default=DEFAULT_AGENT_MODEL,
-                    help="model that replays, compacts and answers (default %(default)s)")
+                    help="model that replays, compacts and answers (default %(default)s; "
+                         "for --provider anthropic pass a pi id, e.g. claude-haiku-4-5)")
+    ap.add_argument("--judge-model", default=os.environ.get("NC_JUDGE_MODEL")
+                    or JUDGE_MODEL_DEFAULT,
+                    help="blind judge model, used ONLY for the startup family check "
+                         "(refuse to run if its family == the agent model's family); "
+                         "default %(default)s = judge_v2's default")
+    ap.add_argument("--ctx-window", type=int, default=None,
+                    help="context window the agent model reports (default: 32768 for "
+                         "openrouter, 200000 for anthropic); only moves the DORMANT "
+                         "native compaction line, see PROVIDERS comment")
+    ap.add_argument("--agent-thinking", default=None,
+                    choices=["off", "minimal", "low", "medium", "high", "xhigh"],
+                    help="pass `--thinking <level>` to pi for replay/ask turns (default: "
+                         "not passed = pi's default, 'medium' for reasoning models)")
+    ap.add_argument("--key-env", default=None, metavar="VAR",
+                    help="read the provider API key from env var VAR (e.g. EVAL_API_KEY) and "
+                         "expose it to pi under the provider's own variable name; the value is "
+                         "never printed")
+    ap.add_argument("--allow-degraded", action="store_true",
+                    help="a nc ask whose session channel is degraded (lexical_only) "
+                         "normally makes the chain invalid (RECALL DEGRADED k/n); with "
+                         "this flag the chain stays valid and the condition is only "
+                         "recorded (recall_degraded on the rows, warning, preflight warn)")
     ap.add_argument("--qa-model", default=None,
                     help="model that answers the questions (default: --agent-model)")
     ap.add_argument("--sum-model", default=None,
@@ -2583,6 +2970,21 @@ def main() -> int:
                          "(default: a throwaway id, only errors abort)")
     args = ap.parse_args()
     args.qa_model = args.qa_model or args.agent_model
+    global PROVIDER, CTX_WINDOW_OVERRIDE, AGENT_THINKING
+    PROVIDER = args.provider
+    CTX_WINDOW_OVERRIDE = args.ctx_window
+    AGENT_THINKING = args.agent_thinking
+    if args.ctx_window is not None and args.ctx_window <= NATIVE_TRIGGER:
+        print(f"--ctx-window must be > {NATIVE_TRIGGER} (native trigger line "
+              f"{CTX_WINDOW} - {RESERVE_TOKENS}); got {args.ctx_window}", file=sys.stderr)
+        return 2
+    conflict = family_conflict(args.agent_model, args.judge_model)
+    for role, m in (("qa (answer)", args.qa_model), ("sum (compactor)", args.sum_model)):
+        if m and not conflict:
+            conflict = family_conflict(m, args.judge_model)
+    if conflict:
+        print(f"!!! REFUSING: {conflict}", file=sys.stderr)
+        return 2
     if args.mem_budget <= 0:
         print("--mem-budget must be > 0", file=sys.stderr)
         return 2
@@ -2625,6 +3027,17 @@ def main() -> int:
     if RUN_POOL_ERROR:
         print(f"!!! {RUN_POOL_ERROR}", file=sys.stderr)
         return 2
+    if args.key_env:
+        _kv = os.environ.get(args.key_env, "").strip()
+        if not _kv:
+            print(f"!!! --key-env {args.key_env} is not set or empty", file=sys.stderr)
+            return 2
+        os.environ[provider_cfg(args.provider)["key_env"]] = _kv
+    if args.provider != "openrouter":   # openrouter: unchanged (pi/extension report a missing key)
+        key_problem = key_env_problem(args.provider)
+        if key_problem:
+            print(f"!!! {key_problem}", file=sys.stderr)
+            return 2
     # never append to a previous run: mixed runs in one records.jsonl are
     # indistinguishable downstream (merging is an explicit, documented step)
     used = [f for f in ("records.jsonl", "compactions.jsonl", "chain_budget.jsonl",
@@ -2642,18 +3055,27 @@ def main() -> int:
     pf = hars_recall(args.mcp, pf_sid, "preflight: what was the most recent action?",
                      timeout=RECALL_TIMEOUT)
     pf_err = str(pf.get("error") or "")
-    pf_sess_err = str((pf.get("session") or {}).get("error") or "") \
-        if isinstance(pf.get("session"), dict) else ""
-    # without --preflight-session the probe session does not exist, so "no context
-    # retrieved" is an honest empty answer; transport/tool errors are not
-    pf_bad = ("ok" not in pf or pf_sess_err
-              or (pf_err and not (pf_err.startswith("no context retrieved")
-                                  and not args.preflight_session))
-              or (args.preflight_session and not str(pf.get("context") or "").strip()))
+    pf_sess = pf.get("session") if isinstance(pf.get("session"), dict) else {}
+    pf_sess_err = str(pf_sess.get("error") or "")
     print(f"preflight memory_recall({pf_sid}) @ {args.mcp}: ok={pf.get('ok')} "
           f"raw={len(str(pf.get('context') or ''))}ch error={pf_err or 'none'}"
+          + (f" session_status={pf_sess.get('status')}" if pf_sess.get("status") else "")
+          + (f" degraded={pf_sess.get('degraded')}" if pf_sess.get("degraded") else "")
           + (f" session_error={pf_sess_err}" if pf_sess_err else ""), flush=True)
-    if pf_bad:
+    pf_status = None
+    if args.preflight_session:
+        pf_status = hars_status(args.mcp, pf_sid)
+        print(f"preflight memory_session_status({pf_sid}): "
+              f"compactions={pf_status.get('compactions')} "
+              f"entities={pf_status.get('entities', '<absent>')} "
+              f"vectors_indexed={pf_status.get('vectors_indexed', '<absent>')}", flush=True)
+    pf_fails, pf_warns = preflight_verdict(pf, args.preflight_session, args.allow_degraded,
+                                           pf_status)
+    for w in pf_warns:
+        print(f"   [preflight warn] {w}", flush=True)
+    if pf_fails:
+        for w in pf_fails:
+            print(f"   [preflight fail] {w}", flush=True)
         print("!!! PREFLIGHT FAIL: the HARS recall channel is not healthy; aborting before "
               "any replay/compaction spend", file=sys.stderr)
         return 1
@@ -2670,21 +3092,29 @@ def main() -> int:
     comp_path = os.path.join(args.out, "compactions.jsonl")
     budget_path = os.path.join(args.out, "chain_budget.jsonl")
     print(f"run_id={args.run_id} chains={len(chains)} arms={arms} "
-          f"agent={args.agent_model} qa={args.qa_model or '(per chains dataset)'} mcp={args.mcp} "
+          f"provider={args.provider} agent={args.agent_model} qa={args.qa_model or '(per chains dataset)'} mcp={args.mcp} "
           f"tokenizer={TOKENIZER} out={args.out}", flush=True)
     print(f"budget: mem_budget={args.mem_budget} realized tokens | baseline ceiling="
           f"{args.baseline_sum_max_tokens} | nc note cap={args.note_sum_max_tokens} | "
           f"recall cap=clamp({args.mem_budget}-realized_C3_note, {args.recall_cap_min}, "
           f"{args.recall_cap_max}) | parity window=[{PARITY_LO}, {PARITY_HI}] | "
           f"require_no_clip={args.require_no_clip} (limit 1/6)", flush=True)
+    print(f"agent side: provider={args.provider} model={args.agent_model} "
+          f"ctx_window={ctx_window_for(args.provider, args.ctx_window)} "
+          f"reserveTokens={reserve_tokens_for(args.provider, args.ctx_window)} "
+          f"(native trigger line {NATIVE_TRIGGER}, native compaction disabled; compactions "
+          f"are forced) | judge={args.judge_model} (family check passed) | "
+          f"allow_degraded={args.allow_degraded}", flush=True)
     for cid, why in skipped:
         print(f"  !!! skipped chain {cid}: {why}", flush=True)
 
     failures: list[str] = []
     invalid: list[str] = []
     budget_recs: list[dict] = []
-    settings_backup = write_settings(RESERVE_TOKENS, KEEP_RECENT)
+    settings_backup = write_settings(reserve_tokens_for(args.provider, args.ctx_window),
+                                     KEEP_RECENT)
     mcp_backup = write_mcp_url(args.mcp)
+    models_backup = write_models_base_url(args.provider)
     try:
         with open(rec_path, "w") as records_f, open(comp_path, "w") as comps_f, \
                 open(budget_path, "w") as budget_f:
@@ -2769,6 +3199,8 @@ def main() -> int:
                         bctx = chain_budget(cid, args, comps_by_arm, recall_tokens,
                                             args.require_no_clip,
                                             {q: c.get("recall_failure_reasons") or []
+                                             for q, c in recall_cache.items()},
+                                            {q: c.get("recall_degraded")
                                              for q, c in recall_cache.items()})
                         print(f"   BUDGET realized: baseline {bctx['baseline_memory_total']} tok "
                               f"C3 note (of a {args.baseline_sum_max_tokens} ceiling) | nc "
@@ -2841,6 +3273,12 @@ def main() -> int:
                         if bad_rc:
                             reasons.append(f"RECALL FAIL {len(bad_rc)}/{len(recall_cache)} "
                                            f"nc recalls unusable (e.g. {bad_rc[0]})")
+                        deg_rc = sorted(q for q, c in recall_cache.items()
+                                        if c.get("recall_degraded"))
+                        if deg_rc and not args.allow_degraded:
+                            reasons.append(f"RECALL DEGRADED {len(deg_rc)}/{len(recall_cache)} "
+                                           f"nc recalls served by a degraded session channel "
+                                           f"(e.g. {deg_rc[0]})")
                     reasons += post_reasons
                     if aborted:
                         reasons.append(f"chain aborted: {abort_reason}")
@@ -2873,6 +3311,7 @@ def main() -> int:
     finally:
         restore(SETTINGS, settings_backup)
         restore(MCP_JSON, mcp_backup)
+        restore_models_json(models_backup)
 
     print(f"\nrecords -> {rec_path}")
     print(f"compactions -> {comp_path}")
@@ -2892,6 +3331,8 @@ def main() -> int:
             "mean_baseline_memory_tokens": round(mean_base, 1),
             "run_ratio": run_ratio, "window": [PARITY_LO, PARITY_HI],
             "in_window": in_win, "tokenizer": TOKENIZER,
+            "agent_model": args.agent_model, "agent_provider": args.provider,
+            "judge_model": args.judge_model,
             "baseline_cap": args.baseline_sum_max_tokens,
             "note_cap": args.note_sum_max_tokens, "mem_budget": args.mem_budget,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),

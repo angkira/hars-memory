@@ -12,6 +12,9 @@
  * Env: NC_PERSIST, NC_SESSION_ID, NC_MCP_URL, NC_PROVIDER,
  *      NC_MODEL_ID (unused unless default fallback needed),
  *      NC_SUM_PROVIDER/NC_SUM_MODEL_ID (compactor model for the NC arm),
+ *      (NC_PROVIDER / NC_SUM_PROVIDER are any pi provider name, e.g. openrouter or
+ *      anthropic; the runner's --provider sets them, nothing here is provider-specific
+ *      except the thinking=off handling at the streamSimple call),
  *      NC_SUM_REASONING_EFFORT (optional reasoning effort for the summarizer
  *      call, pass-through value e.g. off|low|medium|high), NC_SUM_MAX_TOKENS
  *      (VISIBLE answer budget; default 1536 baseline / 640 nc),
@@ -910,7 +913,15 @@ ${convText}
 				signal,
 				cacheRetention: "none",
 				sessionId: uuidv7(),
-				reasoning: sumThinking as any,
+				// pi-ai's anthropic adapter (streamSimpleAnthropic) switches thinking ON for
+				// any truthy `reasoning`, including the string "off" (it only checks
+				// `!options.reasoning`), so for the anthropic provider "off" must be
+				// passed as an absent level. The openrouter/openai-completions path maps
+				// "off" itself (clampedReasoning === "off"), so it keeps the string:
+				// that call shape is the verified one and must not change.
+				reasoning: (SUM_PROVIDER === "anthropic" && sumThinking === "off"
+					? undefined
+					: sumThinking) as any,
 			}).result();
 			if (process.env.NC_DEBUG === "1") {
 				console.error(`[nc-debug] complete ok stop=${response.stopReason} thinking=${sumThinking} effortSupported=${sumSupportsEffort} maxTokens=${sumMaxTokens} usage=${JSON.stringify(response.usage ?? null)} error=${JSON.stringify(response.errorMessage ?? null)}`);
