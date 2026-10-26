@@ -72,3 +72,35 @@ def extract(stdout: str) -> dict:
             out_total += _num(u.get("output"))
     return {"text": text, "usage": {"input": last_input, "output": out_total},
             "compactions": compactions}
+
+
+def extract_spend(stdout: str) -> dict:
+    """Per-assistant-turn token split + pi's own catalog-priced cost, for ``--budget-usd``.
+
+    Separate from :func:`extract` (whose return shape is pinned by tests). Same event rules:
+    only ``message_end`` assistant messages count. ``turns`` is a list of
+    ``{"input","output","cacheRead","cacheWrite"}`` (``input`` = uncached remainder), so a
+    price tier can be picked per request; ``pi_cost_usd`` = sum of ``usage.cost.total``.
+    """
+    turns: list[dict] = []
+    pi_cost = 0.0
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or ev.get("type") != "message_end":
+            continue
+        msg = ev.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        u = msg.get("usage") or {}
+        c = u.get("cost") if isinstance(u.get("cost"), dict) else {}
+        t = c.get("total")
+        pi_cost += float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else 0.0
+        turns.append({"input": _num(u.get("input")), "output": _num(u.get("output")),
+                      "cacheRead": _num(u.get("cacheRead")), "cacheWrite": _num(u.get("cacheWrite"))})
+    return {"turns": turns, "pi_cost_usd": pi_cost}

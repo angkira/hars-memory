@@ -966,6 +966,24 @@ def table(headers: list[str], rows: list[list[str]]) -> list[str]:
     return out
 
 
+def judge_limitation_lines(meta: dict) -> list[str]:
+    """Report-header lines about judge independence (Amendment C.1): a same-family judge is a
+    stated limitation of every number; an unrecorded judge is flagged."""
+    L: list[str] = []
+    if meta.get("judge_same_family"):
+        L += ["> **LIMITATION - SAME-FAMILY JUDGE**: the judge "
+              f"`{meta.get('judge_model')}` is of the same model family as the agent side "
+              "(run with `--allow-same-family-judge`; the judge MODEL differs from the agent "
+              "model). Self-preference / shared-bias is NOT controlled, so every score, "
+              "hallucination and anchor-judged number below carries that limitation and the "
+              "verdict must be read as 'same-family judged'. "
+              f"Reason recorded: {meta.get('judge_same_family_reason') or 'n/a'}", ""]
+    elif meta.get("judge_same_family") is None and meta.get("judge_model") is None:
+        L += ["> judge independence not recorded (no `--mapping`): cannot state whether the "
+              "judge is cross-family.", ""]
+    return L
+
+
 def render(summary: dict, deltas: dict, slice_data: dict, gates: dict,
            meta: dict, suspicious: list | None = None) -> str:
     L = [f"# Chained-compaction metrics (v2)", ""]
@@ -973,6 +991,7 @@ def render(summary: dict, deltas: dict, slice_data: dict, gates: dict,
         L += ["> **LEGACY / EXPLORATORY**: no nc-graph rows. `nc` is chunk-RAG over the "
               "compaction documents (M2) and, per Protocol Amendment C, is excluded from "
               "the decision set.", ""]
+    L += judge_limitation_lines(meta)
     L.append(f"analysis cell: mem_budget B={meta.get('primary_b')} (budgets present: "
              f"{meta.get('budgets')}); treatment arm: {meta.get('treatment')}")
     L.append("")
@@ -1272,6 +1291,13 @@ def main() -> int:
             "questions": len({r["qid"] for r in prec}), "boot_n": args.boot,
             "mem_ratio_pair": mem_pair, "validity": validity,
             "ctx_records": sum(1 for r in prec if r.get("ctx_present")),
+            "judge_model": (mapping or {}).get("judge_model") or (mapping or {}).get("model"),
+            "judge_same_family": ((mapping or {}).get("judge_same_family")
+                                  if mapping and "judge_same_family" in mapping
+                                  else (True if any(j.get("judge_same_family") for j in judged)
+                                        else (False if judged and any("judge_same_family" in j
+                                                                      for j in judged) else None))),
+            "judge_same_family_reason": (mapping or {}).get("judge_same_family_reason"),
             "treatment": treat, "primary_b": primary_b, "legacy": legacy,
             "budgets": sorted(views, reverse=True)}
     md = render(pv["summary"], pv["deltas"], pv["slices"], gates, meta, suspicious)

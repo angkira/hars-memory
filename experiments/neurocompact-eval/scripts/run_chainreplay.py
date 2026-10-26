@@ -117,11 +117,13 @@ import urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
+import providers  # noqa: E402  (single provider layer: profiles, prices, family check, budget)
+from providers import model_family, family_conflict  # noqa: E402,F401  (re-exported, tests use rc.*)
 try:
-    from run_pool import extract  # noqa: E402  (reused helper: pi JSON-mode stdout parser)
+    from run_pool import extract, extract_spend  # noqa: E402  (reused helper: pi JSON-mode stdout parser)
     RUN_POOL_ERROR = ""
 except ImportError as _e:  # run_pool.py is NOT in this repo (see HANDOFF.md)
-    extract = None
+    extract = extract_spend = None
     RUN_POOL_ERROR = (
         f"run_pool.py is not importable ({_e}). It is a helper from the live working "
         "copy (/tmp/opencode/nc-eval, see experiments/neurocompact-eval/HANDOFF.md "
@@ -165,12 +167,10 @@ NATIVE_TRIGGER = CTX_WINDOW - RESERVE_TOKENS   # 30768: the effective native tri
 # yields its own measured threshold). To keep even the DORMANT native line where
 # it is for the openrouter runs (30768), reserveTokens is derived as
 # ctx_window - NATIVE_TRIGGER (openrouter: 2000, exactly as before).
-PROVIDERS = {
-    "openrouter": {"pi_flags": "openrouter", "nc_provider": "openrouter",
-                   "key_env": "OPENROUTER_API_KEY", "ctx_window": CTX_WINDOW},
-    "anthropic": {"pi_flags": "anthropic", "nc_provider": "anthropic",
-                  "key_env": "ANTHROPIC_API_KEY", "ctx_window": 200000},
-}
+# Built from profiles/<name>.json (providers.py): name -> pi provider / key var / window.
+# `--provider NAME` is the legacy alias of `--profile NAME`; the key `gemini` maps to pi's
+# `google` provider (GEMINI_API_KEY). Profile `custom` is registered at runtime (--pi-provider).
+PROVIDERS = providers.runner_provider_table()
 DEFAULT_PROVIDER = "openrouter"
 PROVIDER = DEFAULT_PROVIDER      # active provider; main() sets it from --provider
 CTX_WINDOW_OVERRIDE: int | None = None   # --ctx-window
@@ -194,40 +194,7 @@ def reserve_tokens_for(provider: str | None = None, override: int | None = None)
     return max(1, ctx_window_for(provider, override) - NATIVE_TRIGGER)
 
 
-_FAMILY_RULES = (   # (substring of the lowercased model id, family); first match wins
-    ("claude", "anthropic"), ("anthropic", "anthropic"),
-    ("gpt", "openai"), ("openai", "openai"),
-    ("qwen", "qwen"), ("glm", "zai"), ("z-ai", "zai"), ("zai", "zai"),
-    ("gemini", "google"), ("gemma", "google"), ("google", "google"),
-    ("llama", "meta"), ("meta-llama", "meta"), ("mistral", "mistral"),
-    ("deepseek", "deepseek"), ("nemotron", "nvidia"), ("grok", "xai"), ("x-ai", "xai"),
-)
-
-
-def model_family(model: str | None) -> str | None:
-    """Vendor family of a model id (None = unknown). `openrouter/` / `anthropic/` route
-    prefixes are looked through only when the rest is not itself recognisable."""
-    m = (model or "").strip().lower()
-    if not m:
-        return None
-    # judge ids look like vendor/model; the model part is the better signal
-    tail = m.split("/")[-1]
-    for needle, fam in _FAMILY_RULES:
-        if needle in tail:
-            return fam
-    for needle, fam in _FAMILY_RULES:
-        if needle in m:
-            return fam
-    return None
-
-
-def family_conflict(agent_model: str, judge_model: str | None) -> str | None:
-    """Error text when judge and agent share a family (both known), else None."""
-    fa, fj = model_family(agent_model), model_family(judge_model)
-    if fa and fj and fa == fj:
-        return (f"judge model {judge_model!r} and agent model {agent_model!r} are the same "
-                f"family ({fa}); the blind judge must be a different family from the agent")
-    return None
+# model_family / family_conflict live in providers.py (imported above)
 
 
 def key_env_problem(provider: str, environ=None) -> str | None:
@@ -303,16 +270,70 @@ HARS_EXTRACT_OUT = 1200.0   # per memory_compact: extractor completion tokens (e
 MICRO_KEYWORD_S = float(os.environ.get("NC_PROJ_KEYWORD_S") or 2.0)   # nc-graph keyword LLM call
 KEYWORD_IN, KEYWORD_OUT = 450.0, 80.0    # per nc-graph recall: keyword-extraction tokens (est)
 
-# USD per 1M tokens (OpenRouter public list, fetched 2026-10-25)
+# USD per 1M tokens: the price tables live in profiles/<name>.json (providers.py, each entry
+# carries status confirmed|catalog_only|unverified + source). PRICES is only the last-resort
+# fallback for ids no profile knows.
 PRICES = {
     "qwen/qwen3.8-flash": (0.15, 0.47),
     "z-ai/glm-5.3-flash": (0.15, 0.50),
-    # Anthropic list price (USD / 1M tok), NOT fetched here: verify before relying on it
-    "claude-haiku-4-5": (1.00, 5.00),
-    # claude-haiku-5-5 (Amendment C agent/answer/extractor model): list price NOT verified,
-    # the haiku-4-5 line is used as a placeholder for the --dry-run projection only
-    "claude-haiku-5-5": (1.00, 5.00),
 }
+ACTIVE_PROFILE = None      # providers.Profile of the run (main() sets it)
+BUDGET = None              # providers.Budget of the run (main() sets it; None in dry-run/tests)
+STOP_RUN = False           # set when the --budget-usd cap is reached: no new chain starts
+SPEND = {"pi_usd": 0.0, "est_hars_usd": 0.0, "est_keyword_usd": 0.0, "unpriced_turns": 0}
+
+
+def price_for(model: str) -> tuple[float, float] | None:
+    hit = providers.lookup_price(model, ACTIVE_PROFILE)
+    if hit:
+        return float(hit[1]["in"]), float(hit[1]["out"])
+    return PRICES.get(model)
+
+
+def charge_pi_spend(pi_argv: list[str], stdout: str) -> None:
+    """Charge one pi call to the --budget-usd cap (profile price table per assistant turn,
+    pi's own catalog cost as fallback)."""
+    global STOP_RUN
+    if BUDGET is None or extract_spend is None:
+        return
+    model = ""
+    if "--model" in pi_argv:
+        model = pi_argv[pi_argv.index("--model") + 1]
+        if model.startswith("openrouter/"):
+            model = model[len("openrouter/"):]
+    sp = extract_spend(stdout)
+    usd = 0.0
+    priced = True
+    for t in sp["turns"]:
+        c = (ACTIVE_PROFILE.cost_usd(model, t["input"], t["output"], t["cacheRead"], t["cacheWrite"])
+             if ACTIVE_PROFILE else None)
+        if c is None:
+            priced = False
+            break
+        usd += c
+    if not priced:
+        usd = sp["pi_cost_usd"]
+        if not usd:
+            SPEND["unpriced_turns"] += len(sp["turns"])
+    SPEND["pi_usd"] += usd
+    BUDGET.charge(usd)
+    if BUDGET.spent >= BUDGET.limit:
+        STOP_RUN = True
+
+
+def charge_estimate(kind: str, model: str, tin: float, tout: float) -> None:
+    """Server-side LLM calls the runner cannot see (HARS extraction, keyword extraction) are
+    charged at a flagged ESTIMATE (constants above) priced at the extractor/keyword model."""
+    global STOP_RUN
+    if BUDGET is None:
+        return
+    p = price_for(model)
+    usd = (tin / 1e6 * p[0] + tout / 1e6 * p[1]) if p else 0.0
+    SPEND[kind] += usd
+    BUDGET.charge(usd)
+    if BUDGET.spent >= BUDGET.limit:
+        STOP_RUN = True
+
 
 # Amendment C (2026-10-26): the old `nc` arm is chunk-RAG over the compaction documents
 # (M2: no keywords -> graph branch skipped) and is renamed `nc-chunks`. `nc-graph` is a fork
@@ -1298,11 +1319,16 @@ def run_pi_turn(args: list[str], env: dict, timeout: int) -> dict:
     Same retry semantics as run_pool.run_pi, but stderr is preserved because the
     extension's [nc-metrics] line lives there.
     """
+    if BUDGET is not None and BUDGET.spent >= BUDGET.limit:
+        raise ChainFailure(f"BUDGET STOP: --budget-usd ${BUDGET.limit:.2f} reached "
+                           f"(spent ${BUDGET.spent:.4f})")
+
     def once() -> tuple[str, str, float]:
         t0 = time.time()
         try:
             p = subprocess.run(["pi", *args], env=env, cwd=WORKDIR, timeout=timeout,
                                capture_output=True, text=True)
+            charge_pi_spend(args, p.stdout or "")
             return p.stdout or "", p.stderr or "", time.time() - t0
         except subprocess.TimeoutExpired:
             return "", "timeout", time.time() - t0
@@ -1354,11 +1380,11 @@ def parse_compaction_events(stdout: str) -> list[dict]:
 
 def pi_model_flags(model: str, provider: str | None = None) -> list[str]:
     prov = provider or PROVIDER
-    if prov == "anthropic":
-        # pi CLI: `--provider <name> --model <id>`; ids are the built-in Anthropic ids
-        # (claude-haiku-4-5), no provider prefix
-        return ["--provider", "anthropic", "--model", model]
-    return ["--model", f"openrouter/{model}", "--provider", "openrouter"]   # unchanged
+    if prov == "openrouter":
+        return ["--model", f"openrouter/{model}", "--provider", "openrouter"]   # unchanged
+    # pi CLI: `--provider <pi provider> --model <id>`; ids are the bare catalog ids
+    # (claude-haiku-5-5, gemini-3.7-flash), no provider prefix
+    return ["--provider", provider_cfg(prov)["pi_flags"], "--model", model]
 
 
 def pi_args(sid: str, session_dir: str, model: str, extra: list[str], prompt: str,
@@ -2437,6 +2463,9 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
             print(f"    [{arm}] C{idx}: stop={rec['finish_reason']} "
                   f"summary={len(summary)}ch/{ntok}tok cap={cap} persisted={persisted} "
                   f"before={rec['tokens_before']} after={rec['tokens_after']}", flush=True)
+            if arm == ARM_CHUNKS:   # HARS extraction runs server-side: flagged estimate
+                charge_estimate("est_hars_usd", args.extractor_model, HARS_EXTRACT_IN,
+                                HARS_EXTRACT_OUT)
             if arm == ARM_CHUNKS and not rec["persisted"]:
                 raise ChainFailure(f"span {idx}: memory_compact did not persist to HARS")
         # ---- gate: 3 compactions for nc-chunks (the persisting arm) ----
@@ -2679,7 +2708,13 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
         if arm == ARM_GRAPH:
             g = packed.get("graph") or {}
             rec.update(g)
-            rec["keyword_model"] = getattr(args, "extractor_model", EXTRACTOR_MODEL_DEFAULT)
+            # keyword LLM call: server-reported cost/tokens when present, else the flagged estimate
+            kin, kout = g.get("keyword_tokens_in"), g.get("keyword_tokens_out")
+            charge_estimate("est_keyword_usd", getattr(args, "keyword_model", None)
+                            or args.extractor_model,
+                            kin if kin is not None else KEYWORD_IN,
+                            kout if kout is not None else KEYWORD_OUT)
+            rec["keyword_model"] = getattr(args, "keyword_model", None) or args.extractor_model
             rec["session_graph_mode"] = GRAPH_MODE
             # the keyword call is part of the ask: counted in latency (recall_seconds is
             # added by metrics_v2) and in cost/question (keyword tokens when reported)
@@ -2955,11 +2990,11 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
                              mem_budget - est_note_nc))
 
     def prices(model: str) -> tuple[float, float]:
-        return PRICES.get(model, (float(os.environ.get("NC_PRICE_IN") or 0.15),
-                                  float(os.environ.get("NC_PRICE_OUT") or 0.47)))
+        return price_for(model) or (float(os.environ.get("NC_PRICE_IN") or 0.15),
+                                    float(os.environ.get("NC_PRICE_OUT") or 0.47))
 
     pin, pout = prices(agent_model)
-    gin, gout = prices("z-ai/glm-5.3-flash")
+    gin, gout = prices(getattr(args, "extractor_model", None) or "z-ai/glm-5.3-flash")
     est = {"replay_in": 0, "replay_out": 0, "comp_in": 0, "comp_out": 0,
            "ask_in": 0, "ask_out": 0, "replay_s": 0.0, "comp_s": 0.0, "ask_s": 0.0,
            "compactions": 0, "asks": 0, "recall_s": 0.0}
@@ -3024,11 +3059,15 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
     print(f"chains file: {args.chains}")
     print(f"agent model: {args.agent_model} | sum model: {args.sum_model or args.agent_model}"
           f" | qa model: {args.qa_model or args.agent_model}")
+    print(f"profile: {args.provider} | judge {args.judge_model} | extractor {args.extractor_model} "
+          f"| keyword {args.keyword_model} | same-family judge: "
+          f"{args.judge_verdict['judge_same_family']}")
     if args.provider != DEFAULT_PROVIDER:
         print(f"agent provider: {args.provider} (pi --provider {args.provider} --model "
               f"{args.agent_model}; key env {provider_cfg(args.provider)['key_env']}; "
-              f"judge/QA-gen stay on openrouter; the HARS extractor is the "
-              f"server's config, recorded as --extractor-model {args.extractor_model})")
+              f"judge {args.judge_model} / extractor {args.extractor_model} follow the profile; "
+              f"the HARS server is configured separately: providers.py hars-env --profile "
+              f"{args.provider})")
     print(f"arms: {','.join(arms)} | HARS: {args.mcp} | tokenizer: {TOKENIZER}")
     print(f"ask-time memory budget: --mem-budget {args.mem_budget} realized tokens "
           f"(parity window [{PARITY_LO}, {PARITY_HI}] nc/baseline)")
@@ -3097,7 +3136,7 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
               f"{MICRO_BASELINE_S:.0f}s / {MICRO_NOTE_S:.0f}s)")
         print(f"  projected cost: agent ${pr['usd_agent']:.4f} "
               f"({pr['agent_model']} ${pr['pin']:.2f}/${pr['pout']:.2f} per 1M) + HARS extractor "
-              f"${pr['usd_hars']:.4f} (z-ai/glm-5.3-flash) = ${pr['usd_total']:.4f}")
+              f"${pr['usd_hars']:.4f} ({args.extractor_model}) = ${pr['usd_total']:.4f}")
         totals["compactions"] += sum(per_arm.values())
         totals["asks"] += len(c["qa"]) * len(arms)
         totals["wall"] += e["replay_s"] + e["comp_s"] + e["ask_s"] + e["recall_s"]
@@ -3108,6 +3147,15 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
     print(f"TOTAL projected: {totals['compactions']} compactions, {totals['asks']} asks, "
           f"~{totals['wall'] / 60:.1f} min, ${totals['usd']:.4f}")
 
+    _n = len(getattr(args, "budgets", None) or []) or 1
+    _proj = totals["usd"] * _n
+    if args.budget_usd is not None:
+        print(f"BUDGET CHECK: projected ~${_proj:.4f} vs --budget-usd ${args.budget_usd:.2f}: "
+              + ("fits" if _proj <= args.budget_usd else
+                 "EXCEEDS the cap -> the live run would stop on the cap (primary B first)"))
+    else:
+        print(f"projected ~${_proj:.4f}; a live run REQUIRES --budget-usd (hard cap, "
+              "Amendment C.1)")
     budgets = list(getattr(args, "budgets", None) or [])
     if str(getattr(args, "mem_budgets", "")).strip():
         n_b = len(budgets)
@@ -3174,6 +3222,69 @@ ASK_TIMEOUT = 900
 RECALL_TIMEOUT = 600
 
 
+def write_json(path: str, obj) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+
+
+def embedder_info(mcp_url: str, declared: str | None, environ=None, mcp_fn=None) -> dict:
+    """Which embedder this run used: the id the SERVER reports (memory_status.configured_models)
+    wins; else --embedder-id; else the runner's own HARS_MEMORY_EMBED_* env (which may differ from
+    the server's). A hash-shim / unknown embedder is flagged, never silently accepted."""
+    environ = os.environ if environ is None else environ
+    mcp_fn = mcp_fn or mcp_call
+    reported, err = None, None
+    try:
+        st = mcp_fn(mcp_url, "memory_status", {}, timeout=30)
+        reported = ((st or {}).get("configured_models") or {}).get("embedder")
+    except Exception as e:  # noqa: BLE001
+        err = describe_exception(e)
+    env_id = (environ.get("HARS_MEMORY_EMBED_HTTP_MODEL") or environ.get("HARS_MEMORY_EMBED_MODEL")
+              or "") or None
+    if reported:
+        eid, src = str(reported), "server memory_status.configured_models.embedder"
+    elif declared:
+        eid, src = declared, "--embedder-id"
+    elif env_id:
+        eid, src = env_id, "runner env HARS_MEMORY_EMBED_* (NOT verified against the server)"
+    else:
+        eid, src = None, "unknown"
+    flags = []
+    if not eid:
+        flags.append("EMBEDDER UNKNOWN: record it (--embedder-id) before trusting any recall number")
+    elif "hash" in eid.lower() or "shim" in eid.lower():
+        flags.append("hash/shim embedder: debugging setup only, not a decision-grade configuration")
+    return {"id": eid, "source": src, "server_reported": reported, "declared": declared,
+            "env": {k: environ.get(k) for k in ("HARS_MEMORY_EMBED_MODEL", "HARS_MEMORY_EMBED_PROVIDER",
+                                                 "HARS_MEMORY_EMBED_HTTP_MODEL") if environ.get(k)},
+            "status_error": err, "flags": flags}
+
+
+def build_manifest(args, arms, budgets, chains) -> dict:
+    v = args.judge_verdict
+    emb = embedder_info(args.mcp, args.embedder_id)
+    for f in emb["flags"]:
+        print(f"!!! {f}", file=sys.stderr, flush=True)
+    return {
+        "tool": "run_chainreplay.py", "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "argv": sys.argv, "profile": args.provider,
+        "profile_file": os.path.join(providers.PROFILES_DIR, f"{args.provider}.json"),
+        "models": {"agent": args.agent_model, "answer": args.qa_model, "summarizer": args.sum_model,
+                   "judge": args.judge_model, "extractor": args.extractor_model,
+                   "keyword": args.keyword_model},
+        "prices": {m: (ACTIVE_PROFILE.price(m) if ACTIVE_PROFILE else None)
+                   for m in sorted({args.agent_model, args.qa_model, args.sum_model,
+                                    args.judge_model, args.extractor_model, args.keyword_model})
+                   if m},
+        "judge_same_family": v["judge_same_family"], "judge_same_family_reason": v["reason"],
+        "embedder": emb, "hars_mcp": args.mcp, "arms": arms, "mem_budgets": budgets,
+        "chains": [c["chain_id"] for c in chains], "tokenizer": TOKENIZER,
+        "budget_usd": BUDGET.limit if BUDGET else None, "run_id": args.run_id,
+        "note": "HARS server extractor/keyword config is NOT read back except the embedder; "
+                "export it with `providers.py hars-env --profile NAME` before starting the server",
+    }
+
+
 def main() -> int:
     if "--pack-selftest" in sys.argv or os.environ.get("NC_PACK_SELFTEST") == "1":
         return pack_selftest()
@@ -3190,20 +3301,30 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="zero API calls, zero HARS writes: print the projection only")
     ap.add_argument("--out", default=os.path.join(BASE, "runs", "chains"))
-    ap.add_argument("--provider", choices=sorted(PROVIDERS), default=DEFAULT_PROVIDER,
-                    help="provider of the AGENT side only (replay, compaction summarizer, "
-                         "answers): openrouter (default, unchanged) or anthropic "
-                         "(`pi --provider anthropic --model <id>`, needs ANTHROPIC_API_KEY, "
-                         "honours ANTHROPIC_BASE_URL). Judge, QA generator and the HARS "
-                         "extractor stay on OpenRouter")
-    ap.add_argument("--agent-model", default=DEFAULT_AGENT_MODEL,
-                    help="model that replays, compacts and answers (default %(default)s; "
-                         "for --provider anthropic pass a pi id, e.g. claude-haiku-4-5)")
-    ap.add_argument("--judge-model", default=os.environ.get("NC_JUDGE_MODEL")
-                    or JUDGE_MODEL_DEFAULT,
-                    help="blind judge model, used ONLY for the startup family check "
-                         "(refuse to run if its family == the agent model's family); "
-                         "default %(default)s = judge_v2's default")
+    providers.add_profile_args(ap, roles=("agent", "answer", "summarizer", "judge",
+                                          "extractor", "keyword"))
+    ap.add_argument("--provider", choices=sorted(providers.PROFILE_NAMES), default=None,
+                    help="LEGACY ALIAS: provider of the agent side only (pi provider, key var, "
+                         "window). Role-model defaults stay the pre-profile ones (qwen agent, "
+                         "gpt-6-luna judge, haiku-5-5 extractor); use --profile NAME for "
+                         "profile-driven role defaults")
+    ap.add_argument("--agent-model", default=None,
+                    help="alias of --model-agent: model that replays, compacts and answers "
+                         "(default: the profile's agent model; legacy default %s)"
+                         % DEFAULT_AGENT_MODEL)
+    ap.add_argument("--judge-model", default=None,
+                    help="alias of --model-judge: blind judge model, used ONLY for the startup "
+                         "family check (default: the profile's judge; env NC_JUDGE_MODEL; "
+                         "legacy default %s)" % JUDGE_MODEL_DEFAULT)
+    ap.add_argument("--allow-same-family-judge", action="store_true",
+                    help="accept a judge of the SAME family as the agent side, only if the "
+                         "judge MODEL differs from every agent-side model. Loud warning; "
+                         "recorded as judge_same_family=true + reason in run_manifest.json "
+                         "and the judge mapping, and printed as a limitation by metrics_v2")
+    providers.add_budget_arg(ap)
+    ap.add_argument("--embedder-id", default=None,
+                    help="embedder model id to record in run_manifest.json when the server "
+                         "does not report one (server-reported id wins)")
     ap.add_argument("--ctx-window", type=int, default=None,
                     help="context window the agent model reports (default: 32768 for "
                          "openrouter, 200000 for anthropic); only moves the DORMANT "
@@ -3222,9 +3343,11 @@ def main() -> int:
                          "this flag the chain stays valid and the condition is only "
                          "recorded (recall_degraded on the rows, warning, preflight warn)")
     ap.add_argument("--qa-model", default=None,
-                    help="model that answers the questions (default: --agent-model)")
+                    help="alias of --model-answer: model that answers the questions "
+                         "(default: --agent-model if given, else the profile's answer model)")
     ap.add_argument("--sum-model", default=None,
-                    help="compactor model (default: --agent-model)")
+                    help="alias of --model-summarizer: compactor model (default: --agent-model "
+                         "if given, else the profile's summarizer)")
     ap.add_argument("--mcp", default=os.environ.get("NC_CHAIN_MCP", DEFAULT_MCP))
     ap.add_argument("--run-id", default=os.environ.get("NC_CHAIN_RUN_ID") or time.strftime("%H%M%S"))
     # ---- realized-token budget (see the module docstring) ----
@@ -3237,9 +3360,11 @@ def main() -> int:
                          "--mem-budget/--baseline-sum-max-tokens/--note-sum-max-tokens/"
                          "--recall-cap-min/-max. Records carry mem_budget; empty = single "
                          "--mem-budget run, byte-compatible with the pre-amendment runner")
-    ap.add_argument("--extractor-model", default=EXTRACTOR_MODEL_DEFAULT,
-                    help="HARS extractor / session-graph keyword model, RECORDED only (the "
-                         "server is configured separately); default %(default)s")
+    ap.add_argument("--extractor-model", default=None,
+                    help="alias of --model-extractor: HARS extractor model, RECORDED + priced "
+                         "only (the server is configured separately: `providers.py hars-env "
+                         "--profile NAME`); default: the profile's, legacy %s"
+                         % EXTRACTOR_MODEL_DEFAULT)
     ap.add_argument("--mem-budget", type=int, default=DEFAULT_MEM_BUDGET,
                     help="ask-time memory target in REALIZED tokens, both arms "
                          "(default %(default)s); the nc recall cap is derived from it")
@@ -3272,22 +3397,68 @@ def main() -> int:
                          "memory_recall preflight; then an EMPTY recall also aborts "
                          "(default: a throwaway id, only errors abort)")
     args = ap.parse_args()
-    args.qa_model = args.qa_model or args.agent_model
-    global PROVIDER, CTX_WINDOW_OVERRIDE, AGENT_THINKING
+    global PROVIDER, CTX_WINDOW_OVERRIDE, AGENT_THINKING, ACTIVE_PROFILE, BUDGET
+    # ---- profile + per-role model resolution (--model-<role> > legacy flag > profile) ----
+    # --provider NAME (no --profile) = legacy alias: provider only, role defaults as before
+    legacy_profile = args.profile is None
+    if args.profile and args.provider and args.profile != args.provider:
+        print(f"--profile {args.profile} and --provider {args.provider} disagree", file=sys.stderr)
+        return 2
+    prof_name = args.profile or args.provider or DEFAULT_PROVIDER
+    try:
+        prof = providers.load_profile(prof_name, base_url=args.base_url,
+                                      pi_provider=args.pi_provider)
+    except providers.ProviderError as e:
+        print(f"!!! {e}", file=sys.stderr)
+        return 2
+    if prof_name == "custom":
+        if not (prof.pi.get("provider") and prof.base_url):
+            print("!!! profile custom needs --base-url and --pi-provider", file=sys.stderr)
+            return 2
+        PROVIDERS["custom"] = {"pi_flags": prof.pi["provider"], "nc_provider": prof.pi["provider"],
+                               "key_env": prof.pi["key_env"], "ctx_window": int(prof.pi["ctx_window"])}
+    ACTIVE_PROFILE = prof
+    args.provider = prof_name
+    pm = providers.resolve_models(prof, {})
+    ov = providers.role_overrides(args, ("agent", "answer", "summarizer", "judge",
+                                         "extractor", "keyword"))
+    agent_given = ov.get("agent") or args.agent_model
+    args.agent_model = agent_given or (DEFAULT_AGENT_MODEL if legacy_profile else pm["agent"])
+    args.qa_model = (ov.get("answer") or args.qa_model
+                     or (args.agent_model if (agent_given or legacy_profile) else pm["answer"]))
+    args.sum_model = (ov.get("summarizer") or args.sum_model
+                      or (args.agent_model if (agent_given or legacy_profile) else pm["summarizer"]))
+    args.judge_model = (ov.get("judge") or args.judge_model or os.environ.get("NC_JUDGE_MODEL")
+                        or (JUDGE_MODEL_DEFAULT if legacy_profile else pm["judge"]))
+    args.extractor_model = (ov.get("extractor") or args.extractor_model
+                            or (EXTRACTOR_MODEL_DEFAULT if legacy_profile else pm["extractor"]))
+    args.keyword_model = ov.get("keyword") or (EXTRACTOR_MODEL_DEFAULT if legacy_profile
+                                               else pm["keyword"]) or args.extractor_model
+    missing = [r for r, m in (("agent", args.agent_model), ("judge", args.judge_model),
+                              ("extractor", args.extractor_model)) if not m]
+    if missing:
+        print(f"!!! no model for role(s) {missing}: pass --model-<role> (profile {prof_name} "
+              "has no default)", file=sys.stderr)
+        return 2
     PROVIDER = args.provider
+    global STOP_RUN
+    STOP_RUN = False
+    SPEND.update({"pi_usd": 0.0, "est_hars_usd": 0.0, "est_keyword_usd": 0.0, "unpriced_turns": 0})
     CTX_WINDOW_OVERRIDE = args.ctx_window
     AGENT_THINKING = args.agent_thinking
     if args.ctx_window is not None and args.ctx_window <= NATIVE_TRIGGER:
         print(f"--ctx-window must be > {NATIVE_TRIGGER} (native trigger line "
               f"{CTX_WINDOW} - {RESERVE_TOKENS}); got {args.ctx_window}", file=sys.stderr)
         return 2
-    conflict = family_conflict(args.agent_model, args.judge_model)
-    for role, m in (("qa (answer)", args.qa_model), ("sum (compactor)", args.sum_model)):
-        if m and not conflict:
-            conflict = family_conflict(m, args.judge_model)
-    if conflict:
-        print(f"!!! REFUSING: {conflict}", file=sys.stderr)
+    verdict = providers.judge_family_verdict([args.agent_model, args.qa_model, args.sum_model],
+                                             args.judge_model, args.allow_same_family_judge)
+    args.judge_verdict = verdict
+    if not verdict["ok"]:
+        print(f"!!! REFUSING: {verdict['error']}", file=sys.stderr)
         return 2
+    if verdict["warning"]:
+        print("\n" + "!" * 78 + "\n" + verdict["warning"] + "\n" + "!" * 78 + "\n",
+              file=sys.stderr, flush=True)
     if args.mem_budget <= 0:
         print("--mem-budget must be > 0", file=sys.stderr)
         return 2
@@ -3351,6 +3522,12 @@ def main() -> int:
     # ---- live modes only below ----
     if RUN_POOL_ERROR:
         print(f"!!! {RUN_POOL_ERROR}", file=sys.stderr)
+        return 2
+    try:
+        BUDGET = providers.Budget(args.budget_usd)
+    except providers.ProviderError as e:
+        print(f"!!! {e} (--budget-usd is mandatory for every live run; --dry-run prints the "
+              "projection to size it)", file=sys.stderr)
         return 2
     if args.key_env:
         _kv = os.environ.get(args.key_env, "").strip()
@@ -3433,6 +3610,12 @@ def main() -> int:
     for cid, why in skipped:
         print(f"  !!! skipped chain {cid}: {why}", flush=True)
 
+    manifest_path = os.path.join(args.out, "run_manifest.json")
+    manifest = build_manifest(args, arms, budgets, chains)
+    write_json(manifest_path, manifest)
+    print(f"run manifest -> {manifest_path} (profile {args.provider}, embedder "
+          f"{manifest['embedder']['id']!r} [{manifest['embedder']['source']}], budget "
+          f"${BUDGET.limit:.2f})", flush=True)
     failures: list[str] = []
     invalid: list[str] = []
     budget_recs: list[dict] = []
@@ -3444,9 +3627,16 @@ def main() -> int:
         with open(rec_path, "w") as records_f, open(comp_path, "w") as comps_f, \
                 open(budget_path, "w") as budget_f:
             for args in per_budget_args:
+                if STOP_RUN:
+                    break
                 ctx_budget_banner(args, args0)
                 for chain in chains:
                     cid = chain["chain_id"]
+                    if STOP_RUN:
+                        print(f"\n!!! BUDGET STOP before chain {cid}: --budget-usd "
+                              f"${BUDGET.limit:.2f} reached (spent ${BUDGET.spent:.4f}); the "
+                              "remaining chains/budget cells are NOT run", flush=True)
+                        break
                     print(f"\n== chain {cid} (session {chain['session_id']}, "
                           f"{len(chain['qa'])} questions)", flush=True)
                     align = check_alignment(chain)
@@ -3674,6 +3864,17 @@ def main() -> int:
         restore(MCP_JSON, mcp_backup)
         restore_models_json(models_backup)
 
+    manifest["ended_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    manifest["spend"] = {"budget_usd": BUDGET.limit, "spent_usd": round(BUDGET.spent, 6),
+                         "calls": BUDGET.calls, "stopped_by_budget": STOP_RUN,
+                         **{k: round(v, 6) if isinstance(v, float) else v for k, v in SPEND.items()},
+                         "note": "pi_usd = measured agent-side turns; est_* = flagged estimates of "
+                                 "server-side HARS extraction / keyword calls"}
+    write_json(manifest_path, manifest)
+    print(f"spend: ${BUDGET.spent:.4f} of --budget-usd ${BUDGET.limit:.2f} "
+          f"(pi ${SPEND['pi_usd']:.4f}, est. HARS extraction ${SPEND['est_hars_usd']:.4f}, "
+          f"est. keyword ${SPEND['est_keyword_usd']:.4f}"
+          f"{', STOPPED BY BUDGET' if STOP_RUN else ''})", flush=True)
     print(f"\nrecords -> {rec_path}")
     print(f"compactions -> {comp_path}")
     print(f"chain budgets -> {budget_path}")
@@ -3718,6 +3919,8 @@ def main() -> int:
             "in_window": main_entry.get("in_window"), "tokenizer": TOKENIZER,
             "agent_model": args.agent_model, "agent_provider": args.provider,
             "judge_model": args.judge_model,
+            "judge_same_family": args.judge_verdict["judge_same_family"],
+            "profile": args.provider,
             "baseline_cap": args.baseline_sum_max_tokens,
             "note_cap": args.note_sum_max_tokens, "mem_budget": prim["mem_budget"],
             "by_budget": {str(k): v for k, v in by_b.items()},

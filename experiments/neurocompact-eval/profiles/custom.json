@@ -1,0 +1,27 @@
+{
+ "name": "custom",
+ "description": "Any OpenAI-compatible endpoint: pass --base-url and --key-env, and --model-<role> for every role. pi agent needs a pi provider already configured in models.json (--pi-provider).",
+ "family": null,
+ "base_url": null,
+ "chat_path": "/chat/completions",
+ "auth": {
+  "style": "bearer",
+  "headers": {}
+ },
+ "key_env": "EVAL_API_KEY",
+ "sampling": {
+  "policy": "allow"
+ },
+ "pi": {
+  "provider": null,
+  "key_env": "EVAL_API_KEY",
+  "ctx_window": 32768,
+  "model_style": "bare"
+ },
+ "models": {},
+ "hars": {
+  "extractor_provider": "local",
+  "key_env": "EVAL_API_KEY"
+ },
+ "prices": {}
+}

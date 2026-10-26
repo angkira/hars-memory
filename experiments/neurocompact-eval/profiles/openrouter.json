@@ -1,0 +1,98 @@
+{
+ "name": "openrouter",
+ "description": "OpenRouter. Same Haiku agent/extractor; judge openai/gpt-6-luna is another family (no flag needed).",
+ "family": null,
+ "base_url": "https://openrouter.ai/api/v1",
+ "chat_path": "/chat/completions",
+ "auth": {
+  "style": "bearer",
+  "headers": {
+   "X-Title": "neurocompact-eval"
+  }
+ },
+ "key_env": "OPENROUTER_API_KEY",
+ "sampling": {
+  "policy": "allow",
+  "omit_for_families": [
+   "anthropic"
+  ],
+  "note": "temperature sent for non-Anthropic models only"
+ },
+ "usage_include": true,
+ "pi": {
+  "provider": "openrouter",
+  "key_env": "OPENROUTER_API_KEY",
+  "ctx_window": 32768,
+  "model_style": "openrouter_prefixed"
+ },
+ "models": {
+  "agent": "anthropic/claude-haiku-5.5",
+  "answer": "anthropic/claude-haiku-5.5",
+  "summarizer": "anthropic/claude-haiku-5.5",
+  "qa_generator": "z-ai/glm-5.3-flash",
+  "judge": "openai/gpt-6-luna",
+  "extractor": "anthropic/claude-haiku-5.5",
+  "keyword": "anthropic/claude-haiku-5.5"
+ },
+ "hars": {
+  "extractor_provider": "openrouter",
+  "key_env": "OPENROUTER_API_KEY"
+ },
+ "prices": {
+  "anthropic/claude-haiku-5.5": {
+   "in": 0.1,
+   "out": 0.5,
+   "status": "catalog_only",
+   "source": "pi-ai 1.4.0 openrouter catalog (equals Anthropic list price); OpenRouter page not fetched",
+   "as_of": "2026-10-26",
+   "cache_read": 0.01,
+   "cache_write": 0.125,
+   "tier": {
+    "input_above_tokens": 100000,
+    "in": 0.5,
+    "out": 2.5,
+    "cache_read": 0.05,
+    "cache_write": 0.625
+   }
+  },
+  "anthropic/claude-sonnet-5.5": {
+   "in": 2.0,
+   "out": 10.0,
+   "status": "catalog_only",
+   "source": "pi-ai 1.4.0 openrouter catalog",
+   "as_of": "2026-10-26",
+   "cache_read": 0.1,
+   "cache_write": 2.5
+  },
+  "openai/gpt-6-luna": {
+   "in": 0.1,
+   "out": 0.5,
+   "status": "confirmed",
+   "source": "WebSearch 2026-10-26 (getmaxim, computeprices, llmreference: agree) + pi-ai 1.4.0 catalog; OpenRouter page not fetched",
+   "as_of": "2026-10-26",
+   "cache_read": 0.01,
+   "cache_write": 0.125,
+   "tier": {
+    "input_above_tokens": 272000,
+    "in": 0.2,
+    "out": 0.75,
+    "cache_read": 0.02,
+    "cache_write": 0.25
+   }
+  },
+  "qwen/qwen3.8-flash": {
+   "in": 0.15,
+   "out": 0.47,
+   "status": "confirmed",
+   "source": "OpenRouter public list fetched 2026-10-25 (legacy runner PRICES)",
+   "as_of": "2026-10-26"
+  },
+  "z-ai/glm-5.3-flash": {
+   "in": 0.15,
+   "out": 0.5,
+   "status": "confirmed",
+   "source": "OpenRouter public list fetched 2026-10-25 (legacy runner PRICES)",
+   "as_of": "2026-10-26"
+  }
+ }
+}

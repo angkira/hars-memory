@@ -54,16 +54,16 @@ import random
 import re
 import sys
 import time
-import urllib.request
 from datetime import datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-URL = "https://openrouter.ai/api/v1/chat/completions"
-JUDGE_MODEL_DEFAULT = "openai/gpt-6-luna"
+sys.path.insert(0, BASE)
+import providers  # noqa: E402  (profiles, prices, family check, hard budget)
+
+JUDGE_MODEL_DEFAULT = "openai/gpt-6-luna"     # legacy default (no --profile): OpenRouter
+TRANSPORT = None                               # tests inject a fake HTTP transport
 FIXTURES = os.path.join(BASE, "judge_v2_fixtures.json")
 WINDOW = 500                     # chars either side of the evidence
-PRICE_IN = float(os.environ.get("NC_JUDGE_PRICE_IN", "0.0000001"))
-PRICE_OUT = float(os.environ.get("NC_JUDGE_PRICE_OUT", "0.0000005"))
 UNSUPPORTED_AND_FULL_CREDIT_MAX = 0.05   # calibration gate
 
 # ---------------------------------------------------------------- text helpers
@@ -351,27 +351,23 @@ def post_pass(rec: dict, verdict: dict) -> dict:
 
 # ---------------------------------------------------------------------- model
 
-def call_judge(prompt: str, key: str, model: str, spend: dict,
-               max_tokens: int = 700) -> tuple[str, float]:
-    body = {"model": model, "max_tokens": max_tokens, "temperature": 0,
-            "usage": {"include": True},
-            "messages": [{"role": "user", "content": prompt}]}
-    req = urllib.request.Request(
-        URL, data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}",
-                 "User-Agent": "neurocompact-eval/2.0"})
+def call_judge(prompt: str, ctx: dict, spend: dict, max_tokens: int = 700,
+               transport=None) -> tuple[str, float]:
+    """One judge call through the provider layer. ctx = {profile, model, key_env, budget}.
+    Cost = provider-reported or the profile price table; the hard budget is enforced by
+    providers.chat (an unpriced model without reported cost raises)."""
     t0 = time.time()
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(req, timeout=180) as r:
-                raw = json.load(r)
-            usage = raw.get("usage") or {}
-            cost = usage.get("cost") or usage.get("total_cost") or (
-                (usage.get("prompt_tokens") or 0) * PRICE_IN
-                + (usage.get("completion_tokens") or 0) * PRICE_OUT)
-            spend["usd"] += float(cost)
-            spend["calls"] += 1
-            return (raw["choices"][0]["message"].get("content") or ""), time.time() - t0
+            res = providers.chat("judge", [{"role": "user", "content": prompt}],
+                                 profile=ctx["profile"], model=ctx["model"], max_tokens=max_tokens,
+                                 temperature=0, budget=ctx["budget"], key_env=ctx.get("key_env"),
+                                 retries=1, transport=transport or TRANSPORT)
+            spend["usd"] = ctx["budget"].spent
+            spend["calls"] = ctx["budget"].calls
+            return res.text, time.time() - t0
+        except (providers.BudgetExceeded, providers.UnpricedModel):
+            raise
         except Exception as e:  # noqa: BLE001
             if attempt == 2:
                 print(f"  judge failed: {e}", flush=True)
@@ -455,7 +451,19 @@ def main() -> int:
     ap.add_argument("--in", dest="inp", default="", help="records jsonl (answers to grade)")
     ap.add_argument("--out", default="", help="judged jsonl (default judged.jsonl)")
     ap.add_argument("--mapping", default="", help="presentation order + arm mapping")
-    ap.add_argument("--model", default=JUDGE_MODEL_DEFAULT)
+    providers.add_profile_args(ap, roles=("judge",))
+    ap.add_argument("--model", default=None,
+                    help="alias of --model-judge (default: the profile's judge; legacy "
+                         f"{JUDGE_MODEL_DEFAULT} on the openrouter profile)")
+    ap.add_argument("--key-env", default=None, metavar="VAR",
+                    help="read the API key from env var VAR instead of the profile's variable")
+    ap.add_argument("--agent-model", action="append", default=[],
+                    help="agent-side model(s) for the family check when the records do not "
+                         "carry agent_model/qa_model (repeatable)")
+    ap.add_argument("--allow-same-family-judge", action="store_true",
+                    help="accept a judge of the SAME family as the agent, only if the judge "
+                         "MODEL differs from every agent-side model; loud warning, recorded as "
+                         "judge_same_family=true + reason in the mapping and the judged rows")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--calibration", "--calibrate", dest="calibration",
                     action="store_true",
@@ -463,10 +471,20 @@ def main() -> int:
                          "(--calibrate is the RUNBOOK spelling, kept as alias)")
     ap.add_argument("--dry-run", action="store_true",
                     help="offline plumbing test on bundled fixtures (no API, $0)")
-    ap.add_argument("--budget-usd", type=float, default=0.30)
+    providers.add_budget_arg(ap)
     ap.add_argument("--show-prompt", action="store_true",
                     help="print the first prompt verbatim (blindness check)")
     args = ap.parse_args()
+    prof_name = args.profile or "openrouter"      # no --profile = the historical OpenRouter judge
+    try:
+        prof = providers.load_profile(prof_name, base_url=args.base_url, pi_provider=args.pi_provider)
+    except providers.ProviderError as e:
+        raise SystemExit(f"!!! {e}")
+    judge_model = (getattr(args, "model_judge", None) or args.model
+                   or (JUDGE_MODEL_DEFAULT if prof_name == "openrouter" else prof.default_model("judge")))
+    if not judge_model:
+        raise SystemExit(f"!!! no judge model for profile {prof_name}: pass --model-judge")
+    args.model = judge_model
 
     if args.dry_run:
         records = load_records(FIXTURES)
@@ -491,11 +509,33 @@ def main() -> int:
         if "span_text" not in r:
             raise SystemExit(f"{rid_of(r)}: span_text is required for the evidence window")
 
-    key = ""
+    # ---- judge independence (same rule as run_chainreplay): refuse same family by default
+    agent_models = list(args.agent_model)
+    for r in records:
+        agent_models += [r.get("agent_model"), r.get("qa_model")]
+    agent_models = [m for m in dict.fromkeys(agent_models) if m]
+    if args.dry_run and not agent_models:
+        fam = providers.judge_family_verdict([], model, False)
+    elif not agent_models:
+        raise SystemExit("!!! cannot verify judge independence: the records carry no "
+                         "agent_model/qa_model; pass --agent-model <id> (repeatable)")
+    else:
+        fam = providers.judge_family_verdict(agent_models, args.model, args.allow_same_family_judge)
+    if not fam["ok"]:
+        raise SystemExit(f"!!! REFUSING: {fam['error']}")
+    if fam["warning"]:
+        print("\n" + "!" * 78 + "\n" + fam["warning"] + "\n" + "!" * 78 + "\n",
+              file=sys.stderr, flush=True)
+    ctx = None
     if not args.dry_run:
-        key = os.environ.get("OPENROUTER_API_KEY", "")
-        if not key:
-            raise SystemExit("export OPENROUTER_API_KEY (judging is paid), or use --dry-run")
+        try:
+            budget = providers.Budget(args.budget_usd)
+        except providers.ProviderError as e:
+            raise SystemExit(f"!!! {e} (--budget-usd is mandatory for a paid judge run)")
+        kp = providers.key_problem(prof, args.key_env)
+        if kp:
+            raise SystemExit(f"!!! {kp}; judging is paid, or use --dry-run")
+        ctx = {"profile": prof, "model": args.model, "key_env": args.key_env, "budget": budget}
 
     # narrative excerpt source per record, deterministic
     rng = random.Random(args.seed)
@@ -512,6 +552,10 @@ def main() -> int:
     random.Random(args.seed).shuffle(order)
     mapping = {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                "seed": args.seed, "model": model, "calibration": args.calibration,
+               "profile": prof_name, "judge_model": args.model,
+               "judge_same_family": fam["judge_same_family"],
+               "judge_same_family_reason": fam["reason"],
+               "agent_models": fam["agent_models"],
                "order": [], "map": {}}
     presentations = []          # (present_id, record, pass_no)
     for i, r in enumerate(order):
@@ -550,10 +594,11 @@ def main() -> int:
             raw = rec.get(f"judge_pass{pass_no}") or rec.get("judge_pass0") or ""
             latency = 0.0
         else:
-            if spend["usd"] >= args.budget_usd:
-                raise SystemExit(f"judge budget ${args.budget_usd:.2f} exhausted "
-                                 f"after {spend['calls']} calls")
-            raw, latency = call_judge(prompt, key, model, spend)
+            try:
+                ctx["budget"].check()
+                raw, latency = call_judge(prompt, ctx, spend)
+            except providers.BudgetExceeded as e:
+                raise SystemExit(f"judge budget exhausted after {spend['calls']} calls: {e}")
         verdict, ok = parse_verdict(raw)
         parse_fail += not ok
         post = post_pass(rec, verdict)
@@ -577,6 +622,7 @@ def main() -> int:
             "excerpt_status": how, "excerpt_chars": len(excerpt),
             "excerpt_source_chain": src_chain,
             "judge_parse_ok": ok, "judge_model": model,
+            "judge_same_family": fam["judge_same_family"],
             "judge_latency_s": round(latency, 3),
         })
         if n % 10 == 0 or n == len(presentations):
@@ -629,7 +675,7 @@ def main() -> int:
                                          "judge-calibration.json"), "w"), indent=1)
     if not args.dry_run:
         print(f"judge spend: ${spend['usd']:.5f} over {spend['calls']} calls "
-              f"(cap ${args.budget_usd:.2f})")
+              f"(cap ${args.budget_usd:.2f}; profile {prof_name}, model {args.model})")
     else:
         print("dry run: no API calls, $0")
     return 0 if parse_fail == 0 else 0   # parse failures are reported, not fatal

@@ -1,0 +1,72 @@
+{
+ "name": "anthropic",
+ "description": "Everything through Anthropic (first home runs). Judge = different MODEL, same family -> needs --allow-same-family-judge.",
+ "family": "anthropic",
+ "base_url": "https://api.anthropic.com/v1",
+ "chat_path": "/chat/completions",
+ "auth": {
+  "style": "bearer",
+  "headers": {}
+ },
+ "key_env": "ANTHROPIC_API_KEY",
+ "sampling": {
+  "policy": "omit",
+  "note": "Anthropic 5.x rejects temperature/top_p on the OpenAI-compatible endpoint (hars_memory .env.example); never sent"
+ },
+ "pi": {
+  "provider": "anthropic",
+  "key_env": "ANTHROPIC_API_KEY",
+  "ctx_window": 200000,
+  "model_style": "bare",
+  "base_url_env": "ANTHROPIC_BASE_URL"
+ },
+ "models": {
+  "agent": "claude-haiku-5-5",
+  "answer": "claude-haiku-5-5",
+  "summarizer": "claude-haiku-5-5",
+  "qa_generator": "claude-sonnet-5-5",
+  "judge": "claude-sonnet-5-5",
+  "extractor": "claude-haiku-5-5",
+  "keyword": "claude-haiku-5-5"
+ },
+ "hars": {
+  "extractor_provider": "local",
+  "key_env": "ANTHROPIC_API_KEY"
+ },
+ "prices": {
+  "claude-haiku-5-5": {
+   "in": 0.1,
+   "out": 0.5,
+   "status": "confirmed",
+   "source": "WebSearch 2026-10-26 (techenclave, eesel, apidog, dev.to: agree) + pi-ai 1.4.0 catalog; Anthropic pricing page not fetched",
+   "as_of": "2026-10-26",
+   "cache_read": 0.01,
+   "cache_write": 0.125,
+   "tier": {
+    "input_above_tokens": 100000,
+    "in": 0.5,
+    "out": 2.5,
+    "cache_read": 0.05,
+    "cache_write": 0.625
+   }
+  },
+  "claude-sonnet-5-5": {
+   "in": 2.0,
+   "out": 10.0,
+   "status": "confirmed",
+   "source": "WebSearch 2026-10-26 (techenclave, eesel, apidog, dev.to: agree) + pi-ai 1.4.0 catalog; Anthropic pricing page not fetched",
+   "as_of": "2026-10-26",
+   "cache_read": 0.1,
+   "cache_write": 2.5
+  },
+  "claude-haiku-4-5": {
+   "in": 1.0,
+   "out": 5.0,
+   "status": "catalog_only",
+   "source": "pi-ai 1.4.0 catalog",
+   "as_of": "2026-10-26",
+   "cache_read": 0.1,
+   "cache_write": 1.25
+  }
+ }
+}

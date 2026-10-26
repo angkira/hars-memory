@@ -306,7 +306,7 @@ class RunnerEndToEnd(unittest.TestCase):
         glob_state = (rc.PROVIDER, rc.CTX_WINDOW_OVERRIDE, rc.AGENT_THINKING, dict(rc.CAPS))
         argv = ["run_chainreplay.py", "--chains", cpath, "--out", out, "--run-id", "t1",
                 "--agent-model", "claude-haiku-5-5", "--provider", "anthropic",
-                "--mcp", "http://127.0.0.1:1/mcp", *argv_extra]
+                "--mcp", "http://127.0.0.1:1/mcp", "--budget-usd", "5", *argv_extra]
         old_argv, old_key = sys.argv, os.environ.get("ANTHROPIC_API_KEY")
         sys.argv = argv
         os.environ["ANTHROPIC_API_KEY"] = "x"
