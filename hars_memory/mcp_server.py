@@ -97,7 +97,7 @@ from hars_memory.projects import (
     ProjectMetadata,
     get_default_project_registry,
 )
-from hars_memory.server.embedder import qdrant_collection_names
+from hars_memory.server.embedder import describe_embedder, qdrant_collection_names
 from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_query_event, log_write_event, setup_logging
 from hars_memory.trace import emit as trace_emit
@@ -1127,7 +1127,7 @@ def _index_status(project: ProjectMetadata | None = None) -> dict[str, Any]:
         "configured_models": {
             "extractor": f"{HARS_MEMORY_EXTRACTOR_MODEL} @ {HARS_MEMORY_EXTRACTOR_BASE_URL}",
             "query": f"{HARS_MEMORY_QUERY_MODEL} @ {HARS_MEMORY_QUERY_BASE_URL}",
-            "embedder": f"{HARS_MEMORY_EMBED_MODEL} (CPU)",
+            "embedder": describe_embedder(HARS_MEMORY_EMBED_MODEL),
         },
         "staging_backlog": _staging_backlog_info(staging_dir),
         "message": (

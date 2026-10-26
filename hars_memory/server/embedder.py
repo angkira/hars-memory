@@ -1006,6 +1006,25 @@ _EMBEDDING_DIM_RE = re.compile(r'"embedding_dim"\s*:\s*(\d+)')
 # prefix applied in front of it, so multiple projects can share one Qdrant
 # container without colliding on schema (embedding dimension is a
 # per-collection property, not per-workspace).
+def describe_embedder(local_model: str) -> str:
+    """Human-readable id of the embedder this process actually uses.
+
+    In http mode the vectors come from HARS_MEMORY_EMBED_HTTP_MODEL (falling
+    back to ``local_model``, the same resolution as the http embed func) at
+    HARS_MEMORY_EMBED_BASE_URL — reporting only ``local_model`` there would
+    name a model that never ran.
+    """
+    try:
+        provider = _resolve_provider()
+    except RuntimeError as exc:
+        return f"invalid provider ({exc})"
+    if provider == "http":
+        http_model = os.environ.get("HARS_MEMORY_EMBED_HTTP_MODEL", "").strip() or local_model
+        base_url = os.environ.get("HARS_MEMORY_EMBED_BASE_URL", "").strip().rstrip("/") or "<unset>"
+        return f"{http_model} @ {base_url} (http)"
+    return f"{local_model} (CPU)"
+
+
 def qdrant_collection_names(prefix: str) -> tuple[str, str, str]:
     """Return this project's (chunks, entities, relationships) Qdrant
     collection names, namespaced by `prefix` so multiple projects can

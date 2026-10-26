@@ -569,3 +569,33 @@ def test_make_embedding_func_signature_backward_compatible(http_env) -> None:
     assert asyncio.iscoroutinefunction(func)
     func2 = embedder.make_embedding_func(model_name="unsloth/embeddinggemma-300m", batch_size=8)
     assert asyncio.iscoroutinefunction(func2)
+
+
+class TestDescribeEmbedder:
+    """memory_status reports the embedder that actually produces vectors."""
+
+    def test_local_reports_local_model(self, monkeypatch):
+        for var in _ENV_VARS_TO_CLEAR:
+            monkeypatch.delenv(var, raising=False)
+        assert embedder.describe_embedder("unsloth/embeddinggemma-300m") == "unsloth/embeddinggemma-300m (CPU)"
+
+    def test_http_reports_http_model_and_url(self, monkeypatch):
+        for var in _ENV_VARS_TO_CLEAR:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HARS_MEMORY_EMBED_PROVIDER", "http")
+        monkeypatch.setenv("HARS_MEMORY_EMBED_BASE_URL", "http://embed.test/v1/")
+        monkeypatch.setenv("HARS_MEMORY_EMBED_HTTP_MODEL", "hashshim")
+        desc = embedder.describe_embedder("unsloth/embeddinggemma-300m")
+        assert desc == "hashshim @ http://embed.test/v1 (http)"
+        assert "embeddinggemma" not in desc
+
+    def test_http_without_http_model_falls_back_like_embed_func(self, monkeypatch):
+        for var in _ENV_VARS_TO_CLEAR:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HARS_MEMORY_EMBED_PROVIDER", "http")
+        monkeypatch.setenv("HARS_MEMORY_EMBED_BASE_URL", "http://embed.test/v1")
+        assert embedder.describe_embedder("m") == "m @ http://embed.test/v1 (http)"
+
+    def test_invalid_provider_is_reported_not_raised(self, monkeypatch):
+        monkeypatch.setenv("HARS_MEMORY_EMBED_PROVIDER", "htpp")
+        assert embedder.describe_embedder("m").startswith("invalid provider")
