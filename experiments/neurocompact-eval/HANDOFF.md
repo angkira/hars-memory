@@ -265,9 +265,12 @@ curl -s -m 15 https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $OP
   timeout); total run ~2 h — batch it and let it run.
 - Batch A recall_error=530 on 28/28 nc asks (recall_raw_chars=0): the nc arm in fullB-075703
   ran effectively note-only. Resolve before trusting any fullB number (cause undiagnosed, M5).
-- The runner needs `run_pool.py` (pi JSON-mode stdout parser) from the live working copy
-  `/tmp/opencode/nc-eval`; it is not committed here. `--dry-run` and `--pack-selftest` do not
-  need it.
+- `scripts/run_pool.py` is now committed but is only a minimal re-implementation of `extract()`
+  (pi 1.4.0 `--mode json` stdout parser) -- all `run_chainreplay.py` needs. `usage.input` =
+  last assistant turn's input + cacheRead + cacheWrite (context size); `usage.output` = output
+  summed over turns; `compactions` = count of `compaction_end`. The rest of the owner's
+  original (`run_pi`, `judge`, `hars_recall`, `hars_compactions`) is still only in the live copy
+  `/tmp/opencode/nc-eval`, so `run_longreplay.py` and `judge_backfill.py` still need that one.
 - Judge calibration kappa on the `unsupported` flag alone is 0.624 (score kappa 0.956) —
   mention as a caveat in the final report.
 
