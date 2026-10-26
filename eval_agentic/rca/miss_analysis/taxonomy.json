@@ -1,0 +1,215 @@
+{
+ "definitions": {
+  "coverage": "gold document has no chunk in the index (not ingested)",
+  "channel_miss": "document indexed but no chunk of it is in the fused pool (dense top-30 UNION BM25 top-30)",
+  "window_truncation": "gold in pool, out of the published 10-chunk doc window, but inside a 20-chunk window",
+  "fusion_buried": "gold in pool but below the top-20-chunk window",
+  "fusion_demoted": "gold inside the top-10-chunk window but not at rank 1",
+  "multi_hop_second_hop": "modifier: the failing gold entry is the second (bridged) document of a 2-hop question"
+ },
+ "subcauses": {
+  "single_channel_missing": "the only channel that found the gold was the other one, and the missing channel was imputed 0.0",
+  "lexical_gap": "BM25 missed it, dense found it in its top-5",
+  "dense_gap": "dense missed it, BM25 found it in its top-5",
+  "rank_competition": "both channels found it; a different document scored higher"
+ },
+ "adjudicated_rows": [
+  {
+   "index": "base",
+   "query_id": "_plans_2026_06_20_mlops_maturity_gap_analysis_md",
+   "verdict": "alternative_answer_present",
+   "evidence": "top-1 docs-runtime_operations.md contains both gold ports 5570 and 5572"
+  },
+  {
+   "index": "base",
+   "query_id": "_plans_2026_08_09_12h_vea_hars_fixedt1_program_md",
+   "verdict": "alternative_answer_present",
+   "evidence": "top-1 launch note contains the same PipelineRun 64b3aa63-735e-4b38-8265-8d52cf54ec62 as the gold plan"
+  },
+  {
+   "index": "base",
+   "query_id": "staging_ingested_2026_08_01_paco_dinov3_fractional_mask_pool",
+   "verdict": "ambiguous_label",
+   "evidence": "gold says '16 tests passed', top-1 sibling says '10 passed' for the same test file; two valid-looking answers, gold is the newer note"
+  }
+ ],
+ "caveat": "Only the 3 adjudicated rows were read end-to-end. All other labels are mechanical, from channel ranks only.",
+ "by_index": {
+  "base": {
+   "48q": {
+    "n_gold_entries": 48,
+    "classes": {
+     "hit": {
+      "n": 34,
+      "share": 0.7083
+     },
+     "fusion_demoted": {
+      "n": 13,
+      "share": 0.2708
+     },
+     "window_truncation": {
+      "n": 1,
+      "share": 0.0208
+     }
+    },
+    "miss_subcauses": {
+     "rank_competition": 8,
+     "single_channel_missing": 4,
+     "dense_gap": 1
+    },
+    "ranker_effect": {
+     "inert": 34,
+     "fixed": 7,
+     "broke": 2,
+     "changed_but_not_rank1": 5
+    },
+    "rank1_hits": 34,
+    "top10_hits": 47,
+    "second_hop_failures": 0,
+    "query_level": {
+     "n_queries": 48,
+     "primary_class": {
+      "hit": 34,
+      "fusion_demoted": 13,
+      "window_truncation": 1
+     },
+     "queries_with_all_gold_at_rank1": 34
+    }
+   },
+   "28q": {
+    "n_gold_entries": 56,
+    "classes": {
+     "hit": {
+      "n": 16,
+      "share": 0.2857
+     },
+     "fusion_demoted": {
+      "n": 23,
+      "share": 0.4107
+     },
+     "channel_miss": {
+      "n": 9,
+      "share": 0.1607
+     },
+     "fusion_buried": {
+      "n": 6,
+      "share": 0.1071
+     },
+     "window_truncation": {
+      "n": 2,
+      "share": 0.0357
+     }
+    },
+    "miss_subcauses": {
+     "rank_competition": 10,
+     "single_channel_missing": 7,
+     "lexical_gap": 2,
+     "dense_gap": 4
+    },
+    "ranker_effect": {
+     "inert": 26,
+     "changed_but_not_rank1": 23,
+     "fixed": 4,
+     "broke": 3
+    },
+    "rank1_hits": 16,
+    "top10_hits": 39,
+    "second_hop_failures": 25,
+    "query_level": {
+     "n_queries": 28,
+     "primary_class": {
+      "fusion_demoted": 15,
+      "channel_miss": 7,
+      "fusion_buried": 4,
+      "window_truncation": 2
+     },
+     "queries_with_all_gold_at_rank1": 0
+    }
+   }
+  },
+  "new": {
+   "48q": {
+    "n_gold_entries": 48,
+    "classes": {
+     "hit": {
+      "n": 29,
+      "share": 0.6042
+     },
+     "coverage": {
+      "n": 15,
+      "share": 0.3125
+     },
+     "fusion_demoted": {
+      "n": 4,
+      "share": 0.0833
+     }
+    },
+    "miss_subcauses": {
+     "rank_competition": 3,
+     "dense_gap": 1
+    },
+    "ranker_effect": {
+     "inert": 47,
+     "changed_but_not_rank1": 1
+    },
+    "rank1_hits": 29,
+    "top10_hits": 33,
+    "second_hop_failures": 0,
+    "query_level": {
+     "n_queries": 48,
+     "primary_class": {
+      "hit": 29,
+      "coverage": 15,
+      "fusion_demoted": 4
+     },
+     "queries_with_all_gold_at_rank1": 29
+    }
+   },
+   "28q": {
+    "n_gold_entries": 56,
+    "classes": {
+     "hit": {
+      "n": 12,
+      "share": 0.2143
+     },
+     "fusion_demoted": {
+      "n": 14,
+      "share": 0.25
+     },
+     "coverage": {
+      "n": 25,
+      "share": 0.4464
+     },
+     "fusion_buried": {
+      "n": 5,
+      "share": 0.0893
+     }
+    },
+    "miss_subcauses": {
+     "rank_competition": 7,
+     "lexical_gap": 3,
+     "dense_gap": 3,
+     "single_channel_missing": 1
+    },
+    "ranker_effect": {
+     "inert": 38,
+     "changed_but_not_rank1": 17,
+     "broke": 1
+    },
+    "rank1_hits": 12,
+    "top10_hits": 26,
+    "second_hop_failures": 25,
+    "query_level": {
+     "n_queries": 28,
+     "primary_class": {
+      "fusion_demoted": 4,
+      "coverage": 21,
+      "fusion_buried": 3
+     },
+     "queries_with_all_gold_at_rank1": 0
+    }
+   }
+  }
+ },
+ "caveat_48q": "48q has one gold doc per query, so a query-level class equals the row class. 28q has two gold docs per query; its query-level ceiling for recall@1 is 0.5."
+}

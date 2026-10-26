@@ -1,0 +1,741 @@
+{
+ "label": "base",
+ "summary": {
+  "n": 28,
+  "all_entities_in_graph": 1.0,
+  "all_entities_have_chunks": 1.0,
+  "bridge_covers_both_gold": 1.0,
+  "hop1_covers_all_gold": 1.0,
+  "hop2_covers_all_gold": 1.0
+ },
+ "per_query": {
+  "R01": {
+   "entities_in_graph": {
+    "A2S7c": true,
+    "val/vea_contribution": true,
+    "A2S124A": true
+   },
+   "entities_with_chunks": {
+    "A2S7c": true,
+    "val/vea_contribution": true,
+    "A2S124A": true
+   },
+   "bridge_entity": "val/vea_contribution",
+   "bridge_doc_count": 58,
+   "bridge_covers_gold": {
+    "vea_positive_solution_search_2026-05-19.md": true,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 115,
+   "hop1_docs": 115,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "vea_positive_solution_search_2026-05-19.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R02": {
+   "entities_in_graph": {
+    "A2S178": true,
+    "val/evidence_answer/depth/accuracy": true,
+    "A2S125A": true
+   },
+   "entities_with_chunks": {
+    "A2S178": true,
+    "val/evidence_answer/depth/accuracy": true,
+    "A2S125A": true
+   },
+   "bridge_entity": "val/evidence_answer/depth/accuracy",
+   "bridge_doc_count": 28,
+   "bridge_covers_gold": {
+    "2026-06-19_vea_a2s178_hardneg_failfast.md": true,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 93,
+   "hop1_docs": 93,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-06-19_vea_a2s178_hardneg_failfast.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R03": {
+   "entities_in_graph": {
+    "A2S175-Terminal-Result": true,
+    "val/vea_wrong_margin_violation": true,
+    "A2S124A": true
+   },
+   "entities_with_chunks": {
+    "A2S175-Terminal-Result": true,
+    "val/vea_wrong_margin_violation": true,
+    "A2S124A": true
+   },
+   "bridge_entity": "val/vea_wrong_margin_violation",
+   "bridge_doc_count": 61,
+   "bridge_covers_gold": {
+    "2026-06-18_vea_wrong_evidence_supervision_fix.md": true,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 84,
+   "hop1_docs": 84,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-06-18_vea_wrong_evidence_supervision_fix.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R04": {
+   "entities_in_graph": {
+    "shortcut hypothesis": true,
+    "ResamplerV2": true,
+    "Uses-Slots Gate": true
+   },
+   "entities_with_chunks": {
+    "shortcut hypothesis": true,
+    "ResamplerV2": true,
+    "Uses-Slots Gate": true
+   },
+   "bridge_entity": "ResamplerV2",
+   "bridge_doc_count": 3,
+   "bridge_covers_gold": {
+    "2026-09-19_visual_student_reach_protocol.md": true,
+    "2026-09-19_weekly_experiment_inventory.md": true
+   },
+   "hop1_doc_count": 3,
+   "hop1_docs": 3,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-19_visual_student_reach_protocol.md",
+    "2026-09-19_weekly_experiment_inventory.md"
+   ]
+  },
+  "R05": {
+   "entities_in_graph": {
+    "shortcut hypothesis": true,
+    "ResamplerV2": true,
+    "ResamplerV2 Shortcut Contamination": true
+   },
+   "entities_with_chunks": {
+    "shortcut hypothesis": true,
+    "ResamplerV2": true,
+    "ResamplerV2 Shortcut Contamination": true
+   },
+   "bridge_entity": "ResamplerV2",
+   "bridge_doc_count": 3,
+   "bridge_covers_gold": {
+    "2026-09-19_visual_student_reach_protocol.md": true,
+    "2026-09-19_weekly_research_history_audit.md": true
+   },
+   "hop1_doc_count": 3,
+   "hop1_docs": 3,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-19_visual_student_reach_protocol.md",
+    "2026-09-19_weekly_research_history_audit.md"
+   ]
+  },
+  "R06": {
+   "entities_in_graph": {
+    "DA3 sidecar causality finding": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "entities_with_chunks": {
+    "DA3 sidecar causality finding": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 177,
+   "bridge_covers_gold": {
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md": true,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": true
+   },
+   "hop1_doc_count": 213,
+   "hop1_docs": 213,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R07": {
+   "entities_in_graph": {
+    "visual_tokens [B,3620,768]": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "entities_with_chunks": {
+    "visual_tokens [B,3620,768]": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 177,
+   "bridge_covers_gold": {
+    "2026-09-19_droid_abstractor_proposal.md": true,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": true
+   },
+   "hop1_doc_count": 260,
+   "hop1_docs": 260,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-19_droid_abstractor_proposal.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R08": {
+   "entities_in_graph": {
+    "A2S116b": true,
+    "A2S117": true,
+    "Wrong/reversed evidence finding": true
+   },
+   "entities_with_chunks": {
+    "A2S116b": true,
+    "A2S117": true,
+    "Wrong/reversed evidence finding": true
+   },
+   "bridge_entity": "A2S117",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-05-26_vea_a2s117_da3_depth_status.md": true,
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md": true
+   },
+   "hop1_doc_count": 2,
+   "hop1_docs": 2,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-05-26_vea_a2s117_da3_depth_status.md",
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md"
+   ]
+  },
+  "R09": {
+   "entities_in_graph": {
+    "promotion_requires_seed_replication: true": true,
+    "v4a-s2": true,
+    "optional-stopping refutation": true
+   },
+   "entities_with_chunks": {
+    "promotion_requires_seed_replication: true": true,
+    "v4a-s2": true,
+    "optional-stopping refutation": true
+   },
+   "bridge_entity": "v4a-s2",
+   "bridge_doc_count": 4,
+   "bridge_covers_gold": {
+    "2026-07-20_fable5_hypothesis_methodology_audit.md": true,
+    "2026-07-20_gemini35_flash_quorum_review.md": true
+   },
+   "hop1_doc_count": 6,
+   "hop1_docs": 6,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-07-20_fable5_hypothesis_methodology_audit.md",
+    "2026-07-20_gemini35_flash_quorum_review.md"
+   ]
+  },
+  "R10": {
+   "entities_in_graph": {
+    "v4a-s2 train gate": true,
+    "v4a-s2": true,
+    "optional-stopping refutation": true
+   },
+   "entities_with_chunks": {
+    "v4a-s2 train gate": true,
+    "v4a-s2": true,
+    "optional-stopping refutation": true
+   },
+   "bridge_entity": "v4a-s2",
+   "bridge_doc_count": 4,
+   "bridge_covers_gold": {
+    "2026-07-20_fable5_24h_results_audit.md": true,
+    "2026-07-20_gemini35_flash_quorum_review.md": true
+   },
+   "hop1_doc_count": 6,
+   "hop1_docs": 6,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-07-20_fable5_24h_results_audit.md",
+    "2026-07-20_gemini35_flash_quorum_review.md"
+   ]
+  },
+  "R11": {
+   "entities_in_graph": {
+    "27/60": true,
+    "baseline8k": true,
+    "Claim 1": true
+   },
+   "entities_with_chunks": {
+    "27/60": true,
+    "baseline8k": true,
+    "Claim 1": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 18,
+   "bridge_covers_gold": {
+    "2026-09-11_phase2-input-adaptation.md": true,
+    "2026-09-11_luna-critique-verification.md": true
+   },
+   "hop1_doc_count": 19,
+   "hop1_docs": 19,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-11_phase2-input-adaptation.md",
+    "2026-09-11_luna-critique-verification.md"
+   ]
+  },
+  "R12": {
+   "entities_in_graph": {
+    "baseline8k widened-reset test": true,
+    "baseline8k": true,
+    "Claim 1": true
+   },
+   "entities_with_chunks": {
+    "baseline8k widened-reset test": true,
+    "baseline8k": true,
+    "Claim 1": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 18,
+   "bridge_covers_gold": {
+    "2026-09-10_widened-reset-pure-rl-test.md": true,
+    "2026-09-11_luna-critique-verification.md": true
+   },
+   "hop1_doc_count": 21,
+   "hop1_docs": 21,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-10_widened-reset-pure-rl-test.md",
+    "2026-09-11_luna-critique-verification.md"
+   ]
+  },
+  "R13": {
+   "entities_in_graph": {
+    "baseline8k runtime parity": true,
+    "baseline8k": true,
+    "Claim 1": true
+   },
+   "entities_with_chunks": {
+    "baseline8k runtime parity": true,
+    "baseline8k": true,
+    "Claim 1": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 18,
+   "bridge_covers_gold": {
+    "2026-09-10_phase1-phase2-interface-localization.md": true,
+    "2026-09-11_luna-critique-verification.md": true
+   },
+   "hop1_doc_count": 23,
+   "hop1_docs": 23,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-10_phase1-phase2-interface-localization.md",
+    "2026-09-11_luna-critique-verification.md"
+   ]
+  },
+  "R14": {
+   "entities_in_graph": {
+    "Handover Assistance Result": true,
+    "A11": true,
+    "run:2f9c20c6-0d6e-4f98-8584-e65b6ec00683": true
+   },
+   "entities_with_chunks": {
+    "Handover Assistance Result": true,
+    "A11": true,
+    "run:2f9c20c6-0d6e-4f98-8584-e65b6ec00683": true
+   },
+   "bridge_entity": "A11",
+   "bridge_doc_count": 9,
+   "bridge_covers_gold": {
+    "2026-10-05_r25-selector-verdict-and-c1-prereg-20261005_144831.md": true,
+    "2026-10-04_r25-a11-source-contract-smoke-falsified_223851.md": true
+   },
+   "hop1_doc_count": 9,
+   "hop1_docs": 9,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-10-05_r25-selector-verdict-and-c1-prereg-20261005_144831.md",
+    "2026-10-04_r25-a11-source-contract-smoke-falsified_223851.md"
+   ]
+  },
+  "R15": {
+   "entities_in_graph": {
+    "H6 Aggregate K4 Margin": true,
+    "H6": true,
+    "A2S124A": true
+   },
+   "entities_with_chunks": {
+    "H6 Aggregate K4 Margin": true,
+    "H6": true,
+    "A2S124A": true
+   },
+   "bridge_entity": "H6",
+   "bridge_doc_count": 7,
+   "bridge_covers_gold": {
+    "2026-09-27_full_research_report.md": true,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 82,
+   "hop1_docs": 82,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-27_full_research_report.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R16": {
+   "entities_in_graph": {
+    "H6 Aggregate K4 Margin": true,
+    "H6": true,
+    "H6 Phase C Score 2.05/10": true
+   },
+   "entities_with_chunks": {
+    "H6 Aggregate K4 Margin": true,
+    "H6": true,
+    "H6 Phase C Score 2.05/10": true
+   },
+   "bridge_entity": "H6",
+   "bridge_doc_count": 7,
+   "bridge_covers_gold": {
+    "2026-09-27_full_research_report.md": true,
+    "2026-10-07_memory-archive-phase-c-destroys-phase-a-gains_141310.md": true
+   },
+   "hop1_doc_count": 7,
+   "hop1_docs": 7,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-27_full_research_report.md",
+    "2026-10-07_memory-archive-phase-c-destroys-phase-a-gains_141310.md"
+   ]
+  },
+  "R17": {
+   "entities_in_graph": {
+    "gripper_mse": true,
+    "Run B-2": true,
+    "Fatal Collapse Hypothesis": true
+   },
+   "entities_with_chunks": {
+    "gripper_mse": true,
+    "Run B-2": true,
+    "Fatal Collapse Hypothesis": true
+   },
+   "bridge_entity": "Run B-2",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-09-21_mixed_appearance_randomization.md": true,
+    "2026-09-21_orchestration_protocol_runB.md": true
+   },
+   "hop1_doc_count": 2,
+   "hop1_docs": 2,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-21_mixed_appearance_randomization.md",
+    "2026-09-21_orchestration_protocol_runB.md"
+   ]
+  },
+  "R18": {
+   "entities_in_graph": {
+    "Visual Collapse Disproven": true,
+    "Run B-2": true,
+    "Fatal Collapse Hypothesis": true
+   },
+   "entities_with_chunks": {
+    "Visual Collapse Disproven": true,
+    "Run B-2": true,
+    "Fatal Collapse Hypothesis": true
+   },
+   "bridge_entity": "Run B-2",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-09-21_mixed_appearance_randomization.md": true,
+    "2026-09-21_orchestration_protocol_runB.md": true
+   },
+   "hop1_doc_count": 2,
+   "hop1_docs": 2,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-21_mixed_appearance_randomization.md",
+    "2026-09-21_orchestration_protocol_runB.md"
+   ]
+  },
+  "R19": {
+   "entities_in_graph": {
+    "Identical-example first-action analysis": true,
+    "b_g16": true,
+    "Train Fit-Bar Results": true
+   },
+   "entities_with_chunks": {
+    "Identical-example first-action analysis": true,
+    "b_g16": true,
+    "Train Fit-Bar Results": true
+   },
+   "bridge_entity": "b_g16",
+   "bridge_doc_count": 3,
+   "bridge_covers_gold": {
+    "2026-09-13_abcd_c_h1_failure_decomposition.md": true,
+    "2026-09-13_abcd_b_screening_results.md": true
+   },
+   "hop1_doc_count": 3,
+   "hop1_docs": 3,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-13_abcd_c_h1_failure_decomposition.md",
+    "2026-09-13_abcd_b_screening_results.md"
+   ]
+  },
+  "R20": {
+   "entities_in_graph": {
+    "base9001 generation failure": true,
+    "base9001": true,
+    "Sealed 75-window/8-episode validation": true
+   },
+   "entities_with_chunks": {
+    "base9001 generation failure": true,
+    "base9001": true,
+    "Sealed 75-window/8-episode validation": true
+   },
+   "bridge_entity": "base9001",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-09-13_abcd_c_h1_failure_decomposition.md": true,
+    "2026-09-19_weekly_artifact_runs_audit.md": true
+   },
+   "hop1_doc_count": 3,
+   "hop1_docs": 3,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-13_abcd_c_h1_failure_decomposition.md",
+    "2026-09-19_weekly_artifact_runs_audit.md"
+   ]
+  },
+  "R21": {
+   "entities_in_graph": {
+    "Stable Convergence Without Overfitting": true,
+    "adapter_lNone_best.ckpt": true,
+    "Arm A Adapter Training": true
+   },
+   "entities_with_chunks": {
+    "Stable Convergence Without Overfitting": true,
+    "adapter_lNone_best.ckpt": true,
+    "Arm A Adapter Training": true
+   },
+   "bridge_entity": "adapter_lNone_best.ckpt",
+   "bridge_doc_count": 3,
+   "bridge_covers_gold": {
+    "2026-09-22_approach_alignment_arm_a_protocol.md": true,
+    "2026-09-21_matched_budget_adapter_vs_finetune.md": true
+   },
+   "hop1_doc_count": 50,
+   "hop1_docs": 50,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-22_approach_alignment_arm_a_protocol.md",
+    "2026-09-21_matched_budget_adapter_vs_finetune.md"
+   ]
+  },
+  "R22": {
+   "entities_in_graph": {
+    "MINIMAL": true,
+    "gemini-3.7-flash": true,
+    "Mean Scene Context Score": true
+   },
+   "entities_with_chunks": {
+    "MINIMAL": true,
+    "gemini-3.7-flash": true,
+    "Mean Scene Context Score": true
+   },
+   "bridge_entity": "gemini-3.7-flash",
+   "bridge_doc_count": 3,
+   "bridge_covers_gold": {
+    "2026-08-14_gemini37_thinking_level_ab.md": true,
+    "2026-08-15_gemini_annotation_consolidated.md": true
+   },
+   "hop1_doc_count": 3,
+   "hop1_docs": 3,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-08-14_gemini37_thinking_level_ab.md",
+    "2026-08-15_gemini_annotation_consolidated.md"
+   ]
+  },
+  "R23": {
+   "entities_in_graph": {
+    "Wrist-Weighted Retrieval Variant": true,
+    "Wrist Retrieval R1": true,
+    "A2v Diagnostic Training": true
+   },
+   "entities_with_chunks": {
+    "Wrist-Weighted Retrieval Variant": true,
+    "Wrist Retrieval R1": true,
+    "A2v Diagnostic Training": true
+   },
+   "bridge_entity": "Wrist Retrieval R1",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-07-08_b1_a25_evidence_pair_wrist_weighted_v3_result.md": true,
+    "vea_a2v_query_residual_processor_sidecar_eval20_2026-05-16.md": true
+   },
+   "hop1_doc_count": 26,
+   "hop1_docs": 26,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-07-08_b1_a25_evidence_pair_wrist_weighted_v3_result.md",
+    "vea_a2v_query_residual_processor_sidecar_eval20_2026-05-16.md"
+   ]
+  },
+  "R24": {
+   "entities_in_graph": {
+    "A2 checkpoint": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "entities_with_chunks": {
+    "A2 checkpoint": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 177,
+   "bridge_covers_gold": {
+    "2026-07-10_vea_a1_a2_b1_recipe_audit_and_launch.md": true,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": true
+   },
+   "hop1_doc_count": 224,
+   "hop1_docs": 224,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-07-10_vea_a1_a2_b1_recipe_audit_and_launch.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R25": {
+   "entities_in_graph": {
+    "A2S125a": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "entities_with_chunks": {
+    "A2S125a": true,
+    "DA3": true,
+    "Raw DA3 Rule Accuracy": true
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 177,
+   "bridge_covers_gold": {
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": true
+   },
+   "hop1_doc_count": 202,
+   "hop1_docs": 202,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R26": {
+   "entities_in_graph": {
+    "Pre-RL Paired Evaluation": true,
+    "train_secured8192_v2": true,
+    "Grouped Grasp Adapter Evaluation": true
+   },
+   "entities_with_chunks": {
+    "Pre-RL Paired Evaluation": true,
+    "train_secured8192_v2": true,
+    "Grouped Grasp Adapter Evaluation": true
+   },
+   "bridge_entity": "train_secured8192_v2",
+   "bridge_doc_count": 5,
+   "bridge_covers_gold": {
+    "2026-09-15_grouped-ac-learning-audit.md": true,
+    "2026-09-19_weekly_research_history_audit.md": true
+   },
+   "hop1_doc_count": 5,
+   "hop1_docs": 5,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-15_grouped-ac-learning-audit.md",
+    "2026-09-19_weekly_research_history_audit.md"
+   ]
+  },
+  "R27": {
+   "entities_in_graph": {
+    "3.7-flash-medium proxy estimate": true,
+    "gemini-3.6-flash": true,
+    "Independent Adjudication Result": true
+   },
+   "entities_with_chunks": {
+    "3.7-flash-medium proxy estimate": true,
+    "gemini-3.6-flash": true,
+    "Independent Adjudication Result": true
+   },
+   "bridge_entity": "gemini-3.6-flash",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-08-14_native_video_annotation_cost_model.md": true,
+    "2026-07-30_openrouter_gemma4_online_image_smoke.md": true
+   },
+   "hop1_doc_count": 2,
+   "hop1_docs": 2,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-08-14_native_video_annotation_cost_model.md",
+    "2026-07-30_openrouter_gemma4_online_image_smoke.md"
+   ]
+  },
+  "R28": {
+   "entities_in_graph": {
+    "Sep-10 sealed run": true,
+    "baseline8k": true,
+    "Frozen-Pool Lift Evaluation": true
+   },
+   "entities_with_chunks": {
+    "Sep-10 sealed run": true,
+    "baseline8k": true,
+    "Frozen-Pool Lift Evaluation": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 18,
+   "bridge_covers_gold": {
+    "2026-09-12_baseline8k-failure-mode-breakdown.md": true,
+    "2026-09-19_weekly_research_history_audit.md": true
+   },
+   "hop1_doc_count": 18,
+   "hop1_docs": 18,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-12_baseline8k-failure-mode-breakdown.md",
+    "2026-09-19_weekly_research_history_audit.md"
+   ]
+  }
+ }
+}

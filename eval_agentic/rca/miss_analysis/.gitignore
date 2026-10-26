@@ -1,0 +1,3 @@
+__pycache__/
+# 5.5 MB of per-candidate feature rows, regenerable in ~3 min by trace_misses.py
+traces/candidates_*.jsonl

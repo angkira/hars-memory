@@ -1,0 +1,695 @@
+{
+ "label": "new",
+ "summary": {
+  "n": 28,
+  "all_entities_in_graph": 0.07142857142857142,
+  "all_entities_have_chunks": 0.07142857142857142,
+  "bridge_covers_both_gold": 0.10714285714285714,
+  "hop1_covers_all_gold": 0.17857142857142858,
+  "hop2_covers_all_gold": 0.17857142857142858
+ },
+ "per_query": {
+  "R01": {
+   "entities_in_graph": {
+    "A2S7c": true,
+    "val/vea_contribution": true,
+    "A2S124a": true
+   },
+   "entities_with_chunks": {
+    "A2S7c": true,
+    "val/vea_contribution": true,
+    "A2S124a": true
+   },
+   "bridge_entity": "val/vea_contribution",
+   "bridge_doc_count": 14,
+   "bridge_covers_gold": {
+    "vea_positive_solution_search_2026-05-19.md": true,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 271,
+   "hop1_docs": 271,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "vea_positive_solution_search_2026-05-19.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R02": {
+   "entities_in_graph": {
+    "A2S178": true,
+    "val/evidence_answer/depth/accuracy": true,
+    "A2S125a": true
+   },
+   "entities_with_chunks": {
+    "A2S178": true,
+    "val/evidence_answer/depth/accuracy": true,
+    "A2S125a": true
+   },
+   "bridge_entity": "val/evidence_answer/depth/accuracy",
+   "bridge_doc_count": 5,
+   "bridge_covers_gold": {
+    "2026-06-19_vea_a2s178_hardneg_failfast.md": false,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 177,
+   "hop1_docs": 177,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-06-19_vea_a2s178_hardneg_failfast.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R03": {
+   "entities_in_graph": {
+    "null": false,
+    "val/vea_wrong_margin_violation": true,
+    "A2S124a": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "val/vea_wrong_margin_violation": true,
+    "A2S124a": true
+   },
+   "bridge_entity": "val/vea_wrong_margin_violation",
+   "bridge_doc_count": 15,
+   "bridge_covers_gold": {
+    "2026-06-18_vea_wrong_evidence_supervision_fix.md": false,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 257,
+   "hop1_docs": 257,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-06-18_vea_wrong_evidence_supervision_fix.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R04": {
+   "entities_in_graph": {
+    "Shortcut Hypothesis": true,
+    "ResamplerV2": true,
+    "null": false
+   },
+   "entities_with_chunks": {
+    "Shortcut Hypothesis": true,
+    "ResamplerV2": true,
+    "null": false
+   },
+   "bridge_entity": "ResamplerV2",
+   "bridge_doc_count": 1,
+   "bridge_covers_gold": {
+    "2026-09-19_visual_student_reach_protocol.md": true,
+    "2026-09-19_weekly_experiment_inventory.md": false
+   },
+   "hop1_doc_count": 1,
+   "hop1_docs": 1,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-19_visual_student_reach_protocol.md",
+    "2026-09-19_weekly_experiment_inventory.md"
+   ]
+  },
+  "R05": {
+   "entities_in_graph": {
+    "Shortcut Hypothesis": true,
+    "ResamplerV2": true,
+    "null": false
+   },
+   "entities_with_chunks": {
+    "Shortcut Hypothesis": true,
+    "ResamplerV2": true,
+    "null": false
+   },
+   "bridge_entity": "ResamplerV2",
+   "bridge_doc_count": 1,
+   "bridge_covers_gold": {
+    "2026-09-19_visual_student_reach_protocol.md": true,
+    "2026-09-19_weekly_research_history_audit.md": false
+   },
+   "hop1_doc_count": 1,
+   "hop1_docs": 1,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-19_visual_student_reach_protocol.md",
+    "2026-09-19_weekly_research_history_audit.md"
+   ]
+  },
+  "R06": {
+   "entities_in_graph": {
+    "null": false,
+    "DA3": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "DA3": true
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 153,
+   "bridge_covers_gold": {
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md": true,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R07": {
+   "entities_in_graph": {
+    "null": false,
+    "DA3": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "DA3": true
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 153,
+   "bridge_covers_gold": {
+    "2026-09-19_droid_abstractor_proposal.md": true,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-19_droid_abstractor_proposal.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R08": {
+   "entities_in_graph": {
+    "A2S116b": true,
+    "A2S117": true,
+    "null": false
+   },
+   "entities_with_chunks": {
+    "A2S116b": true,
+    "A2S117": true,
+    "null": false
+   },
+   "bridge_entity": "A2S117",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-05-26_vea_a2s117_da3_depth_status.md": true,
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md": true
+   },
+   "hop1_doc_count": 50,
+   "hop1_docs": 50,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-05-26_vea_a2s117_da3_depth_status.md",
+    "2026-05-26_vea_da3_quorum_analysis_codex_claude_ninja.md"
+   ]
+  },
+  "R09": {
+   "entities_in_graph": {
+    "null": false
+   },
+   "entities_with_chunks": {
+    "null": false
+   },
+   "bridge_entity": null,
+   "bridge_doc_count": 0,
+   "bridge_covers_gold": {
+    "2026-07-20_fable5_hypothesis_methodology_audit.md": false,
+    "2026-07-20_gemini35_flash_quorum_review.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-07-20_fable5_hypothesis_methodology_audit.md",
+    "2026-07-20_gemini35_flash_quorum_review.md"
+   ]
+  },
+  "R10": {
+   "entities_in_graph": {
+    "null": false
+   },
+   "entities_with_chunks": {
+    "null": false
+   },
+   "bridge_entity": null,
+   "bridge_doc_count": 0,
+   "bridge_covers_gold": {
+    "2026-07-20_fable5_24h_results_audit.md": false,
+    "2026-07-20_gemini35_flash_quorum_review.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-07-20_fable5_24h_results_audit.md",
+    "2026-07-20_gemini35_flash_quorum_review.md"
+   ]
+  },
+  "R11": {
+   "entities_in_graph": {
+    "null": false,
+    "baseline8k": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "baseline8k": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-09-11_phase2-input-adaptation.md": true,
+    "2026-09-11_luna-critique-verification.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-11_phase2-input-adaptation.md",
+    "2026-09-11_luna-critique-verification.md"
+   ]
+  },
+  "R12": {
+   "entities_in_graph": {
+    "null": false,
+    "baseline8k": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "baseline8k": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-09-10_widened-reset-pure-rl-test.md": false,
+    "2026-09-11_luna-critique-verification.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-10_widened-reset-pure-rl-test.md",
+    "2026-09-11_luna-critique-verification.md"
+   ]
+  },
+  "R13": {
+   "entities_in_graph": {
+    "null": false,
+    "baseline8k": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "baseline8k": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-09-10_phase1-phase2-interface-localization.md": false,
+    "2026-09-11_luna-critique-verification.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-10_phase1-phase2-interface-localization.md",
+    "2026-09-11_luna-critique-verification.md"
+   ]
+  },
+  "R14": {
+   "entities_in_graph": {
+    "null": false,
+    "A11": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "A11": true
+   },
+   "bridge_entity": "A11",
+   "bridge_doc_count": 4,
+   "bridge_covers_gold": {
+    "2026-10-05_r25-selector-verdict-and-c1-prereg-20261005_144831.md": false,
+    "2026-10-04_r25-a11-source-contract-smoke-falsified_223851.md": true
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-10-05_r25-selector-verdict-and-c1-prereg-20261005_144831.md",
+    "2026-10-04_r25-a11-source-contract-smoke-falsified_223851.md"
+   ]
+  },
+  "R15": {
+   "entities_in_graph": {
+    "null": false,
+    "H6": true,
+    "A2S124a": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "H6": true,
+    "A2S124a": true
+   },
+   "bridge_entity": "H6",
+   "bridge_doc_count": 6,
+   "bridge_covers_gold": {
+    "2026-09-27_full_research_report.md": false,
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true
+   },
+   "hop1_doc_count": 257,
+   "hop1_docs": 257,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-09-27_full_research_report.md",
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md"
+   ]
+  },
+  "R16": {
+   "entities_in_graph": {
+    "null": false,
+    "H6": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "H6": true
+   },
+   "bridge_entity": "H6",
+   "bridge_doc_count": 6,
+   "bridge_covers_gold": {
+    "2026-09-27_full_research_report.md": false,
+    "2026-10-07_memory-archive-phase-c-destroys-phase-a-gains_141310.md": true
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-27_full_research_report.md",
+    "2026-10-07_memory-archive-phase-c-destroys-phase-a-gains_141310.md"
+   ]
+  },
+  "R17": {
+   "entities_in_graph": {
+    "null": false
+   },
+   "entities_with_chunks": {
+    "null": false
+   },
+   "bridge_entity": null,
+   "bridge_doc_count": 0,
+   "bridge_covers_gold": {
+    "2026-09-21_mixed_appearance_randomization.md": false,
+    "2026-09-21_orchestration_protocol_runB.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-21_mixed_appearance_randomization.md",
+    "2026-09-21_orchestration_protocol_runB.md"
+   ]
+  },
+  "R18": {
+   "entities_in_graph": {
+    "null": false
+   },
+   "entities_with_chunks": {
+    "null": false
+   },
+   "bridge_entity": null,
+   "bridge_doc_count": 0,
+   "bridge_covers_gold": {
+    "2026-09-21_mixed_appearance_randomization.md": false,
+    "2026-09-21_orchestration_protocol_runB.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-21_mixed_appearance_randomization.md",
+    "2026-09-21_orchestration_protocol_runB.md"
+   ]
+  },
+  "R19": {
+   "entities_in_graph": {
+    "null": false,
+    "B_G16": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "B_G16": true
+   },
+   "bridge_entity": "B_G16",
+   "bridge_doc_count": 1,
+   "bridge_covers_gold": {
+    "2026-09-13_abcd_c_h1_failure_decomposition.md": true,
+    "2026-09-13_abcd_b_screening_results.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-13_abcd_c_h1_failure_decomposition.md",
+    "2026-09-13_abcd_b_screening_results.md"
+   ]
+  },
+  "R20": {
+   "entities_in_graph": {
+    "null": false,
+    "Base9001": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "Base9001": true
+   },
+   "bridge_entity": "Base9001",
+   "bridge_doc_count": 4,
+   "bridge_covers_gold": {
+    "2026-09-13_abcd_c_h1_failure_decomposition.md": true,
+    "2026-09-19_weekly_artifact_runs_audit.md": true
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-13_abcd_c_h1_failure_decomposition.md",
+    "2026-09-19_weekly_artifact_runs_audit.md"
+   ]
+  },
+  "R21": {
+   "entities_in_graph": {
+    "null": false
+   },
+   "entities_with_chunks": {
+    "null": false
+   },
+   "bridge_entity": null,
+   "bridge_doc_count": 0,
+   "bridge_covers_gold": {
+    "2026-09-22_approach_alignment_arm_a_protocol.md": false,
+    "2026-09-21_matched_budget_adapter_vs_finetune.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-22_approach_alignment_arm_a_protocol.md",
+    "2026-09-21_matched_budget_adapter_vs_finetune.md"
+   ]
+  },
+  "R22": {
+   "entities_in_graph": {
+    "Minimal": true,
+    "gemini-3.7-flash": true,
+    "null": false
+   },
+   "entities_with_chunks": {
+    "Minimal": true,
+    "gemini-3.7-flash": true,
+    "null": false
+   },
+   "bridge_entity": "gemini-3.7-flash",
+   "bridge_doc_count": 1,
+   "bridge_covers_gold": {
+    "2026-08-14_gemini37_thinking_level_ab.md": false,
+    "2026-08-15_gemini_annotation_consolidated.md": true
+   },
+   "hop1_doc_count": 4,
+   "hop1_docs": 4,
+   "hop1_covers_all_gold": true,
+   "hop2_covers_all_gold": true,
+   "gold_docs": [
+    "2026-08-14_gemini37_thinking_level_ab.md",
+    "2026-08-15_gemini_annotation_consolidated.md"
+   ]
+  },
+  "R23": {
+   "entities_in_graph": {
+    "Wrist-Weighted Retrieval Variant": true,
+    "null": false
+   },
+   "entities_with_chunks": {
+    "Wrist-Weighted Retrieval Variant": true,
+    "null": false
+   },
+   "bridge_entity": null,
+   "bridge_doc_count": 0,
+   "bridge_covers_gold": {
+    "2026-07-08_b1_a25_evidence_pair_wrist_weighted_v3_result.md": false,
+    "vea_a2v_query_residual_processor_sidecar_eval20_2026-05-16.md": false
+   },
+   "hop1_doc_count": 1,
+   "hop1_docs": 1,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-07-08_b1_a25_evidence_pair_wrist_weighted_v3_result.md",
+    "vea_a2v_query_residual_processor_sidecar_eval20_2026-05-16.md"
+   ]
+  },
+  "R24": {
+   "entities_in_graph": {
+    "null": false,
+    "DA3": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "DA3": true
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 153,
+   "bridge_covers_gold": {
+    "2026-07-10_vea_a1_a2_b1_recipe_audit_and_launch.md": false,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-07-10_vea_a1_a2_b1_recipe_audit_and_launch.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R25": {
+   "entities_in_graph": {
+    "A2S125a": true,
+    "DA3": true,
+    "null": false
+   },
+   "entities_with_chunks": {
+    "A2S125a": true,
+    "DA3": true,
+    "null": false
+   },
+   "bridge_entity": "DA3",
+   "bridge_doc_count": 153,
+   "bridge_covers_gold": {
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md": true,
+    "2026-07-02_da3_depth_pair_rule_ceiling.md": false
+   },
+   "hop1_doc_count": 176,
+   "hop1_docs": 176,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-05-27_vea_a2s121b_resume_and_h6_metrics.md",
+    "2026-07-02_da3_depth_pair_rule_ceiling.md"
+   ]
+  },
+  "R26": {
+   "entities_in_graph": {
+    "Pre-RL Paired Evaluation": true,
+    "Train_Secured8192_V2": true,
+    "null": false
+   },
+   "entities_with_chunks": {
+    "Pre-RL Paired Evaluation": true,
+    "Train_Secured8192_V2": true,
+    "null": false
+   },
+   "bridge_entity": "Train_Secured8192_V2",
+   "bridge_doc_count": 1,
+   "bridge_covers_gold": {
+    "2026-09-15_grouped-ac-learning-audit.md": false,
+    "2026-09-19_weekly_research_history_audit.md": false
+   },
+   "hop1_doc_count": 7,
+   "hop1_docs": 7,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-15_grouped-ac-learning-audit.md",
+    "2026-09-19_weekly_research_history_audit.md"
+   ]
+  },
+  "R27": {
+   "entities_in_graph": {
+    "null": false,
+    "Gemini-3.6-Flash": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "Gemini-3.6-Flash": true
+   },
+   "bridge_entity": "Gemini-3.6-Flash",
+   "bridge_doc_count": 3,
+   "bridge_covers_gold": {
+    "2026-08-14_native_video_annotation_cost_model.md": false,
+    "2026-07-30_openrouter_gemma4_online_image_smoke.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-08-14_native_video_annotation_cost_model.md",
+    "2026-07-30_openrouter_gemma4_online_image_smoke.md"
+   ]
+  },
+  "R28": {
+   "entities_in_graph": {
+    "null": false,
+    "baseline8k": true
+   },
+   "entities_with_chunks": {
+    "null": false,
+    "baseline8k": true
+   },
+   "bridge_entity": "baseline8k",
+   "bridge_doc_count": 2,
+   "bridge_covers_gold": {
+    "2026-09-12_baseline8k-failure-mode-breakdown.md": false,
+    "2026-09-19_weekly_research_history_audit.md": false
+   },
+   "hop1_doc_count": 0,
+   "hop1_docs": 0,
+   "hop1_covers_all_gold": false,
+   "hop2_covers_all_gold": false,
+   "gold_docs": [
+    "2026-09-12_baseline8k-failure-mode-breakdown.md",
+    "2026-09-19_weekly_research_history_audit.md"
+   ]
+  }
+ }
+}

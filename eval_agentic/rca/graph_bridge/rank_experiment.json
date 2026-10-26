@@ -1,0 +1,127 @@
+{
+  "n_queries": 300,
+  "aggregation_at_default_expansion": {
+    "sum": {
+      "answer_scored_rate": 0.74,
+      "answer_in_top20_all_queries": 0.17,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.064,
+      "answer_in_top20_actionable": 0.1512,
+      "median_rank_when_scored": 71.0
+    },
+    "max": {
+      "answer_scored_rate": 0.74,
+      "answer_in_top20_all_queries": 0.1167,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.0465,
+      "answer_in_top20_actionable": 0.1512,
+      "median_rank_when_scored": 88.0
+    },
+    "mean": {
+      "answer_scored_rate": 0.74,
+      "answer_in_top20_all_queries": 0.1067,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.0349,
+      "answer_in_top20_actionable": 0.1047,
+      "median_rank_when_scored": 104.5
+    },
+    "sqrt": {
+      "answer_scored_rate": 0.74,
+      "answer_in_top20_all_queries": 0.16,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.0581,
+      "answer_in_top20_actionable": 0.1337,
+      "median_rank_when_scored": 62.0
+    },
+    "bonus_first": {
+      "answer_scored_rate": 0.74,
+      "answer_in_top20_all_queries": 0.2467,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1105,
+      "answer_in_top20_actionable": 0.2151,
+      "median_rank_when_scored": 54.0
+    },
+    "max_bonus": {
+      "answer_scored_rate": 0.74,
+      "answer_in_top20_all_queries": 0.22,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1221,
+      "answer_in_top20_actionable": 0.2209,
+      "median_rank_when_scored": 71.5
+    }
+  },
+  "expansion_grid_bonus_first": {
+    "hub10_hop1": {
+      "answer_scored_rate": 0.6867,
+      "answer_in_top20_all_queries": 0.27,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.0988,
+      "answer_in_top20_actionable": 0.2326,
+      "median_rank_when_scored": 40.0,
+      "median_scored_chunks": 924.5
+    },
+    "hub10_hop2": {
+      "answer_scored_rate": 0.7,
+      "answer_in_top20_all_queries": 0.2733,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1163,
+      "answer_in_top20_actionable": 0.2442,
+      "median_rank_when_scored": 46.5,
+      "median_scored_chunks": 1006.0
+    },
+    "hub20_hop1": {
+      "answer_scored_rate": 0.7,
+      "answer_in_top20_all_queries": 0.2533,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1047,
+      "answer_in_top20_actionable": 0.2267,
+      "median_rank_when_scored": 45.0,
+      "median_scored_chunks": 1010.5
+    },
+    "hub20_hop2": {
+      "answer_scored_rate": 0.72,
+      "answer_in_top20_all_queries": 0.2533,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1105,
+      "answer_in_top20_actionable": 0.2151,
+      "median_rank_when_scored": 51.5,
+      "median_scored_chunks": 1164.5
+    },
+    "hub40_hop1": {
+      "answer_scored_rate": 0.71,
+      "answer_in_top20_all_queries": 0.24,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.0988,
+      "answer_in_top20_actionable": 0.2093,
+      "median_rank_when_scored": 55,
+      "median_scored_chunks": 1150.5
+    },
+    "hub40_hop2": {
+      "answer_scored_rate": 0.7367,
+      "answer_in_top20_all_queries": 0.24,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1105,
+      "answer_in_top20_actionable": 0.2035,
+      "median_rank_when_scored": 51,
+      "median_scored_chunks": 1376.5
+    },
+    "hub80_hop1": {
+      "answer_scored_rate": 0.7267,
+      "answer_in_top20_all_queries": 0.2433,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1047,
+      "answer_in_top20_actionable": 0.2093,
+      "median_rank_when_scored": 63.0,
+      "median_scored_chunks": 1287.5
+    },
+    "hub80_hop2": {
+      "answer_scored_rate": 0.74,
+      "answer_in_top20_all_queries": 0.2467,
+      "actionable_queries": 172,
+      "answer_in_top5_actionable": 0.1105,
+      "answer_in_top20_actionable": 0.2151,
+      "median_rank_when_scored": 54.0,
+      "median_scored_chunks": 1540.5
+    }
+  }
+}
