@@ -34,6 +34,14 @@ batch_chains = 4                      # chains per run_chainreplay invocation (t
 retries      = 1                      # re-run invalid / missing (chain, B) cells this many times
 budgets      = [1536]                 # primary cell only. OPT-IN protocol sweep: [1536, 1024, 512] (~3x the cost)
 graph_store  = ""                     # <HARS sessions dir> for the funnel's anchor_in_graph stage (optional)
+# Amendment C.4: the baseline summary cap is a CALIBRATED parity parameter. Run `home_run.py calibrate` once before `oh`
+# (writes <campaign>/calibration.json, excludes the calibration chain from the decision set). `oh` refuses without it unless
+# you set an explicit cap here or pass --baseline-cap on the command line (recorded as source "cli", not a calibration).
+# Both are also the START value of `calibrate`. Leave empty to calibrate from cap = B.
+baseline_cap       = ""               # "1536:2010,1024:1340" per B, or a table { 1536 = 2010 }
+baseline_cap_scale = 0.0              # cap(B) = round(B * scale) for the B not in baseline_cap (0 = unset), e.g. 1.31
+calibration_max_iterations = 2        # max calibration runs per B (initial + retry at the runner's advice)
+calibration_seed = 20261026           # calibration chain = first of the seeded order (C.4-2); fixed before results
 
 [beam]                                # Amendment C.2/C.3 long-session track: BEAM-1M, a seeded sample
 repo        = "~/data/BEAM"           # git clone https://github.com/mohammadtavakoli78/BEAM
@@ -63,7 +71,7 @@ max_questions = 0
 extra_args  = []
 
 [smoke]                               # caps of `home_run.py smoke` (cents-level; hard)
-run_cap_oh  = 0.60
+run_cap_oh  = 0.90
 run_cap_ls  = 0.25
 judge_cap   = 0.25
 

@@ -526,6 +526,12 @@ def merge(args) -> int:
         print(f"  {k:<8} arms={v['arms']} qids={v['qids']} incomplete={v['qids_incomplete']}")
 
     merged_order = list(dict.fromkeys(c for D in dirs for c in D["chains"]))
+    excluded = [c.strip() for c in (args.exclude_chains or "").split(",") if c.strip()]
+    leaked = [c for c in merged_order if c in set(excluded)]
+    if leaked:
+        errors.append(f"excluded chain(s) {leaked} (--exclude-chains: the calibration chain, "
+                      "Amendment C.4) are present in the merged run dirs; a calibration chain "
+                      "must never enter the decision set")
     order_note = None
     if args.chains:
         ref = load_chain_order(args.chains)
@@ -620,6 +626,7 @@ def merge(args) -> int:
         "argv": sys.argv, "inputs": [{"dir": D["dir"], "chains": D["chains"],
                                       "files": D["files"]} for D in dirs],
         "chain_order": merged_order, "chain_order_check": order_note,
+        "excluded_chains": excluded,
         "arm_completeness": completeness,
         "profile": (manifests[0].get("profile") if manifests else None),
         "embedder_id": ((manifests[0].get("embedder") or {}).get("id") if manifests else None),
@@ -855,6 +862,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="fresh output dir (must not exist or be empty)")
     ap.add_argument("--chains", default="",
                     help="chains.jsonl: report merged chain order vs its order")
+    ap.add_argument("--exclude-chains", default="", metavar="ID[,ID...]",
+                    help="chain ids that must NOT be in the merged set (Amendment C.4 calibration "
+                         "chain): their presence in any input dir is an error")
     ap.add_argument("--allow-invalid", action="store_true",
                     help="keep chains with valid!=true / recall_error / no chain_budget "
                          "row (reported, flagged in run_budget.json)")

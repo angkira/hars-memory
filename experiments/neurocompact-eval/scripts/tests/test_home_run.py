@@ -402,6 +402,7 @@ class FakeRunner:
         self.invalid_first = set(invalid_first)       # (chain, B) cells that come out invalid on the first attempt
         self.attempts = {}
         self.stop_after = None
+        self.calibration_script = []                  # dicts: ratio / clip_baseline / recommended_cap per --calibrate call
 
     def __call__(self, argv, env, cwd, log_path, echo=True):
         script = next((os.path.basename(a) for a in argv if a.endswith(".py")), "")
@@ -423,6 +424,8 @@ class FakeRunner:
         if "--dry-run" in argv:
             return 0, ("== chain_x_c0\n  projected cost: agent $0.3 + HARS $0.0 = $0.30\n"
                        "TOTAL projected: 12 compactions, 80 asks, ~120.0 min, $1.2000\n")
+        if "--calibrate" in argv:
+            return self.calibrate(argv)
         out, B = self.arg(argv, "--out"), int(self.arg(argv, "--mem-budgets"))
         chains = [json.loads(l) for l in open(self.arg(argv, "--chains")) if l.strip()]
         os.makedirs(out, exist_ok=True)
@@ -454,6 +457,25 @@ class FakeRunner:
                    "spend": {"spent_usd": spent, "stopped_by_budget": bool(self.stop_after)}},
                   open(os.path.join(out, "run_manifest.json"), "w"))
         return 0, f"spend: ${spent}\n"
+
+    def calibrate(self, argv):
+        """Stands in for `run_chainreplay.py --calibrate`: scripted outcome per call (default: passes at once)."""
+        out, B = self.arg(argv, "--out"), int(self.arg(argv, "--mem-budgets"))
+        cap = int(self.arg(argv, "--baseline-cap").split(":")[1])
+        step = self.calibration_script.pop(0) if self.calibration_script else {}
+        ratio = step.get("ratio", 0.95)
+        clipb = step.get("clip_baseline", False)
+        clipn = step.get("clip_nc", False)
+        os.makedirs(out, exist_ok=True)
+        cal = {"mode": "calibrate", "chain_id": json.loads(open(self.arg(argv, "--chains")).readline())["chain_id"],
+               "mem_budget": B, "baseline_cap": cap, "ratio": ratio, "in_window": 0.8 <= ratio <= 1.05,
+               "clip": {"baseline": {"compactions": 3, "unrepaired_clipped": 3 if clipb else 0, "clip_fail": clipb},
+                        "nc-chunks": {"compactions": 3, "unrepaired_clipped": 3 if clipn else 0, "clip_fail": clipn}},
+               "clip_free": not (clipb or clipn), "recommended_cap": step.get("recommended_cap", cap),
+               "nc_memory_total": 1500, "baseline_memory_total": round(1500 / ratio), "spent_usd": 0.25}
+        json.dump(cal, open(os.path.join(out, "calibration.json"), "w"))
+        self.cal_argvs = getattr(self, "cal_argvs", []) + [argv]
+        return 0, f"calibration cap {cap} ratio {ratio}\n"
 
     def touch_out(self, argv):
         open(self.arg(argv, "--out"), "w").write("{}\n")
@@ -503,7 +525,8 @@ class OpenHandsFlow(unittest.TestCase):
         return open(os.path.join(self.root, ".homerun-current")).read()
 
     def run_oh(self, runner, extra=(), toml=None):
-        argv = self.base + (["--config", toml] if toml else []) + ["oh", *extra]
+        # the oh track refuses without a calibration or an explicit cap (Amendment C.4): scale 1.0 = cap == B
+        argv = self.base + (["--config", toml] if toml else []) + ["oh", *(extra or ["--baseline-cap-scale", "1.0"])]
         return quiet(H.main, argv, runner=runner)
 
     def toml(self, text):
@@ -606,7 +629,7 @@ class OpenHandsFlow(unittest.TestCase):
         self.assertEqual(len([e for e in led if e["phase"] == "run"]), 2)
         # a cap that is already spent refuses a new batch
         rc, so, se = quiet(H.main, ["--root", self.root, "--oh-dir", self.art, "--run-cap", "0.5", "--judge-cap", "9",
-                                    "--config", t, "oh", "--force-step", "oh.run.b1536-00", "--accept-partial"], runner=r)
+                                    "--config", t, "oh", "--baseline-cap-scale", "1.0", "--force-step", "oh.run.b1536-00", "--accept-partial"], runner=r)
         self.assertEqual(rc, 2)
         self.assertIn("spent", se)
 

@@ -36,12 +36,12 @@
 
 Written 2026-10-26. You run everything here with your HARS, your real embedder and your Anthropic key
 (later maybe OpenRouter / Gemini through a profile), and send ONE file back: the bundle (step 9).
-The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, C.2, **C.3**). Nothing in this
+The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, C.2, C.3, **C.4**). Nothing in this
 runbook changes a metric or a rule; the tooling is `scripts/home_run.py` (one entry point) on top of the
 existing scripts. All paths below are relative to the repo root.
 
 ```
-home_run.py doctor | hars-env | dry-run | smoke | oh | beam | cc | bundle
+home_run.py doctor | hars-env | dry-run | smoke | calibrate | oh | beam | cc | bundle
 ```
 
 ## 0. What you are going to spend and wait (read this first)
@@ -167,7 +167,9 @@ command lines included. Re-running a subcommand skips finished steps and resumes
 
 ```bash
 HR dry-run [--find "TITLE"]      # zero spend: per-track gen/run/judge estimate, ALL-TRACKS TOTAL vs $30, cache saving, wall-clock
-HR smoke                         # 1 cheapest OH chain + 1 tiny synthetic long session, ~$0.5-0.8 total (own campaign); must PASS
+HR smoke                         # 1 cheapest OH chain (incl. its baseline-cap calibration) + 1 tiny synthetic long session, ~$0.5-0.8 plus the calibration runs, cents each (own campaign); must PASS
+HR calibrate                     # Amendment C.4, ONCE per decision set, BEFORE `oh`: baseline cap on the calibration chain
+                                 #   (first chain in seeded order; no QA asks, ~cents) -> <campaign>/calibration.json; must say PASS
 HR oh                            # OpenHands chains (add --oh-tar TAR the first time): batches of 4, B-major, retries invalid cells once,
                                  #   merge -> export -> judge -> metrics_v2 -> funnel
 HR beam                          # BEAM-1M: seeded 10-chat import -> run_longsession (end checkpoint, B per [beam] budgets)
@@ -183,12 +185,42 @@ Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export
 printed in every report, C.1-2). The vendor switch (OpenRouter / Gemini) is `--profile NAME` and a NEW decision set
 (C.1-4): never mix profiles or embedders inside one campaign.
 
-Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `oh` (cheapest, ~7 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
+Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~7 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
+
+### 6a. Baseline-cap calibration (Amendment C.4) - why `oh` refuses without it
+
+With the baseline cap equal to B the baseline summaries can be cut at the cap (`stop=length`, CLIP FAIL) and the
+realized parity ratio nc/baseline can leave [0.80, 1.05] (your home smoke: 1.31). The cap is therefore a calibrated parity
+parameter. `HR calibrate` runs `run_chainreplay.py --calibrate` on ONE chain (the first in the seeded order of
+`[oh] calibration_seed`, default 20261026; no QA asks, no judge), reads the runner's own advice (`recommended_cap`) and
+re-runs at that cap, at most `--max-iterations` runs per B (default 2: initial + one retry; `[oh] calibration_max_iterations`).
+It accepts when the run is CLIP-free AND the ratio is inside the window, then writes `<campaign>/calibration.json`
+(per-B caps, `scale`, ratio achieved, chain id, cost, every iteration). Then:
+
+* `HR oh` takes the calibrated caps (`--baseline-cap 1536:<cap>` + `--baseline-cap-scale <cap/1536>` + `--baseline-cap-source
+  calibrated:<run dir>` go to every `run_chainreplay.py`); a B you did not calibrate (`--budgets 1536,1024`) uses the scale;
+  both are recorded per B in `oh/caps.json`, `chain_budget.jsonl`, `records.jsonl`, `run_manifest.json`, `run_budget.json`.
+* The calibration chain is EXCLUDED from the decision set automatically (13 of 14 chains run; `oh/inputs/chains.jsonl` is
+  the decision set, `chains.all.jsonl` the full artifact; `--exclude-chains` to the runner and merge, `--exclude-sid` to metrics).
+* The caps are frozen for the campaign (`oh/caps.json`); other caps need `--new` (a new decision set).
+* `HR oh` without a passing `calibration.json` REFUSES (before any spend) unless you give a cap yourself: `HR oh --baseline-cap
+  1536:2010` (or `--baseline-cap-scale 1.31`, or `[oh] baseline_cap = "1536:2010"` / `baseline_cap_scale` in `home_run.toml`).
+  An explicit cap is recorded with source `cli` and is NOT a calibration; `HR calibrate` also starts from such a value.
+* `HR smoke` runs the same calibration on its own single chain (not excluded) and then the OH flow at the calibrated cap.
+
+**If the calibration FAILS** (`[calibrate] FAIL: ...`, `calibration.json` has `status: "fail"`, `per_b.<B>.stopped_because` and
+`next_cap_suggestion`): nothing was run on the decision set. In order: (1) the reason `max iterations ... reached` - the advice
+still moved the cap; re-run with more room `HR calibrate --max-iterations 4` (finished iterations are kept and skipped; the
+extra runs cost cents); (2) `NC note itself is clipped` - the nc note cap is frozen by the protocol, not tunable here: send the
+bundle (`HR bundle`) and the log `logs/oh.calibrate.*.log`, do NOT change `--note-sum-max-tokens`; (3) `advice does not move the
+cap` / `no measured ratio` - the realized baseline does not grow with the cap (the model saturates) or a run produced no
+tokens: send the bundle, do not hand-tune the cap on decision chains; (4) you may always pass the cap you want explicitly
+(`HR oh --baseline-cap 1536:<cap>`), but that is then an uncalibrated choice and the run says so.
 
 ## 7. What each track gives you (and what it cannot)
 
-* `oh`: primary = nc-graph vs baseline at B=1536 on 14 sessions, S1-S3 Holm family (C.2-1). The old "multihop"
+* `oh`: primary = nc-graph vs baseline at B=1536 on 13 sessions (the 14th is the calibration chain, C.4-4), S1-S3 Holm family (C.2-1). The old "multihop"
   items are analysed as `xspan_locator` (descriptive S4d/S5d). `REPORT-chains.md`, `metrics.json`, `funnel.md`.
 * `beam`: the C.2-3 / C.3-2 long-session track: primary nc-graph vs baseline at B=1536 on the 10 seeded BEAM-1M chats, family L1-L5 (L2/L3 n/a without the sweep)
   on the rubric-graded score, genuine multi-hop = `multi_session_reasoning`. Only 34 of 350 items carry a

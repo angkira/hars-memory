@@ -3,7 +3,28 @@
 Written 2026-10-26 by the interim agent. Read with: RUNBOOK-gate.md, REPORT-PROTOCOL.md,
 INFRA-NOTES.md, REPORT-forensics-gate212839.md.
 
-## STATE UPDATE 2026-10-26 (Amendment C.3: small run, prompt cache, cc discovery) — NEWEST, READ FIRST
+## STATE UPDATE 2026-10-26 (Amendment C.4: calibrated baseline cap) — NEWEST, READ FIRST
+
+Owner's home smoke: OH calibration at baseline cap 1536 failed (baseline C3 `stop=length` = CLIP FAIL on claude-haiku-5-5, run ratio
+nc/baseline 1.31 vs window [0.80, 1.05]); the runner's own advice was a cap near 2010. Two tooling bugs kept it from being applied:
+`args_for_budget` overwrote any explicit `--baseline-sum-max-tokens` with B in the sweep path, and `home_run.py` never passed a cap.
+Fixed (EVAL-VERSION / HOME_RUN_VERSION `2026-10-26.c4`: the owner's home copy must be refreshed, `doctor` row `stale_copy` says so):
+
+- **Amendment C.4** (REPORT-PROTOCOL.md 4a.4): the baseline cap is a calibrated parity parameter; the parity gate (realized-token ratio) is
+  unchanged. `run_chainreplay.py`: `--baseline-cap 1536:2010,1024:1340` > `--baseline-cap-scale S` (cap(B)=round(B*S)) > legacy
+  `--baseline-sum-max-tokens` (one B; refused with a multi-B `--mem-budgets`) > default B; `--baseline-cap-source default|cli|calibrated:<dir>`;
+  per-B cap + basis + source in chain_budget / records / compactions-extra / `run_manifest.json` (`baseline_caps`) / `run_budget.json`.
+  ONE value (NC_SUM_MAX_TOKENS) is the prompt limit, the provider max_tokens, the hard section trim and the CLIP threshold (no split).
+  `--exclude-chains`, `--calibrate` now reports `clip` / `clip_free` / `recommended_cap` / `spent_usd` and takes ONE B.
+- **`home_run.py calibrate`** (chain = first in seeded order; <= `calibration_max_iterations` (2) runs per B; accept = CLIP-free and ratio in
+  window; writes `<campaign>/calibration.json`). `oh` refuses without a passing calibration unless `--baseline-cap` / `--baseline-cap-scale` /
+  `[oh] baseline_cap` is given; passes the calibrated caps (uncalibrated B via scale); excludes the calibration chain from the decision set
+  (13 of 14 chains; `merge_runs.py --exclude-chains` guard, `metrics_v2 --exclude-sid`). `smoke` calibrates on its own chain (not excluded);
+  smoke OH run cap 0.60 -> 0.90.
+- Tests: `tests/test_baseline_cap.py` (offline; precedence, no overwrite in the sweep, manifest fields, calibrate loop fail -> advice -> pass,
+  refusal, exclusion). Runbook: HOME-RUNBOOK.md 6a (what to do if the calibration fails).
+
+## STATE UPDATE 2026-10-26 (Amendment C.3: small run, prompt cache, cc discovery) (earlier)
 
 The owner's home agent had looked at an OLD working copy (`/tmp/opencode/nc-eval`: old runner, OpenRouter-only judge/extractor, Haiku 4.5 defaults,
 5-session dataset). That copy is OBSOLETE; only `experiments/neurocompact-eval/` of branch `claude/youthful-thompson-yv6xqd` counts

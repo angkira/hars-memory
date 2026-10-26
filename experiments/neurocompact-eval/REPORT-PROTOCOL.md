@@ -518,6 +518,83 @@ home run: QA generation USD 3, runs (replay / compaction / answers + the flagged
 judge USD 5, total USD 30 across all tracks (`[caps]` are campaign-wide per phase unless a per-track
 override exists). `home_run.py dry-run` prints the estimate against the total before any spend.
 
+### 4a.4 PROTOCOL AMENDMENT C.4 (2026-10-26, written before any decision-set result was seen)
+
+Provenance: the owner's home smoke. With the baseline cap equal to B (1536) the OpenHands calibration
+chain failed twice: the baseline summaries ended `stop=length` on claude-haiku-5-5 (CLIP FAIL) and the
+run parity ratio nc / baseline was 1.31 against the window [0.80, 1.05]; the runner's own advice
+(`cap_advice`: realized / cap = fill, cap = target / fill) was a baseline cap near 2010. Two tooling
+defects kept that advice from being applied: in the per-B sweep path the runner overwrote any explicit
+`--baseline-sum-max-tokens` with B, and `home_run.py` never passed a cap. No record of any decision set
+exists at the time of writing (only offline fixtures and the cents-level smoke runs). As with C to C.3,
+nothing below may be edited after the first decision-set record exists; a deviation is Amendment D. C.4
+changes the BASELINE CAP value and how it is obtained; it does not touch any metric, threshold, arm,
+the parity window, the realized-token parity gate, the nc note cap, the nc recall cap formula, the
+prompt text, the judge, or the section-5 WIN / FAIL rules.
+
+**C.4-1. The baseline cap is a calibrated parity parameter, not a constant.** Amendment A fixed the
+baseline cap at B on the assumption that a summarizer fills what it is given. Measured on the
+protocol model it does not (fill 0.43-0.63 in the first protocol run, 1183 vs 2047 realized tokens
+across runs of one chain, section 4), so "cap = B" does not give realized-memory parity. What is pre-registered is
+the PARITY, i.e. the unchanged gate on REALIZED ask-time tokens (`ratio = nc_memory_total /
+baseline_memory_total` in [0.80, 1.05], mean over chains, per B and per treatment). The cap is the knob
+that makes the baseline's natural fill land there and is therefore set per B by the calibration below,
+before any decision-set record, and then frozen. Consequences stated openly:
+
+- With cap(B) > B the baseline's hard ceiling is above B (e.g. 2010 at B = 1536). The baseline is NOT
+  given more realized memory than the window allows: the gate is on realized tokens, and the window
+  admits a baseline up to 1/0.80 = 1.25 x the nc memory (the unchanged, pre-registered tolerance).
+- ONE value feeds everything the baseline summarizer sees: the prompt's "hard output limit" and its
+  85 % soft target, the provider `max_tokens` of the generation, the deterministic section trim
+  (`NC_SUM_SECTION_TRIM=1`) and the CLIP detection (`stop=length` at that `max_tokens`).
+  Generation and trim therefore share the cap by construction; they cannot diverge.
+- The nc side is unchanged: note cap round(640 B / 1536), recall cap = clamp(B - realized note,
+  round(256 B / 1536), round(1024 B / 1536)). The cap never enters the nc arithmetic.
+
+**C.4-2. Calibration procedure** (`home_run.py calibrate`, `run_chainreplay.py --calibrate`):
+
+1. *Chain.* The calibration chain is the FIRST chain in a seeded order of the artifact's chains:
+   the sorted chain ids shuffled by `random.Random("20261026:oh-calibration")` (seed `[oh]
+   calibration_seed`), first element. Fixed by the artifact and the seed, so it cannot be picked after
+   seeing any result; it is written to `calibration.json` (`chain_selection`).
+2. *Run.* The chain goes through both live arms (baseline, nc-chunks) up to C3 at the primary B (1536;
+   each further B listed in `[oh] budgets` is calibrated in turn) with NO QA asks and no judge, at a
+   starting cap (default B, or an explicit `[oh] baseline_cap` / `--baseline-cap`).
+3. *Acceptance* (both must hold): (a) CLIP-free by the same rule as `--require-no-clip` (no arm with more
+   than 1/6 unrepaired `stop=length` compactions; with three compactions per arm that is none), and (b)
+   the realized ratio of that run inside [0.80, 1.05].
+4. *Iteration.* If not accepted, the next cap is the runner's own advice (`recommended_cap` = target
+   realized / measured fill); a clipped baseline always grows (at least +10 %); a clipped nc note, a
+   missing ratio, or advice that does not move the cap end the calibration as FAILED. At most `N`
+   calibration runs per B (`--max-iterations`, `[oh] calibration_max_iterations`, default 2: the initial
+   run plus one retry), so the calibration costs a bounded number of cents-level runs (ledger, run cap).
+5. *Record.* `calibration.json` in the campaign: status, chain id and selection, per-B cap with every
+   iteration (cap, ratio, clip verdicts, advice, cost, run dir), `caps`, `scale`, `ratio` achieved,
+   total cost, `excluded_from_decision_set`. A FAILED calibration is recorded as such and is a
+   blocking condition (C.4-4), not a result.
+
+**C.4-3. Freeze and uncalibrated B.** After a passing calibration the caps are frozen for the campaign
+(`oh/caps.json`; a later invocation with different caps is refused, a new campaign is a new decision
+set). A B that was not calibrated uses `scale = cap(primary) / primary`: `cap(B) = round(B * scale)`;
+the run records that cap as `basis = scale` (calibrated B: `basis = map`), together with its source
+(`default` | `cli` | `calibrated:<run dir>`) per B in `chain_budget`, `records`, `compactions`,
+`run_manifest.json` (`baseline_caps`) and `run_budget.json`. Precedence in the runner: explicit per-B
+map > scale > legacy `--baseline-sum-max-tokens` (one B only) > default B; an explicit value is never
+replaced by B. The per-B parity gate is evaluated on the decision set as before; a scale-derived B that
+lands outside the window fails the gate and is reported as such (not re-tuned on decision data).
+
+**C.4-4. The calibration chain is excluded from the decision set.** The chain used to choose the cap
+has been seen at run time with the cap tuned against it, which is exactly the tuning-on-decision-chains
+failure recorded as M7 in section 6. The calibration chain is therefore removed from the OpenHands
+decision set automatically (13 of 14 chains): `home_run.py` writes the decision-set chain file without
+it, passes `--exclude-chains` to every run, `merge_runs.py` refuses a merged set that contains it and
+`metrics_v2.py` gets `--exclude-sid`; the exclusion is recorded in `calibration.json`, `oh/caps.json`,
+`oh_inputs.json` and the run / merge manifests. The `oh` track refuses to run without a passing
+calibration unless a cap is given explicitly (`--baseline-cap`, `--baseline-cap-scale` or `[oh]
+baseline_cap`, recorded with source `cli`; an explicit cap is a statement of the owner, not a
+calibration, and is labelled so). The `smoke` command calibrates on its own single chain WITHOUT
+excluding it (a smoke is not a decision set; its `calibration.json` is not reusable).
+
 ## 5. Measurement stack
 
 **Recall packer v2** (run_chainreplay.py, frozen after the gate-212839 offline eval):

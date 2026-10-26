@@ -17,6 +17,10 @@ adds NO new LLM call except the cents-level liveness pings of `doctor`.
              placeholders) to start the server for these runs.
   dry-run    all tracks, ZERO spend: cost / wall-clock estimate per phase (gen, run, judge) vs the caps.
   smoke      1 OpenHands chain + 1 tiny synthetic long session, a few cents to tens of cents (own campaign).
+  calibrate  Amendment C.4: calibrate the BASELINE CAP on the first chain in seeded order (run_chainreplay
+             --calibrate, no QA asks), iterate on the runner's own cap advice until CLIP-free and the
+             parity ratio is in [0.80, 1.05], write calibration.json. `oh` refuses to run without a passing
+             calibration (or an explicit --baseline-cap) and excludes the calibration chain from the set.
   oh         OpenHands chain track: batches (B-major, primary B first), retry of invalid cells, merge,
              export, judge, metrics, funnel.
   beam       BEAM: import selected chats, run_longsession, export, judge, metrics (--end-only, C.2 L-family).
@@ -75,8 +79,10 @@ JUDGE_IN_TOK, JUDGE_OUT_TOK = 1300, 80          # per judged item (prompt + exce
 LLM_S_PER_SUMMARY, LLM_S_PER_ASK = 20.0, 8.0    # rough wall-clock model for run_longsession (summariser / ask)
 TRACKS = ("oh", "beam", "cc")
 PHASES = ("gen", "run", "judge")
+CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
+PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
 PLACEHOLDER_CAP = 0.0
-HOME_RUN_VERSION = "2026-10-26.c3"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+HOME_RUN_VERSION = "2026-10-26.c4"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
 EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
 HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
 BUDGET_TOTAL_DEFAULT = 30.0
@@ -93,12 +99,17 @@ DEFAULT_CONFIG: dict = {
              "oh": {}, "beam": {}, "cc": {}},
     # small by default (Amendment C.3-2): 14 OH chains at B=1536; BEAM-1M N=10 seeded chats at B=1536; sweeps opt-in
     "oh": {"artifact_dir": "", "batch_chains": 4, "retries": 1, "budgets": [1536],
-           "graph_store": ""},
+           "graph_store": "",
+           # Amendment C.4: baseline cap = calibrated parity parameter. baseline_cap "1536:2010,1024:1340" (or a
+           # table {1536 = 2010}) / baseline_cap_scale (cap(B) = round(B*scale); 0 = unset) are EXPLICIT values:
+           # the start of `calibrate`, and accepted by `oh` without a calibration.
+           "baseline_cap": "", "baseline_cap_scale": 0.0,
+           "calibration_max_iterations": 2, "calibration_seed": 20261026},
     "beam": {"repo": "", "size": "1M", "chats": "sample", "n_chats": 10, "seed": 20261026, "limit": 0,
              "checkpoints": "end", "budgets": [1536], "session_concurrency": 1, "extra_args": []},
     "cc": {"paths": [], "root": "~/.claude/projects", "min_tokens": 0, "limit": 0, "n_single": 12, "n_multihop": 4,
            "session_budget_usd": 2.5, "checkpoints": "every:3", "budgets": [1536], "max_questions": 0, "extra_args": []},
-    "smoke": {"run_cap_oh": 0.60, "run_cap_ls": 0.25, "judge_cap": 0.25},
+    "smoke": {"run_cap_oh": 0.90, "run_cap_ls": 0.25, "judge_cap": 0.25},
     "hars": {"data_dir": "", "port": 8307},
 }
 
@@ -935,33 +946,65 @@ def placeholder_session(session: dict, n_q: int) -> dict:
     return s
 
 
+def oh_exclusions(camp: Campaign) -> list[str]:
+    """Chain ids kept OUT of the decision set: the calibration chain(s) (Amendment C.4)."""
+    cal = read_json(camp.p(CAL_FILE), None) or {}
+    return list(cal.get("excluded_from_decision_set") or [])
+
+
+def oh_all_chains(camp: Campaign) -> list[dict]:
+    oh_inputs(camp)
+    return read_jsonl(camp.p("oh", "inputs", "chains.all.jsonl"))
+
+
 def oh_inputs(camp: Campaign) -> str:
-    """Copy chains.jsonl (+ manifests) of the OH artifact dir into the campaign; returns its path."""
+    """Copy chains.jsonl (+ manifests) of the OH artifact dir into the campaign; returns the DECISION-SET
+    chains path (`oh/inputs/chains.jsonl` = chains.all.jsonl minus the calibration chain, Amendment C.4)."""
     dst = camp.p("oh", "inputs", "chains.jsonl")
-    if os.path.isfile(dst):
-        return dst
-    src_dir = camp.cfg["oh"].get("artifact_dir")
-    if not src_dir or not os.path.isfile(os.path.join(src_dir, "chains.jsonl")):
-        raise HomeRunError("[oh] artifact_dir (or --oh-dir) must be the copied OpenHands artifact dir holding "
-                           "chains.jsonl (HOME-RUNBOOK.md step 4)")
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    chains = read_jsonl(os.path.join(src_dir, "chains.jsonl"))
-    if not chains:
-        raise HomeRunError(f"{src_dir}/chains.jsonl is empty")
-    for fn in ("chains.jsonl", "chains-manifest.json", "verify-report.md", "MANIFEST.json", "dataset_stats.md"):
-        s = os.path.join(src_dir, fn)
-        if os.path.isfile(s):
-            shutil.copy2(s, os.path.join(os.path.dirname(dst), fn))
-    types: dict[str, int] = {}
-    for c in chains:
-        for q in c.get("qa", []):
-            k = ("unanswerable" if not q.get("answerable", True) else (q.get("qtype") or "single"))
-            types[k] = types.get(k, 0) + 1
-    write_json(camp.p("inputs", "oh_inputs.json"), {
-        "source_dir": os.path.abspath(src_dir), "chains": len(chains), "qa_by_type": types,
-        "sha256": {"chains.jsonl": sha256_file(dst)},
-        "note": "stored qtype 'multihop' is analysed as xspan_locator (Amendment C.2)"})
-    print(f"  OH inputs: {len(chains)} chains, qa by stored type {types}, sha256 {sha256_file(dst)[:12]}")
+    allp = camp.p("oh", "inputs", "chains.all.jsonl")
+    if not os.path.isfile(allp) and os.path.isfile(dst):         # campaign from before C.4
+        shutil.copy2(dst, allp)
+    if not os.path.isfile(allp):
+        src_dir = camp.cfg["oh"].get("artifact_dir")
+        if not src_dir or not os.path.isfile(os.path.join(src_dir, "chains.jsonl")):
+            raise HomeRunError("[oh] artifact_dir (or --oh-dir) must be the copied OpenHands artifact dir holding "
+                               "chains.jsonl (HOME-RUNBOOK.md step 4)")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        chains = read_jsonl(os.path.join(src_dir, "chains.jsonl"))
+        if not chains:
+            raise HomeRunError(f"{src_dir}/chains.jsonl is empty")
+        for fn in ("chains.jsonl", "chains-manifest.json", "verify-report.md", "MANIFEST.json", "dataset_stats.md"):
+            s_ = os.path.join(src_dir, fn)
+            if os.path.isfile(s_):
+                shutil.copy2(s_, os.path.join(os.path.dirname(dst), fn))
+        shutil.copy2(dst, allp)
+        types: dict[str, int] = {}
+        for c in chains:
+            for q in c.get("qa", []):
+                k = ("unanswerable" if not q.get("answerable", True) else (q.get("qtype") or "single"))
+                types[k] = types.get(k, 0) + 1
+        write_json(camp.p("inputs", "oh_inputs.json"), {
+            "source_dir": os.path.abspath(src_dir), "chains": len(chains), "qa_by_type": types,
+            "sha256": {"chains.jsonl": sha256_file(allp)},
+            "note": "stored qtype 'multihop' is analysed as xspan_locator (Amendment C.2)"})
+        print(f"  OH inputs: {len(chains)} chains, qa by stored type {types}, sha256 {sha256_file(allp)[:12]}")
+    excl = set(oh_exclusions(camp))
+    allc = read_jsonl(allp)
+    want = [c for c in allc if c["chain_id"] not in excl]
+    have = [c["chain_id"] for c in read_jsonl(dst)] if os.path.isfile(dst) else None
+    if have != [c["chain_id"] for c in want]:
+        with open(dst, "w") as f:
+            for c in want:
+                f.write(json.dumps(c, ensure_ascii=False) + "\n")
+        meta = read_json(camp.p("inputs", "oh_inputs.json"), {}) or {}
+        meta.update({"decision_set_chains": len(want), "excluded_from_decision_set": sorted(excl),
+                     "sha256_decision_set": sha256_file(dst)})
+        write_json(camp.p("inputs", "oh_inputs.json"), meta)
+        if excl:
+            print(f"  OH decision set: {len(want)} of {len(allc)} chains (calibration chain {sorted(excl)} excluded)")
+    if not want:
+        raise HomeRunError("no chains left in the OH decision set after excluding the calibration chain "
+                           f"{sorted(excl)}")
     return dst
 
 
@@ -1357,6 +1400,7 @@ def run_oh_batch(camp: Campaign, tag: str, chain_ids: list[str], B: int, chains_
                 "--out", out, "--mcp", camp.cfg["general"]["mcp"], "--require-no-clip"]
         if camp.cfg["general"].get("embedder_id"):
             argv += ["--embedder-id", camp.cfg["general"]["embedder_id"]]
+        argv += list(getattr(camp, "oh_extra_argv", []) or [])      # baseline caps + exclusions (Amendment C.4)
         rc, _ = camp.run(step, argv, check=False)
         spent, src = chainreplay_spend(out)
         man = read_json(os.path.join(out, "run_manifest.json"), {}) or {}
@@ -1418,6 +1462,273 @@ def oh_missing_or_invalid(camp: Campaign, ids: list[str], budgets: list[int]) ->
     return need
 
 
+# =============================================================================
+# baseline-cap calibration (Amendment C.4)
+# =============================================================================
+def caps_to_str(v) -> str:
+    """[oh] baseline_cap may be "1536:2010,1024:1340" or a TOML table {1536 = 2010}; -> the CLI string."""
+    if not v:
+        return ""
+    if isinstance(v, dict):
+        return ",".join(f"{int(b)}:{int(c)}" for b, c in v.items())
+    return str(v).strip()
+
+
+def caps_from_str(spec: str) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        b, sep, c = part.partition(":")
+        if not sep or not b.strip().isdigit() or not c.strip().isdigit():
+            raise HomeRunError(f"baseline cap entry {part!r} must be B:CAP (integers), e.g. 1536:2010")
+        out[int(b)] = int(c)
+    return out
+
+
+def explicit_caps(cfg: dict, args) -> dict | None:
+    """An explicit cap given on the CLI (origin `cli`) or in [oh] (origin `config`); None when neither."""
+    cm, cs = getattr(args, "baseline_cap", None), getattr(args, "baseline_cap_scale", None)
+    if cm or cs:
+        return {"map": caps_from_str(cm or ""), "scale": cs, "origin": "cli"}
+    cm, cs = caps_to_str(cfg["oh"].get("baseline_cap")), cfg["oh"].get("baseline_cap_scale") or None
+    if cm or cs:
+        return {"map": caps_from_str(cm), "scale": cs, "origin": "config"}
+    return None
+
+
+def pick_calibration_chain(ids: list[str], seed) -> tuple[str, list[str]]:
+    """First chain in the seeded order: sorted ids shuffled by random.Random("<seed>:oh-calibration")."""
+    order = sorted(ids)
+    random.Random(f"{seed}:oh-calibration").shuffle(order)
+    return order[0], order
+
+
+def parse_calibration_out(out: str) -> dict:
+    cal = read_json(os.path.join(out, "calibration.json"), None)
+    if not cal:
+        raise HomeRunError(f"{out}/calibration.json is missing: run_chainreplay --calibrate did not finish "
+                           "(see the step log; the paid work is on the ledger)")
+    return cal
+
+
+def next_calibration_cap(cap: int, cal: dict) -> tuple[int | None, str]:
+    """Next baseline cap from the runner's own advice, or (None, reason) when the cap cannot fix it."""
+    clip = cal.get("clip") or {}
+    if (clip.get("nc-chunks") or {}).get("clip_fail"):
+        return None, ("the NC note itself is clipped (stop=length): its cap is frozen by the protocol, a baseline "
+                      "cap cannot fix that")
+    bclip = bool((clip.get("baseline") or {}).get("clip_fail"))
+    rec = cal.get("recommended_cap")
+    bump = int(-(-cap * 11 // 10))                       # ceil(cap * 1.10)
+    if cal.get("ratio") is None:
+        return None, "no measured ratio (no baseline/nc realized tokens)"
+    if not cal.get("in_window"):
+        nxt = int(rec) if rec else None
+        if bclip:
+            nxt = max(nxt or 0, bump)
+    else:
+        nxt = bump if bclip else None
+    if nxt is None or nxt == cap:
+        return None, "the runner's advice does not move the cap"
+    return nxt, ""
+
+
+def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exclude: bool = True,
+                       start: dict | None = None, accept_partial: bool = False) -> dict:
+    """Amendment C.4. Per B: run_chainreplay --calibrate on the calibration chain (no QA asks), accept when
+    CLIP-free AND the realized parity ratio is in the window, else retry at the runner's recommended cap, at
+    most `max_iter` calibration runs per B. Writes <campaign>/calibration.json (status pass|fail)."""
+    cfg = camp.cfg
+    o = cfg["oh"]
+    allc = oh_all_chains(camp)
+    seed = o.get("calibration_seed", 20261026)
+    chain_id, order = pick_calibration_chain([c["chain_id"] for c in allc], seed)
+    cdir = camp.p("oh", "calibration")
+    os.makedirs(cdir, exist_ok=True)
+    chain_path = os.path.join(cdir, "chain.jsonl")
+    with open(chain_path, "w") as f:
+        f.write(json.dumps(next(c for c in allc if c["chain_id"] == chain_id), ensure_ascii=False) + "\n")
+    primary = 1536 if 1536 in budgets else max(budgets)
+    ordered = [primary] + sorted((b for b in budgets if b != primary), reverse=True)
+    start = start or {"map": {}, "scale": None, "origin": "default"}
+    print(f"[calibrate] chain {chain_id} (first of {len(order)} in seeded order, seed {seed}); B in {ordered}; "
+          f"at most {max_iter} calibration run(s) per B; acceptance: CLIP-free and ratio in [{PARITY_LO}, {PARITY_HI}]")
+    per_b: dict[str, dict] = {}
+    scale = None
+    status, spent_total = "pass", 0.0
+    for B in ordered:
+        if B in start["map"]:
+            cap = int(start["map"][B])
+        elif scale is not None:
+            cap = int(round(B * scale))
+        elif start.get("scale"):
+            cap = int(round(B * float(start["scale"])))
+        else:
+            cap = B
+        iters, ok, why = [], False, ""
+        for k in range(1, max_iter + 1):
+            step = f"oh.calibrate.b{B}.i{k}"
+            out = camp.p("oh", "calibration", f"b{B}-i{k}")
+
+            def go(B=B, cap=cap, out=out, step=step):
+                rem = camp.remaining("oh", "run")
+                if os.path.isdir(out) and os.listdir(out):
+                    camp.quarantine(out)
+                argv = [camp.script("run_chainreplay.py"), "--calibrate", "--chains", chain_path, "--limit", "1",
+                        *profile_args(camp.cfg), "--allow-same-family-judge", "--arms", "baseline,nc-chunks",
+                        "--mem-budgets", str(int(B)), "--baseline-cap", f"{int(B)}:{int(cap)}",
+                        "--baseline-cap-source", "cli", "--budget-usd", str(rem), "--out", out,
+                        "--mcp", camp.cfg["general"]["mcp"], "--require-no-clip"]
+                if camp.cfg["general"].get("embedder_id"):
+                    argv += ["--embedder-id", camp.cfg["general"]["embedder_id"]]
+                rc, _ = camp.run(step, argv, check=False)
+                cal = read_json(os.path.join(out, "calibration.json"), None) or {}
+                spent = float(cal.get("spent_usd") or 0.0)
+                camp.charge("oh", "run", step, spent, source=f"{out}#{time.time_ns()}",
+                            note="calibration.json spent_usd (measured pi usage + flagged HARS estimates)")
+                if rc != 0 or not cal:
+                    raise HomeRunError(f"calibration run {step} did not finish (exit {rc}); log logs/{step}.log; "
+                                       "re-running redoes it")
+                return {"B": B, "iter": k, "cap": cap, "out": out, "ratio": cal.get("ratio"),
+                        "in_window": cal.get("in_window"), "clip": cal.get("clip"),
+                        "clip_free": cal.get("clip_free"), "recommended_cap": cal.get("recommended_cap"),
+                        "nc_memory_total": cal.get("nc_memory_total"),
+                        "baseline_memory_total": cal.get("baseline_memory_total"), "spent_usd": spent}
+            res = camp.step(step, go)
+            if int(res.get("cap")) != int(cap):
+                raise HomeRunError(f"{step} was run at cap {res.get('cap')} but the config now implies {cap}: "
+                                   f"use --new for a fresh campaign or --force-step {step}")
+            iters.append(res)
+            spent_total += float(res.get("spent_usd") or 0.0)
+            print(f"  [calibrate B={B} #{k}] cap {cap}: ratio {res['ratio']} "
+                  f"({'in' if res['in_window'] else 'OUTSIDE'} window), clip-free={res['clip_free']}, "
+                  f"advice cap {res['recommended_cap']}, spent {fmt_usd(res['spent_usd'])}")
+            if res["clip_free"] and res["in_window"] is True:
+                ok = True
+                break
+            nxt, why = next_calibration_cap(cap, res)
+            if nxt is None:
+                break
+            if k == max_iter:
+                why = f"max iterations ({max_iter}) reached; the next cap would be {nxt}"
+                break
+            cap = nxt
+        per_b[str(B)] = {"cap": int(iters[-1]["cap"]), "accepted": ok, "ratio": iters[-1]["ratio"],
+                         "clip_free": iters[-1]["clip_free"], "run_dir": iters[-1]["out"],
+                         "iterations": iters, "stopped_because": ("" if ok else why),
+                         "next_cap_suggestion": (None if ok else iters[-1].get("recommended_cap"))}
+        if ok:
+            if B == primary:
+                scale = per_b[str(B)]["cap"] / B
+        else:
+            status = "fail"
+            break
+    pb = per_b.get(str(primary)) or {}
+    source_dir = pb.get("run_dir")
+    cal_out = {
+        "version": 1, "ts": utc_iso(), "track": "oh", "status": status, "chain_id": chain_id,
+        "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first',
+                            "seed": seed, "population": len(order), "order_head": order[:3]},
+        "primary_budget": primary, "budgets": ordered, "window": [PARITY_LO, PARITY_HI],
+        "max_iterations": max_iter,
+        "caps": {b: v["cap"] for b, v in per_b.items() if v["accepted"]},
+        "scale": (round(scale, 6) if scale is not None else None),
+        "scale_note": (f"cap(B)=round(B*scale) for B without a calibrated cap (scale = primary B={primary} "
+                       "cap / B)" if scale is not None else None),
+        "ratio": pb.get("ratio"), "per_b": per_b,
+        "source_run_dir": source_dir, "spent_usd": round(spent_total, 6),
+        "started_from": {"origin": start.get("origin"), "map": {str(k): v for k, v in start["map"].items()},
+                         "scale": start.get("scale")},
+        "excluded_from_decision_set": ([chain_id] if exclude else []),
+        "note": ("the calibration chain is excluded from the decision set (Amendment C.4)" if exclude else
+                 "smoke: nothing here is a decision set, the calibration chain is not excluded"),
+    }
+    write_json(camp.p(CAL_FILE), cal_out)
+    camp.write_manifest()
+    if status == "pass":
+        print(f"[calibrate] PASS: caps {cal_out['caps']} scale {cal_out['scale']} -> {camp.p(CAL_FILE)}")
+    else:
+        bad = next(v for v in per_b.values() if not v["accepted"])
+        print(f"[calibrate] FAIL: {bad['stopped_because']}. Last cap {bad['cap']}, ratio {bad['ratio']}, "
+              f"runner advice {bad['next_cap_suggestion']}. See HOME-RUNBOOK.md (calibration failed). "
+              f"calibration.json: {camp.p(CAL_FILE)}")
+    return cal_out
+
+
+def oh_cap_plan(camp: Campaign, args, budgets: list[int]) -> dict:
+    """Caps for the oh run: explicit CLI > passing calibration > explicit [oh] config; refuse otherwise. The
+    result is frozen per campaign in oh/caps.json (a later invocation with other caps is refused)."""
+    cfg = camp.cfg
+    cal = read_json(camp.p(CAL_FILE), None) or {}
+    cli = {"map": caps_from_str(getattr(args, "baseline_cap", None) or ""),
+           "scale": getattr(args, "baseline_cap_scale", None)}
+    if cli["map"] or cli["scale"]:
+        ex = {**cli, "origin": "cli"}
+        mode, source = "explicit", "cli"
+    elif cal.get("status") == "pass":
+        ex = {"map": {int(b): int(c) for b, c in (cal.get("caps") or {}).items()}, "scale": cal.get("scale"),
+              "origin": "calibration"}
+        mode, source = "calibrated", f"calibrated:{cal.get('source_run_dir')}"
+    elif explicit_caps(cfg, args):
+        ex = explicit_caps(cfg, args)
+        mode, source = "explicit", "cli"
+    else:
+        why = ("the calibration FAILED (see calibration.json; HOME-RUNBOOK.md 'calibration failed')"
+               if cal else "there is no calibration yet")
+        raise HomeRunError(f"oh refuses to run: {why}. The baseline cap is a calibrated parity parameter "
+                           "(Amendment C.4): run `home_run.py calibrate` first, or pass --baseline-cap "
+                           "1536:<cap> (or --baseline-cap-scale S / [oh] baseline_cap) explicitly.")
+    rows = {}
+    for B in budgets:
+        if B in ex["map"]:
+            rows[str(B)] = {"cap": int(ex["map"][B]), "basis": "map", "source": source}
+        elif ex["scale"]:
+            rows[str(B)] = {"cap": int(round(B * float(ex["scale"]))), "basis": "scale", "source": source}
+        else:
+            raise HomeRunError(f"no baseline cap for B={B}: the explicit map {ex['map']} has no entry for it and "
+                               "no --baseline-cap-scale is set; pass --baseline-cap-scale or add the B to the map")
+    plan = {"mode": mode, "origin": ex["origin"], "source": source, "caps": rows,
+            "map": {str(k): v for k, v in ex["map"].items()}, "scale": ex["scale"],
+            "calibration": camp.p(CAL_FILE) if cal else None,
+            "excluded_from_decision_set": oh_exclusions(camp), "ts": utc_iso()}
+    frozen = read_json(camp.p("oh", "caps.json"), None)
+    if frozen:
+        diff = {b: (frozen["caps"][b]["cap"], r["cap"]) for b, r in rows.items()
+                if b in frozen["caps"] and frozen["caps"][b]["cap"] != r["cap"]}
+        if diff:
+            raise HomeRunError(f"the baseline caps are FROZEN per campaign (oh/caps.json) and differ now: "
+                               f"{diff} (B: frozen, new). Start a new campaign (--new) to use other caps.")
+        plan["caps"] = {**frozen["caps"], **rows}
+    os.makedirs(camp.p("oh"), exist_ok=True)
+    write_json(camp.p("oh", "caps.json"), plan)
+    argv = []
+    if ex["map"]:
+        argv += ["--baseline-cap", caps_to_str(ex["map"])]
+    if ex["scale"]:
+        argv += ["--baseline-cap-scale", str(ex["scale"])]
+    argv += ["--baseline-cap-source", source]
+    if plan["excluded_from_decision_set"]:
+        argv += ["--exclude-chains", ",".join(plan["excluded_from_decision_set"])]
+    plan["argv"] = argv
+    return plan
+
+
+def cmd_calibrate(camp: Campaign, args) -> int:
+    cfg = camp.cfg
+    if cfg["general"].get("_offline"):
+        raise HomeRunError("the oh calibration needs the pi agent: there is no offline self-test for it")
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    n = int(args.max_iterations if args.max_iterations is not None else cfg["oh"]["calibration_max_iterations"])
+    if n < 1:
+        raise HomeRunError("--max-iterations must be >= 1")
+    start = explicit_caps(cfg, args)
+    res = run_oh_calibration(camp, budgets=budgets, max_iter=n, exclude=True, start=start)
+    return 0 if res["status"] == "pass" else 1
+
+
+
 def cmd_oh(camp: Campaign, args) -> int:
     cfg = camp.cfg
     o = cfg["oh"]
@@ -1426,6 +1737,12 @@ def cmd_oh(camp: Campaign, args) -> int:
     chains_path = oh_inputs(camp)
     ids = [c["chain_id"] for c in read_jsonl(chains_path)]
     budgets = [int(b) for b in (args.budgets or o["budgets"])]
+    plan = oh_cap_plan(camp, args, budgets)          # refuses BEFORE any spend without a calibration / explicit cap
+    camp.oh_extra_argv = plan["argv"]
+    print(f"[oh] baseline caps ({plan['mode']}, source {plan['source']}): "
+          + ", ".join(f"B={b}: {r['cap']} [{r['basis']}]" for b, r in plan["caps"].items() if int(b) in budgets)
+          + (f"; excluded from the decision set: {plan['excluded_from_decision_set']}"
+             if plan["excluded_from_decision_set"] else ""))
     est = camp.step("oh.estimate", lambda: {"estimate": estimate_oh(camp)})["estimate"]
     guard_estimate(camp, "oh", est, args.accept_partial)
     bsz = max(1, int(o["batch_chains"]))
@@ -1452,6 +1769,8 @@ def cmd_oh(camp: Campaign, args) -> int:
         if os.path.isdir(merged) and os.listdir(merged):
             camp.quarantine(merged)
         argv = [camp.script("merge_runs.py"), "--out", merged, "--chains", chains_path, *views]
+        if oh_exclusions(camp):
+            argv += ["--exclude-chains", ",".join(oh_exclusions(camp))]
         if invalid:
             argv.append("--allow-invalid")
             print(f"  WARNING {len(invalid)} cell(s) stay invalid after the retries and are kept with valid=false "
@@ -1467,9 +1786,11 @@ def cmd_oh(camp: Campaign, args) -> int:
         print("[oh] --skip-judge: stopping before the judge")
         return 0
     camp.step("oh.judge", lambda: judge_step(camp, "oh", "oh", ji, judged, mp, args.accept_partial))
-    camp.step("oh.metrics", lambda: metrics_step(camp, "oh.metrics", rec, judged, mp, ji,
-                                                 os.path.join(merged, "REPORT-chains.md"),
-                                                 os.path.join(merged, "metrics.json")))
+    excl = oh_exclusions(camp)
+    camp.step("oh.metrics", lambda: metrics_step(
+        camp, "oh.metrics", rec, judged, mp, ji, os.path.join(merged, "REPORT-chains.md"),
+        os.path.join(merged, "metrics.json"),
+        (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else None)))
 
     def do_funnel():
         argv = [camp.script("funnel_chains.py"), "--run", merged, "--chains", chains_path,
@@ -1772,13 +2093,26 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
                     shutil.copy2(os.path.join(src, fn), first)
             os.remove(all_p)
             scfg["oh"]["artifact_dir"] = first
-            ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=bool(args.skip_judge))
+            ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=bool(args.skip_judge),
+                                    baseline_cap=None, baseline_cap_scale=None)
             camp.cfg = scfg
+            cal_info = {}
+            if not getattr(args, "skip_calibrate", False):
+                # the smoke chain is the only chain: calibrate on it, do NOT exclude it (nothing here is a decision set)
+                cal = run_oh_calibration(camp, budgets=[1536], exclude=False,
+                                         max_iter=int(scfg["oh"]["calibration_max_iterations"]),
+                                         start=explicit_caps(scfg, ns))
+                cal_info = {"calibration": cal["status"], "calibrated_caps": cal["caps"], "calibration_ratio": cal["ratio"]}
+                if cal["status"] != "pass":
+                    raise HomeRunError("baseline-cap calibration failed in the smoke (calibration.json): the decision "
+                                       "run would refuse too; see HOME-RUNBOOK.md 'calibration failed'")
+            else:
+                ns.baseline_cap_scale = 1.0          # smoke only: nothing calibrated, B=cap explicit
             rcode = cmd_oh(camp, ns)
             m = read_json(os.path.join(camp.p("oh", "merged"), "metrics.json"), {}) or {}
             return {"chain": pick, "projected_usd": per.get(pick), "verdict": (m.get("gates") or {}).get("verdict"),
-                    "exit": rcode}
-        smoke_stage(results, "oh (1 chain, B=1536, 4 arms -> judge -> metrics -> funnel)", oh)
+                    "exit": rcode, **cal_info}
+        smoke_stage(results, "oh (1 chain: baseline-cap calibration, B=1536, 4 arms -> judge -> metrics -> funnel)", oh)
 
     def ls():
         data = camp.p("smoke", "ls-data")
@@ -2045,8 +2379,18 @@ def build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--no-live", action="store_true")
     sm.add_argument("--skip-oh", action="store_true")
     sm.add_argument("--skip-ls", action="store_true", help="skip the synthetic long-session part")
+    sm.add_argument("--skip-calibrate", action="store_true",
+                    help="no baseline-cap calibration in the OH smoke (cap = B; the smoke then reproduces the uncalibrated CLIP/ratio failure)")
     sm.add_argument("--skip-judge", action="store_true", help="no judge call (saves the judge cap)")
     sm.add_argument("--allow-shim", action="store_true", help="accept the hash/shim embedder for this smoke only")
+    cal_p = sub.add_parser("calibrate", parents=[common],
+                           help="Amendment C.4: calibrate the OH baseline cap on the calibration chain (writes calibration.json)")
+    cal_p.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None,
+                       help="B values to calibrate (default [oh] budgets; the primary 1536 first)")
+    cal_p.add_argument("--max-iterations", type=int, default=None,
+                       help="max calibration runs per B (default [oh] calibration_max_iterations = 2)")
+    cal_p.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP]", help="START cap (default [oh] baseline_cap, else B)")
+    cal_p.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S", help="START scale: cap(B)=round(B*S)")
     for name, hlp in (("oh", "OpenHands chain track"), ("beam", "BEAM long-session track"),
                       ("cc", "Claude Code long-session track")):
         t = sub.add_parser(name, parents=[common], help=hlp)
@@ -2056,6 +2400,11 @@ def build_parser() -> argparse.ArgumentParser:
         t.add_argument("--skip-judge", action="store_true", help="stop after export (no judge spend)")
         if name == "oh":
             t.add_argument("--retries", type=int, default=None, help="re-run invalid/missing (chain, B) cells N times")
+            t.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP]",
+                           help="EXPLICIT baseline caps, e.g. 1536:2010,1024:1340 (skips the calibration requirement; "
+                                "wins over a calibration; frozen per campaign)")
+            t.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S",
+                           help="EXPLICIT scale: cap(B)=round(B*S) for the B not in --baseline-cap")
         if name == "cc":
             t.add_argument("--find", default=None, metavar="TEXT",
                            help="find the session by a substring of its title / first user message, e.g. \"HARS Experts Research\"")
@@ -2149,6 +2498,8 @@ def main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
             dry_run_report(camp, tracks)
             camp.write_manifest()
             return 0
+        if args.cmd == "calibrate":
+            return cmd_calibrate(camp, args)
         if args.cmd == "oh":
             return cmd_oh(camp, args)
         if args.cmd == "beam":

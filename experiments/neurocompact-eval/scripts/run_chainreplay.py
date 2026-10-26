@@ -52,11 +52,34 @@ Equalized ask-time memory budget — REALIZED tokens, not configured caps
                              block (wrapper included). The baseline's realized
                              C3 summary is REPORTED (chain_budget / records) but
                              never feeds the cap.
-    baseline summary cap     --baseline-sum-max-tokens 1536 (= mem_budget) with
+    baseline summary cap     default = mem_budget (1536 at B=1536) with
                              NC_SUM_SECTION_TRIM=1: an over-long summary is cut at
                              section boundaries to the cap; realized tokens are
                              still recorded (the model can under-fill it) and
                              --calibrate reports the fill.
+                             Amendment C.4: the cap is a CALIBRATED PARITY
+                             PARAMETER, per mem_budget B. Precedence (explicit
+                             never silently overwritten, also in the B sweep):
+                               1. --baseline-cap 1536:2010,1024:1340  (per-B map)
+                               2. --baseline-cap-scale 1.31           (cap(B)=round(B*scale))
+                               3. --baseline-sum-max-tokens N         (legacy, ONE B only;
+                                  refused with a multi-B --mem-budgets)
+                               4. default: cap(B) = B
+                             --baseline-cap-source labels where the numbers came from
+                             (cli | calibrated:<run dir>; default cli, or `default`
+                             when nothing is given). Per-B cap + source + basis are
+                             recorded in chain_budget / records / compactions /
+                             run_manifest.json / run_budget.json.
+                             ONE value (NC_SUM_MAX_TOKENS) feeds all of: the prompt's
+                             "hard output limit" and its 85% soft target, the
+                             provider max_tokens of the generation, and the
+                             section hard trim (neurocompact.ts noteCap) and the
+                             CLIP detection (stop=length at that max_tokens). Generation
+                             and trim therefore cannot differ and `cap` means the same
+                             thing everywhere. With cap(B) > B the baseline's HARD
+                             ask-time ceiling is above B; what is gated stays the
+                             REALIZED memory ratio (unchanged), the cap is only the
+                             knob that makes the baseline's natural fill land there.
   --calibrate runs one chain through both live arms, skips the QA asks, and
   prints realized note / recall / total tokens per arm, the measured ratio and
   the baseline cap that WOULD land in [0.80, 1.05].
@@ -94,7 +117,7 @@ Usage:
   python3 run_chainreplay.py --calibrate --chains chains.fixture.jsonl --limit 1
   python3 run_chainreplay.py --chains chains.fixture.jsonl \
       --arms baseline,nc,nc-note-only --limit 1 --out runs/chains \
-      --mem-budget 1536 --baseline-sum-max-tokens <recommended>
+      --mem-budgets 1536 --baseline-cap 1536:<recommended>
   python3 run_chainreplay.py --chains chains.fixture.jsonl --limit 2 --dry-run
 
 The single-boundary runner (run_longreplay.py) is untouched and still works.
@@ -2003,6 +2026,59 @@ def pack_injection(raw: str, sid: str, budget: int = RECALL_BUDGET_TOKENS,
 # ---------------------------------------------------------------------------
 # budget accounting — REALIZED tokens, never configured caps
 # ---------------------------------------------------------------------------
+def parse_baseline_cap_map(spec: str | None) -> dict[int, int]:
+    """`1536:2010,1024:1340` -> {1536: 2010, 1024: 1340}. Raises ValueError on junk."""
+    out: dict[int, int] = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        b, sep, c = part.partition(":")
+        if not sep or not b.strip().isdigit() or not c.strip().isdigit():
+            raise ValueError(f"--baseline-cap entry {part!r} must be B:CAP (integers)")
+        b, c = int(b), int(c)
+        if b <= 0 or c <= 0:
+            raise ValueError(f"--baseline-cap entry {part!r}: B and CAP must be > 0")
+        if b in out:
+            raise ValueError(f"--baseline-cap lists B={b} twice")
+        out[b] = c
+    return out
+
+
+def resolve_baseline_cap(args, budget: int) -> dict:
+    """Baseline generation+trim cap for mem_budget `budget` (Amendment C.4).
+
+    Precedence: explicit per-B map > scale > legacy --baseline-sum-max-tokens > default B.
+    Reads only `baseline_cap` (map string), `baseline_cap_scale`, `baseline_cap_legacy`
+    (the explicit legacy value, set by main) and `baseline_cap_source`; absent = unset.
+    A map that does not list `budget` falls through to the scale / legacy / default (and
+    the basis says so); an explicit value is never replaced by the formula for the same B.
+    """
+    budget = int(budget)
+    src_label = getattr(args, "baseline_cap_source", None) or "cli"
+    cmap = parse_baseline_cap_map(getattr(args, "baseline_cap", None))
+    scale = getattr(args, "baseline_cap_scale", None)
+    legacy = getattr(args, "baseline_cap_legacy", None)
+    if budget in cmap:
+        return {"mem_budget": budget, "baseline_cap": cmap[budget], "baseline_cap_basis": "map",
+                "baseline_cap_source": src_label, "baseline_cap_scale": None}
+    if scale is not None:
+        return {"mem_budget": budget, "baseline_cap": max(1, int(round(budget * float(scale)))),
+                "baseline_cap_basis": "scale", "baseline_cap_source": src_label,
+                "baseline_cap_scale": float(scale)}
+    if legacy is not None:
+        return {"mem_budget": budget, "baseline_cap": int(legacy), "baseline_cap_basis": "legacy",
+                "baseline_cap_source": "cli", "baseline_cap_scale": None}
+    return {"mem_budget": budget, "baseline_cap": budget, "baseline_cap_basis": "default",
+            "baseline_cap_source": "default", "baseline_cap_scale": None}
+
+
+def apply_baseline_cap(a, budget: int) -> None:
+    info = resolve_baseline_cap(a, budget)
+    a.baseline_cap_info = info
+    a.baseline_sum_max_tokens = int(info["baseline_cap"])
+
+
 def args_for_budget(args, budget: int, sweep: bool):
     """Per-B copy of the CLI namespace. Without --mem-budgets it is the namespace itself
     (pre-amendment behaviour). With it, every B-dependent knob is the frozen function of B."""
@@ -2011,7 +2087,7 @@ def args_for_budget(args, budget: int, sweep: bool):
     import copy
     a = copy.copy(args)
     a.mem_budget = int(budget)
-    a.baseline_sum_max_tokens = int(budget)
+    apply_baseline_cap(a, budget)            # explicit map/scale/legacy win; never overwritten by B
     a.note_sum_max_tokens = note_cap_formula(budget)
     a.recall_cap_min = recall_floor_formula(budget)
     a.recall_cap_max = recall_ceil_formula(budget)
@@ -2024,7 +2100,9 @@ def ctx_budget_banner(args, args0) -> None:
     CAPS["baseline"] = int(args.baseline_sum_max_tokens)
     CAPS[ARM_CHUNKS] = CAPS[ARM_GRAPH] = CAPS[ARM_NOTE] = int(args.note_sum_max_tokens)
     if getattr(args, "b_tag", False):
-        print(f"\n######## mem_budget B={args.mem_budget}: baseline trim {args.baseline_sum_max_tokens}"
+        ci = getattr(args, "baseline_cap_info", None) or {}
+        print(f"\n######## mem_budget B={args.mem_budget}: baseline cap {args.baseline_sum_max_tokens}"
+              f" [{ci.get('baseline_cap_basis', 'default')}/{ci.get('baseline_cap_source', 'default')}]"
               f" | note cap {args.note_sum_max_tokens} | recall cap = clamp(B - realized note, "
               f"{args.recall_cap_min}, {args.recall_cap_max})"
               f"{' | PRIMARY cell' if args.mem_budget == PRIMARY_BUDGET else ''}", flush=True)
@@ -2139,6 +2217,9 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
         "recall_cap_min": int(args.recall_cap_min),
         "recall_cap_max": int(args.recall_cap_max),
         "baseline_sum_max_tokens": int(args.baseline_sum_max_tokens),
+        "baseline_cap_source": (getattr(args, "baseline_cap_info", None) or {}).get("baseline_cap_source"),
+        "baseline_cap_basis": (getattr(args, "baseline_cap_info", None) or {}).get("baseline_cap_basis"),
+        "baseline_cap_scale": (getattr(args, "baseline_cap_info", None) or {}).get("baseline_cap_scale"),
         "note_sum_max_tokens": int(args.note_sum_max_tokens),
         "parity_window": [PARITY_LO, PARITY_HI],
         "require_no_clip": bool(require_no_clip),
@@ -2204,7 +2285,7 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
                 f"per-chain ratio {rec['ratio']} outside [{PARITY_LO}, {PARITY_HI}] "
                 f"(nc {rec['nc_memory_total']} = note {rec['nc_note_tokens']} + recall "
                 f"{rec['nc_recall_tokens']} vs baseline {rec['baseline_memory_total']})"
-                + (f"; {adv['note']} -> try --baseline-sum-max-tokens "
+                + (f"; {adv['note']} -> try --baseline-cap {rec['mem_budget']}:"
                    f"{adv['recommended_cap']}" if adv.get("recommended_cap") else ""))
         if (n3 or {}).get("recall_cap_clamped_low"):
             # structural: the note alone busts the budget, parity is impossible from
@@ -2741,6 +2822,7 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
                 "nc_memory_total", "baseline_memory_total", "ratio", "ratio_in_window",
                 "recall_cap", "recall_cap_arithmetic", "recall_cap_clamped_low",
                 "recall_uncapped_target", "baseline_sum_max_tokens", "note_sum_max_tokens",
+                "baseline_cap_source", "baseline_cap_basis", "baseline_cap_scale",
                 "parity_window", "require_no_clip", "baseline_cap_advice",
                 "recall_degraded_n", "recall_degraded_qids",
                 "nc_graph_recall_tokens", "nc_graph_memory_total", "ratio_graph",
@@ -2849,7 +2931,7 @@ def calibrate_table(rows: dict, args, sweep_rows: list[dict],
         rec["fill_model"] = adv
         print("baseline cap recommendation (realized tokens as the target):")
         print(f"  {adv['note']}")
-        print(f"  => --baseline-sum-max-tokens {adv['recommended_cap']} would land realized "
+        print(f"  => --baseline-cap {args.mem_budget}:{adv['recommended_cap']} would land realized "
               f"~{int(round(nc_total))} tok at the measured fill {adv['fill']:.3f}")
         print(f"  parity window: any cap in {adv['window'][0]}..{adv['window'][1]} keeps "
               f"ratio in [{PARITY_LO}, {PARITY_HI}] IF the fill stays {adv['fill']:.3f}")
@@ -2963,8 +3045,26 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
                             "valid": None})
         out = calibrate_table(rows, args, sweep_rows, int(args.baseline_sum_max_tokens),
                              int(args.note_sum_max_tokens))
+        # CLIP verdict with the SAME rule as chain_budget (--require-no-clip): an arm fails
+        # when > CLIP_LIMIT of its compactions are unrepaired stop=length cuts.
+        clip = {}
+        for arm_, st_ in (("baseline", st_b), (ARM_CHUNKS, st_n)):
+            n_ = len(st_["compactions"])
+            k_ = sum(1 for r in st_["compactions"] if r.get("truncated"))
+            clip[arm_] = {"compactions": n_, "unrepaired_clipped": k_,
+                          "clip_fail": bool(n_ and k_ / n_ > CLIP_LIMIT)}
+        ci_ = getattr(args, "baseline_cap_info", None) or {}
+        spent_ = round(BUDGET.spent, 6) if BUDGET else None
         out.update({"chain_id": cid, "run_id": args.run_id, "mode": "calibrate",
                     "mem_budget": args.mem_budget,
+                    "clip": clip,
+                    "clip_free": not any(v["clip_fail"] for v in clip.values()),
+                    "baseline_cap": int(args.baseline_sum_max_tokens),
+                    "baseline_cap_source": ci_.get("baseline_cap_source"),
+                    "baseline_cap_basis": ci_.get("baseline_cap_basis"),
+                    "recommended_cap": ((out.get("recommendation") or {}).get("fill_model")
+                                        or {}).get("recommended_cap"),
+                    "spent_usd": spent_,
                     "baseline_sum_max_tokens": args.baseline_sum_max_tokens,
                     "note_sum_max_tokens": args.note_sum_max_tokens,
                     "recall_cap_min": args.recall_cap_min,
@@ -3134,7 +3234,7 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
     print(f"arms: {','.join(arms)} | HARS: {args.mcp} | tokenizer: {TOKENIZER}")
     print(f"ask-time memory budget: --mem-budget {args.mem_budget} realized tokens "
           f"(parity window [{PARITY_LO}, {PARITY_HI}] nc/baseline)")
-    print(f"  baseline: NC_SUM_MAX_TOKENS={args.baseline_sum_max_tokens} = HARD budget, "
+    print(f"  baseline: NC_SUM_MAX_TOKENS={args.baseline_sum_max_tokens} = cap (prompt limit = max_tokens = HARD trim), "
           "NC_SUM_SECTION_TRIM=1 cuts an over-long summary at section boundaries "
           "to this cap (parity with the nc note+recall total)")
     print(f"  nc:       NC_SUM_MAX_TOKENS={args.note_sum_max_tokens} note + recall cap = "
@@ -3231,7 +3331,9 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
         print()
         print(f"BUDGET SWEEP (Amendment C): B in {budgets}, primary B={PRIMARY_BUDGET} runs first")
         for b in budgets:
-            print(f"  B={b}: baseline trim {b} | note cap {note_cap_formula(b)} | recall cap = "
+            ci = resolve_baseline_cap(args, b)
+            print(f"  B={b}: baseline cap {ci['baseline_cap']} [{ci['baseline_cap_basis']}/"
+                  f"{ci['baseline_cap_source']}] | note cap {note_cap_formula(b)} | recall cap = "
                   f"clamp(B - realized note, {recall_floor_formula(b)}, {recall_ceil_formula(b)})")
         n_comp = sum(1 for a in arms if a in ("baseline", ARM_CHUNKS)) * 3
         print(f"  cost multiplier vs one 3-arm run at one B: compactions/replays x{n_b} "
@@ -3348,6 +3450,9 @@ def build_manifest(args, arms, budgets, chains) -> dict:
         "judge_same_family": v["judge_same_family"], "judge_same_family_reason": v["reason"],
         "embedder": emb, "hars_mcp": args.mcp, "arms": arms, "mem_budgets": budgets,
         "chains": [c["chain_id"] for c in chains], "tokenizer": TOKENIZER,
+        "baseline_caps": {str(b): (getattr(args, "baseline_caps", {}) or {}).get(int(b))
+                          for b in budgets},
+        "excluded_chains": list(getattr(args, "excluded_chains", []) or []),
         "budget_usd": BUDGET.limit if BUDGET else None, "run_id": args.run_id,
         "note": "HARS server extractor/keyword config is NOT read back except the embedder; "
                 "export it with `providers.py hars-env --profile NAME` before starting the server",
@@ -3441,11 +3546,26 @@ def main() -> int:
                     help="floor on the derived nc recall cap (default %(default)s)")
     ap.add_argument("--recall-cap-max", type=int, default=RECALL_CAP_MAX,
                     help="ceiling on the derived nc recall cap (default %(default)s)")
-    ap.add_argument("--baseline-sum-max-tokens", type=int, default=1536,
-                    help="baseline NC_SUM_MAX_TOKENS = the arm's HARD ask-time memory "
-                         "budget (mem_budget); NC_SUM_SECTION_TRIM=1 cuts an over-long "
-                         "summary at section boundaries to this cap (default 1536 = "
-                         "mem_budget parity by construction)")
+    ap.add_argument("--baseline-sum-max-tokens", type=int, default=None,
+                    help="LEGACY single-B baseline cap (NC_SUM_MAX_TOKENS: prompt limit, "
+                         "provider max_tokens AND section hard trim). Applies to the one "
+                         "--mem-budget only; refused with a multi-B --mem-budgets (use "
+                         "--baseline-cap / --baseline-cap-scale). Lowest explicit "
+                         "precedence; unset = cap(B) = B")
+    ap.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP...]",
+                    help="Amendment C.4 per-mem_budget baseline cap, e.g. 1536:2010,1024:1340. "
+                         "Highest precedence; a B not listed falls to --baseline-cap-scale / "
+                         "legacy / default. Never overwritten by the sweep")
+    ap.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S",
+                    help="Amendment C.4: cap(B) = round(B * S) for every B without an explicit "
+                         "--baseline-cap entry (e.g. 1.31)")
+    ap.add_argument("--baseline-cap-source", default=None, metavar="LABEL",
+                    help="provenance recorded next to the cap: `cli` (default when a cap is "
+                         "given) or `calibrated:<run dir>` (home_run.py passes the calibration)")
+    ap.add_argument("--exclude-chains", default="", metavar="ID[,ID...]",
+                    help="chain ids dropped from --chains before anything runs (the calibration "
+                         "chain is excluded from the decision set, Amendment C.4); recorded in "
+                         "run_manifest.json")
     ap.add_argument("--note-sum-max-tokens", type=int, default=CAPS[ARM_CHUNKS],
                     help="nc/note-only NC_SUM_MAX_TOKENS (default %(default)s)")
     ap.add_argument("--calibrate", action="store_true",
@@ -3537,6 +3657,30 @@ def main() -> int:
         print(f"--recall-cap-min/-max must satisfy 0 < min <= max "
               f"(got {args.recall_cap_min}, {args.recall_cap_max})", file=sys.stderr)
         return 2
+    # ---- baseline cap (Amendment C.4): explicit map > scale > legacy > default B ----
+    try:
+        parse_baseline_cap_map(args.baseline_cap)
+    except ValueError as e:
+        print(f"!!! {e}", file=sys.stderr)
+        return 2
+    if args.baseline_cap_scale is not None and args.baseline_cap_scale <= 0:
+        print("--baseline-cap-scale must be > 0", file=sys.stderr)
+        return 2
+    if args.baseline_cap_source and not (args.baseline_cap_source == "cli"
+                                         or args.baseline_cap_source.startswith("calibrated:")):
+        print("--baseline-cap-source must be `cli` or `calibrated:<run dir>`", file=sys.stderr)
+        return 2
+    if args.baseline_sum_max_tokens is not None and args.baseline_sum_max_tokens <= 0:
+        print("--baseline-sum-max-tokens must be > 0", file=sys.stderr)
+        return 2
+    args.baseline_cap_legacy = args.baseline_sum_max_tokens      # None = not given
+    if args.mem_budgets.strip() and args.baseline_cap_legacy is not None \
+            and len([x for x in args.mem_budgets.split(",") if x.strip()]) > 1:
+        print("!!! --baseline-sum-max-tokens is a single-B knob and the sweep would have to "
+              "overwrite it per B: use --baseline-cap B:CAP,... or --baseline-cap-scale S "
+              "with --mem-budgets", file=sys.stderr)
+        return 2
+    apply_baseline_cap(args, args.mem_budget)     # single-B namespace; sweep re-derives per B
     # caps are derived from the CLI; CAPS stays the single source for base_env/
     # the projector so nothing can drift between the printed env and the wire.
     CAPS["baseline"] = int(args.baseline_sum_max_tokens)
@@ -3577,9 +3721,22 @@ def main() -> int:
         # descending
         budgets.sort(key=lambda b: (b != PRIMARY_BUDGET, -b))
     per_budget_args = [args_for_budget(args, b, sweep) for b in budgets]
+    if sweep:
+        apply_baseline_cap(args, budgets[0])      # args0 reports the primary B's cap
     args.budgets = budgets
+    args.baseline_caps = {int(a.mem_budget): dict(a.baseline_cap_info) for a in per_budget_args}
+    excl = [c.strip() for c in (args.exclude_chains or "").split(",") if c.strip()]
+    args.excluded_chains = excl
 
     chains, skipped = load_chains(args.chains)
+    if args.excluded_chains:
+        known = {c["chain_id"] for c in chains}
+        for cid in args.excluded_chains:
+            if cid not in known:
+                print(f"  note: --exclude-chains {cid} is not in {args.chains}", flush=True)
+        chains = [c for c in chains if c["chain_id"] not in set(args.excluded_chains)]
+        print(f"  excluded from the decision set (--exclude-chains): {args.excluded_chains}",
+              flush=True)
     if args.limit:
         chains = chains[:args.limit]
     if not chains:
@@ -3656,7 +3813,11 @@ def main() -> int:
         if ARM_CHUNKS not in arms or "baseline" not in arms:
             print("--calibrate needs both live arms (baseline + nc-chunks)", file=sys.stderr)
             return 2
-        return run_calibrate(chains, args, arms)
+        if len(per_budget_args) != 1:
+            print("--calibrate runs ONE mem_budget: pass a single --mem-budgets entry (or "
+                  "--mem-budget)", file=sys.stderr)
+            return 2
+        return run_calibrate(chains, per_budget_args[0], arms)
 
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(WORKDIR, exist_ok=True)
@@ -3967,6 +4128,11 @@ def main() -> int:
             mean_base = sum(p[1] for p in pairs) / len(pairs)
             run_ratio = round(mean_nc / mean_base, 3) if mean_base else None
             in_win = run_ratio is not None and PARITY_LO <= run_ratio <= PARITY_HI
+            ci = (getattr(args, "baseline_caps", {}) or {}).get(B) or {}
+            entry["baseline_cap"] = ci.get("baseline_cap")
+            entry["baseline_cap_source"] = ci.get("baseline_cap_source")
+            entry["baseline_cap_basis"] = ci.get("baseline_cap_basis")
+            entry["baseline_cap_scale"] = ci.get("baseline_cap_scale")
             entry[label] = {"chains": len(pairs), "mean_memory_tokens": round(mean_nc, 1),
                             "mean_baseline_memory_tokens": round(mean_base, 1),
                             "run_ratio": run_ratio, "in_window": in_win}
@@ -3992,7 +4158,10 @@ def main() -> int:
             "judge_model": args.judge_model,
             "judge_same_family": args.judge_verdict["judge_same_family"],
             "profile": args.provider,
-            "baseline_cap": args.baseline_sum_max_tokens,
+            "baseline_cap": (prim.get("baseline_cap") or args.baseline_sum_max_tokens),
+            "baseline_cap_source": prim.get("baseline_cap_source"),
+            "baseline_caps": {str(k): v for k, v in (getattr(args, "baseline_caps", {}) or {}).items()},
+            "excluded_chains": list(getattr(args, "excluded_chains", []) or []),
             "note_cap": args.note_sum_max_tokens, "mem_budget": prim["mem_budget"],
             "by_budget": {str(k): v for k, v in by_b.items()},
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
