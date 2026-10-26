@@ -23,6 +23,20 @@ Usage:
   OPENROUTER_API_KEY=... python3 make_chains.py --limit 2    # paid pilot
 
 Outputs (defaults): chains.jsonl, chains-manifest.json
+
+Independence options (all OPT-IN; without them the output is byte-identical to the
+pre-2026-10-26 builder, see tests/test_make_chains.py):
+  --disjoint        chains of one session never share a span: boundaries are tiled in
+                    non-overlapping blocks 0-2, 3-5, 6-8, ... (a 2nd chain per session
+                    only when it has >= 6 boundaries). Default (overlapping) enumeration
+                    makes c0 = boundaries 0-2 and c1 = 1-3, i.e. 2 of 3 spans shared.
+  --unique-probes   unanswerable probes are drawn WITHOUT replacement from a pool of
+                    distinct phantom identifiers (PROBE_POOL_*; NC_PHANTOM_TTL_MS kept);
+                    exits if the pool is smaller than the unanswerables requested, and
+                    rejects (-> repair) an unanswerable that reuses an earlier probe.
+  --dedup-anchors   rejects (-> repair) an answerable item whose gold_anchor is already
+                    the gold_anchor of another chain of the SAME session; rejections are
+                    recorded per chain in the manifest (`rejections`, `independence_rejections`).
 """
 from __future__ import annotations
 
@@ -31,6 +45,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -229,11 +244,21 @@ def span_fp(spans: list[dict]) -> str:
         for sp in spans for e in sp["segments"]).encode()).hexdigest()[:16]
 
 
-def enumerate_chains(sessions: list[dict]) -> list[tuple[int, int]]:
+def chain_starts(n_boundaries: int, disjoint: bool = False) -> range:
+    """Start boundaries of the chains a session yields. Overlapping (default): every
+    start 0..n-C, so chain c and c+1 share C-1 spans. Disjoint: starts 0, C, 2C, ...
+    (span ranges [k, k+C-1] never overlap)."""
+    return range(0, n_boundaries - CHAIN_LEN + 1, CHAIN_LEN if disjoint else 1)
+
+
+def enumerate_chains(sessions: list[dict], disjoint: bool = False) -> list[tuple[int, int]]:
     """Deterministic round-robin: chain 0 of every session, then chain 1, ...
     Spreads the pilot across sessions instead of taking 7 near-duplicate chains
-    from one long session (bootstrap is clustered on chains)."""
-    per = [(i, range(len(s["boundaries"]) - CHAIN_LEN + 1))
+    from one long session (bootstrap is clustered on chains).
+
+    The second element is the chain's START boundary (= chain_idx). With
+    disjoint=True only non-overlapping boundary blocks are emitted."""
+    per = [(i, chain_starts(len(s["boundaries"]), disjoint))
            for i, s in enumerate(sessions) if len(s["boundaries"]) >= CHAIN_LEN]
     order, depth = [], 0
     while True:
@@ -446,7 +471,7 @@ def evidence_windows(text: str, want: int = 8) -> list[str]:
 
 
 def suggested_anchors(windows: list[str], span_text: str, other_texts: list[str],
-                      limit: int = 6) -> list[tuple[int, str]]:
+                      limit: int = 6, exclude: set[str] | None = None) -> list[tuple[int, str]]:
     """(window_no, token) pairs that already pass the anchor gates by construction:
     exactly one occurrence in this span, zero in the other two, >= 3 chars, and
     inside a candidate evidence window of the same half. Removes the most common
@@ -458,6 +483,8 @@ def suggested_anchors(windows: list[str], span_text: str, other_texts: list[str]
             tl = t.lower()
             if tl in seen or len(t) < 3 or re.fullmatch(r"\d{1,2}", t):
                 continue
+            if exclude and tl in exclude:     # --dedup-anchors: used by a sibling chain
+                continue
             if len(anchor_re(t).findall(span_text)) != 1:
                 continue
             if any(anchor_re(t).search(o) for o in other_texts):
@@ -468,7 +495,8 @@ def suggested_anchors(windows: list[str], span_text: str, other_texts: list[str]
     return out[:limit]
 
 
-def span_block(span: dict, half_chars: int, other_texts: list[str] | None = None) -> str:
+def span_block(span: dict, half_chars: int, other_texts: list[str] | None = None,
+               exclude: set[str] | None = None) -> str:
     head, tail = halves(span["text"])
     if len(head) > half_chars:
         head = head[:half_chars] + "\n[...HEAD truncated...]"
@@ -484,7 +512,8 @@ def span_block(span: dict, half_chars: int, other_texts: list[str] | None = None
                          f"quote one of them verbatim]")
             lines += [f"E{span['span_idx']}{sl[0]}{n + 1} ({len(w.split())} words): {w}"
                       for n, w in enumerate(wins)]
-            anchors = suggested_anchors(wins, span["text"], other_texts or [])
+            anchors = suggested_anchors(wins, span["text"], other_texts or [],
+                                        exclude=exclude)
             if anchors:
                 lines.append(f"[SUGGESTED ANCHORS {sl} of SPAN {span['span_idx']} — copy "
                              f"ONE verbatim; each occurs once here and never in the other spans]")
@@ -519,6 +548,45 @@ def absent_probe_candidates(span_texts: list[str], transcript: str,
             out.append(cand)
             if len(out) >= limit:
                 return out
+    return out
+
+
+# --unique-probes pool: the 6x6 grid above plus extra bases/tails -> 12 x 10 = 120
+# distinct identifiers. NC_PHANTOM_TTL_MS stays in the pool (compatibility with the
+# existing dataset, where it is the probe of 7/10 unanswerables).
+PROBE_POOL_BASES = ("PHANTOM", "GHOST", "ZEPHYR", "OBSIDIAN", "QUARTZ", "VECTOR",
+                    "NEBULA", "COBALT", "TUNDRA", "MERIDIAN", "HALCYON", "SPECTRE")
+PROBE_POOL_TAILS = ("RETENTION_HOURS", "TTL_MS", "QUOTA_FACTOR", "FLUSH_INTERVAL_S",
+                    "MAX_DEPTH", "WINDOW_SECONDS", "BACKOFF_JITTER_MS", "SHARD_COUNT",
+                    "LEASE_SECONDS", "PREFETCH_DEPTH")
+
+
+def probe_pool(seed: int) -> list[str]:
+    """All distinct pool identifiers, in a seed-determined draw order."""
+    pool = [f"NC_{b}_{t}" for b in PROBE_POOL_BASES for t in PROBE_POOL_TAILS]
+    assert len(set(pool)) == len(pool) and "NC_PHANTOM_TTL_MS" in pool
+    random.Random(seed).shuffle(pool)
+    return pool
+
+
+def draw_unique_probes(pool: list[str], used: set[str], span_texts: list[str],
+                       transcript: str, limit: int = 5) -> list[str]:
+    """Next `limit` pool identifiers that no accepted chain used yet (without
+    replacement) and that occur nowhere in this session. Raises SystemExit when the
+    pool is exhausted instead of silently reusing a probe."""
+    out = []
+    for cand in pool:
+        if cand.lower() in used:
+            continue
+        rx = anchor_re(cand)
+        if rx.search(transcript) or any(rx.search(x) for x in span_texts):
+            continue
+        out.append(cand)
+        if len(out) >= limit:
+            break
+    if not out:
+        raise SystemExit(f"--unique-probes: probe pool exhausted ({len(pool)} identifiers, "
+                         f"{len(used)} used); extend PROBE_POOL_BASES/PROBE_POOL_TAILS")
     return out
 
 
@@ -597,10 +665,22 @@ def absent_block(chain: dict) -> str:
             "do not add, rename or rewrite any token in it]\n" + "\n".join(stems))
 
 
+def forbidden_block(chain: dict) -> str:
+    """--dedup-anchors only: anchors already used by another chain of this session.
+    Empty (no prompt change) when the flag is off."""
+    fb = chain.get("forbidden_anchors") or []
+    if not fb:
+        return ""
+    return ("[ANCHORS ALREADY USED BY ANOTHER CHAIN OF THIS SESSION — never use any of "
+            "these as gold_anchor]\n" + ", ".join(sorted(fb)) + "\n\n")
+
+
 def chain_prompt(chain: dict, half_chars: int) -> str:
+    excl = {a.lower() for a in chain.get("forbidden_anchors") or []} or None
     blocks = "\n\n".join(
         span_block(s, half_chars,
-                   [o["text"] for o in chain["spans"] if o["span_idx"] != s["span_idx"]])
+                   [o["text"] for o in chain["spans"] if o["span_idx"] != s["span_idx"]],
+                   exclude=excl)
         for s in chain["spans"])
     return (
         "You write exam items about ONE long coding session that was compacted "
@@ -616,6 +696,7 @@ def chain_prompt(chain: dict, half_chars: int) -> str:
         "of ONE token from [VERIFIED-ABSENT TOKENS]. Its canonical_short_answer, "
         "gold_anchor and evidence are empty strings.\n\n"
         f"{absent_block(chain)}\n\n"
+        f"{forbidden_block(chain)}"
         f"{RULES}\n\n"
         'Schema: {"items":[{"kind":"answerable","span_idx":1,"slice":"HEAD",'
         '"question":"...","canonical_short_answer":"...","gold_anchor":"...",'
@@ -636,11 +717,15 @@ def repair_prompt(chain: dict, slots: list[dict], half_chars: int) -> str:
                       "them, and in none of the session's other turns.)\n"
                       + absent_block(chain))
     shown = sorted({sl["span_idx"] for sl in slots if sl["kind"] == "answerable"})
+    excl = {a.lower() for a in chain.get("forbidden_anchors") or []} or None
+    if excl:
+        blocks.append(forbidden_block(chain).rstrip())
     for s in chain["spans"]:
         if s["span_idx"] in shown or any(sl["kind"] == "unanswerable" for sl in slots):
             blocks.append(span_block(s, half_chars,
                                      [o["text"] for o in chain["spans"]
-                                      if o["span_idx"] != s["span_idx"]]))
+                                      if o["span_idx"] != s["span_idx"]],
+                                     exclude=excl))
     return (
         f"You previously wrote exam items that failed validation. Return EXACTLY "
         f"{len(slots)} item(s), one per slot, in the order listed, and obey every rule "
@@ -804,7 +889,19 @@ def main() -> int:
                     help="keep chains already in --out and skip them (append mode)")
     ap.add_argument("--no-selfcheck", action="store_true",
                     help="skip the segmentation equality assertion")
+    ap.add_argument("--disjoint", action="store_true",
+                    help="opt-in: chains of one session never share spans (boundary "
+                         "blocks 0-2, 3-5, ...; a 2nd chain only with >= 6 boundaries)")
+    ap.add_argument("--unique-probes", action="store_true",
+                    help="opt-in: draw unanswerable probes without replacement from "
+                         "a pool; exit if the pool is smaller than the request")
+    ap.add_argument("--dedup-anchors", action="store_true",
+                    help="opt-in: reject (and re-ask) an item whose gold_anchor is "
+                         "already a gold_anchor of another chain of the same session")
     args = ap.parse_args()
+    build_flags = {"disjoint": args.disjoint, "unique_probes": args.unique_probes,
+                   "dedup_anchors": args.dedup_anchors}
+    indep_on = any(build_flags.values())
 
     RAW_LOG["path"] = args.save_raw
     if args.save_raw:
@@ -819,7 +916,7 @@ def main() -> int:
     ok = selfcheck_span(session_spans(probe_session)[0], args.segs)
     print(f"segmentation/window identical to make_longreplay_dataset.py: "
           f"{'OK' if ok else 'MISMATCH'} ({probe_session['sid'][-8:]} span 1)")
-    order = enumerate_chains(sessions)
+    order = enumerate_chains(sessions, disjoint=args.disjoint)
     want = args.max_chains if args.limit <= 0 else min(args.limit, args.max_chains)
     plan = order
 
@@ -839,6 +936,36 @@ def main() -> int:
     seen_chain_ids: dict[str, str] = {}
     fingerprints: dict[str, str] = {}
     carried = 0            # chains already in --out when resuming (manifest honesty)
+    # independence state (only consulted when the matching opt-in flag is set)
+    pool = probe_pool(args.seed) if args.unique_probes else []
+    used_probes: dict[str, str] = {}                     # probe.lower() -> chain_id
+    session_anchors: dict[str, dict[str, tuple[str, str]]] = {}  # sid -> a.lower() -> (a, cid)
+
+    def remember_chain(c: dict):
+        for q in c.get("qa", []):
+            if q.get("answerable"):
+                a = (q.get("gold_anchor") or "").strip()
+                if a:
+                    session_anchors.setdefault(c["session_id"], {}).setdefault(
+                        a.lower(), (a, c["chain_id"]))
+            else:
+                for t in probe_tokens(q.get("question") or ""):
+                    used_probes.setdefault(t.lower(), c["chain_id"])
+
+    def independence_reject(it: dict, sid: str) -> list[str]:
+        """Extra (opt-in) rejection reasons on top of validate()."""
+        if it["kind"] == "unanswerable":
+            if args.unique_probes:
+                reused = [t for t in probe_tokens(it["question"]) if t.lower() in used_probes]
+                if reused:
+                    return [f"probe_reused:{reused[0]}@{used_probes[reused[0].lower()]}"]
+            return []
+        if args.dedup_anchors:
+            a = (it.get("gold_anchor") or "").strip().lower()
+            hit = session_anchors.get(sid, {}).get(a)
+            if a and hit:
+                return [f"anchor_dup_across_chains:{hit[0]}@{hit[1]}"]
+        return []
 
     def write_outputs():
         """Persist after every chain: a network/API failure must not throw away work."""
@@ -866,6 +993,17 @@ def main() -> int:
                        "api_calls": spend.calls, "spend_usd": round(spend.spent, 5),
                        "budget_usd": args.budget_usd},
         }
+        if indep_on:      # additive key, absent in the default build
+            per_sess: dict[str, list[str]] = {}
+            for c in chains:
+                per_sess.setdefault(c["session_id"], []).append(c["chain_id"])
+            manifest["independence"] = dict(
+                build_flags,
+                distinct_sessions=len(per_sess),
+                chains_per_session=per_sess,
+                probe_pool_size=len(pool) if args.unique_probes else None,
+                probes_used=sorted(used_probes) if args.unique_probes else None,
+            )
         with open(args.out, "w") as w:
             for c in chains:
                 w.write(json.dumps(c, ensure_ascii=False) + "\n")
@@ -884,6 +1022,7 @@ def main() -> int:
             for c in chains:
                 seen_chain_ids[c["chain_id"]] = c["session_id"]
                 fingerprints[span_fp(c["spans"])] = c["chain_id"]
+                remember_chain(c)
             print(f"resume: {len(chains)} chain(s) already in {args.out}")
         if os.path.exists(args.manifest):
             try:
@@ -900,6 +1039,14 @@ def main() -> int:
                           f"of spend from the previous run (global cap ${spend.budget:.2f})")
             except Exception:  # noqa: BLE001 - a broken manifest must not block resume
                 manifest_chains, dropped = [], []
+
+    if args.unique_probes:
+        free = len([p for p in pool if p.lower() not in used_probes])
+        if free < want:
+            raise SystemExit(f"--unique-probes: pool has {free} unused identifier(s) "
+                             f"({len(pool)} total, {len(used_probes)} used) but {want} "
+                             f"unanswerable(s) requested; extend PROBE_POOL_* or lower --limit")
+        print(f"unique probes: pool {len(pool)}, unused {free}, requested {want}")
 
     attempted = 0
     for pos, (si, ci) in enumerate(plan, 1):
@@ -964,6 +1111,13 @@ def main() -> int:
         for sp in spans:
             print(f"    span {sp['span_idx']} lag={sp['lag']}: {sp['chars']} chars "
                   f"~{sp['est_tokens']} tok")
+        if args.unique_probes:
+            chain["absent_probes"] = draw_unique_probes(
+                pool, set(used_probes), [sp["text"] for sp in spans], transcript_of(s))
+        if args.dedup_anchors:
+            chain["forbidden_anchors"] = sorted(
+                a for a, _ in session_anchors.get(s["sid"], {}).values())
+        indep_rejections = []
         predicted_in = sum(sp["chars"] for sp in spans) + 2500
         est = predicted_in / CHARS_PER_TOKEN * PRICE_IN + 2000 * PRICE_OUT + 0.004
         raw, _ = llm(chain_prompt(chain, args.half_chars), key, args.model, spend,
@@ -1000,6 +1154,12 @@ def main() -> int:
                         it["slice"] = slot["slice"]
                     it["span_idx"] = 0 if it["kind"] == "unanswerable" else slot["span_idx"]
                     ok, why, checks = validate(it, spans, transcript)
+                    if ok and indep_on:
+                        extra = independence_reject(it, s["sid"])
+                        if extra:
+                            ok, why = False, extra
+                            indep_rejections.append({"slot": str(k), "round": rnd,
+                                                     "reason": extra[0]})
                     slot_reports.append({"slot": k, "round": rnd, "ok": ok, "why": why,
                                          "checks": checks})
                     if ok:
@@ -1079,6 +1239,8 @@ def main() -> int:
             pending = still
 
         if failed_now:
+            if indep_rejections:
+                dropped[-1]["independence_rejections"] = indep_rejections
             write_outputs()
             continue
 
@@ -1123,6 +1285,8 @@ def main() -> int:
             "slice_evidence_match_rate": rate("slice_evidence_match"),
             "rejections": rejection_counts,
         })
+        if indep_on:
+            manifest_chains[-1]["independence_rejections"] = indep_rejections
         chains.append({
             "chain_id": cid, "session_id": s["sid"], "chain_idx": ci,
             "spans": [{"span_idx": sp["span_idx"], "lag": sp["lag"],
@@ -1132,6 +1296,9 @@ def main() -> int:
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "valid": True,
         })
+        if indep_on:      # additive field, absent in the default build
+            chains[-1]["build_flags"] = dict(build_flags)
+        remember_chain(chains[-1])
         print(f"  accepted {len(qa)}/7 items; spend so far ${spend.spent:.4f}")
         write_outputs()
 

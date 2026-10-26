@@ -19,12 +19,24 @@ scratch:
     ZERO  zero probe hits across all 3 spans AND the full session transcript
     EMPTY answer / gold_anchor / evidence are all empty
 
+  dataset independence (section "Independence")
+    distinct sessions, chains per session, chain pairs sharing a span (identity:
+    session_id + boundary ordinal chain_idx+span_idx-1; and content: identical span
+    segments), gold anchors repeated across chains, unanswerable probes repeated
+    across chains.
+    HARD FAIL: distinct sessions < MIN_SESSIONS (8, = metrics_v2.MIN_CHAINS which
+    counts sessions); any shared-span pair in a --disjoint dataset; and, when the
+    dataset declares --dedup-anchors / --unique-probes (chain `build_flags` or
+    manifest `independence`), a repeated same-session anchor / repeated probe.
+
 Usage: python3 verify_chains.py [--chains chains.jsonl] [--out verify_chains.report.md]
+                                [--manifest chains-manifest.json] [--disjoint]
 Exit 0 iff no hard-gate failure.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -37,12 +49,116 @@ from make_chains import (  # noqa: E402
     load_sessions, norm_ws, probe_tokens, transcript_of,
 )
 
+MIN_SESSIONS = 8   # metrics_v2.MIN_CHAINS: distinct sessions below which no WIN/FAIL
+
+
+def _span_content_fp(sp: dict) -> str:
+    return hashlib.sha1("".join(
+        f"[{e.get('role', '')}] {(e.get('text') or '').strip()}\n\n"
+        for e in sp.get("segments", [])).encode()).hexdigest()[:16]
+
+
+def independence(chains: list[dict], declared: dict) -> tuple[list[str], list[tuple]]:
+    """Report lines + hard failures for dataset-level independence. Pure function of
+    the chain records (no session files needed)."""
+    L, fails = ["## Independence", ""], []
+    per_sess: dict[str, list[str]] = {}
+    for c in chains:
+        per_sess.setdefault(c["session_id"], []).append(c["chain_id"])
+    n_sess = len(per_sess)
+    L.append(f"distinct sessions: {n_sess} | chains: {len(chains)} | "
+             f"declared build flags: {', '.join(k for k, v in declared.items() if v) or 'none'}")
+    L.append("")
+    L.append("| session | chains | chain ids |")
+    L.append("|---|---|---|")
+    for sid, cids in per_sess.items():
+        L.append(f"| {sid} | {len(cids)} | {', '.join(cids)} |")
+    L.append("")
+
+    # shared spans: identity (session + boundary ordinal) and content (segments hash)
+    span_owner: dict[tuple, list[str]] = {}
+    fp_owner: dict[str, list[str]] = {}
+    for c in chains:
+        ci = c.get("chain_idx")
+        for sp in c.get("spans", []):
+            if isinstance(ci, int):
+                span_owner.setdefault((c["session_id"], ci + sp["span_idx"] - 1),
+                                      []).append(c["chain_id"])
+            fp_owner.setdefault(_span_content_fp(sp), []).append(c["chain_id"])
+    pairs: dict[tuple[str, str], list[str]] = {}
+    for (sid, b), cids in span_owner.items():
+        for i in range(len(cids)):
+            for j in range(i + 1, len(cids)):
+                pairs.setdefault(tuple(sorted((cids[i], cids[j]))), []).append(f"boundary#{b}")
+    for fp, cids in fp_owner.items():
+        for i in range(len(cids)):
+            for j in range(i + 1, len(cids)):
+                if cids[i] != cids[j]:
+                    pairs.setdefault(tuple(sorted((cids[i], cids[j]))), []).append(f"content:{fp}")
+    L.append(f"chain pairs sharing >= 1 span: {len(pairs)}")
+    for (a, b), why in sorted(pairs.items()):
+        L.append(f"- {a} <-> {b}: {', '.join(sorted(set(why)))}")
+    L.append("")
+
+    # repeated gold anchors across chains
+    anchors: dict[str, list[tuple[str, str]]] = {}
+    for c in chains:
+        for q in c.get("qa", []):
+            a = (q.get("gold_anchor") or "").strip().lower() if q.get("answerable") else ""
+            if a:
+                anchors.setdefault(a, []).append((c["chain_id"], c["session_id"]))
+    dup_anchors = {a: v for a, v in anchors.items() if len({x[0] for x in v}) > 1}
+    L.append(f"gold anchors repeated across chains: {len(dup_anchors)}")
+    for a, v in sorted(dup_anchors.items()):
+        same = len({x[1] for x in v}) < len(v)
+        L.append(f"- {a!r}: {', '.join(x[0] for x in v)}{' (same session)' if same else ''}")
+        if declared.get("dedup_anchors") and same:
+            fails.append(("DATASET", "INDEP-ANCHOR",
+                          f"--dedup-anchors dataset repeats anchor {a!r} within a session"))
+    L.append("")
+
+    # repeated unanswerable probes
+    probes: dict[str, list[str]] = {}
+    for c in chains:
+        for q in c.get("qa", []):
+            if not q.get("answerable"):
+                for t in probe_tokens(q.get("question") or ""):
+                    probes.setdefault(t.lower(), []).append(c["chain_id"])
+    n_unans = sum(1 for c in chains for q in c.get("qa", []) if not q.get("answerable"))
+    dup_probes = {t: v for t, v in probes.items() if len(v) > 1}
+    L.append(f"unanswerable items: {n_unans} | distinct probe tokens: {len(probes)} | "
+             f"probes used by > 1 item: {len(dup_probes)}")
+    for t, v in sorted(dup_probes.items(), key=lambda kv: -len(kv[1])):
+        L.append(f"- {t}: {len(v)}x ({', '.join(v)})")
+        if declared.get("unique_probes"):
+            fails.append(("DATASET", "INDEP-PROBE",
+                          f"--unique-probes dataset reuses probe {t!r} {len(v)}x"))
+    L.append("")
+
+    if n_sess < MIN_SESSIONS:
+        fails.append(("DATASET", "INDEP-SESSIONS",
+                      f"FAIL: {n_sess} distinct session(s) < {MIN_SESSIONS} "
+                      f"(MIN_CHAINS counts sessions; cluster bootstrap is underpowered)"))
+    if declared.get("disjoint") and pairs:
+        fails.append(("DATASET", "INDEP-DISJOINT",
+                      f"FAIL: --disjoint dataset has {len(pairs)} chain pair(s) sharing spans"))
+    for f in fails:
+        L.append(f"**{f[1]}**: {f[2]}")
+    if not fails:
+        L.append("independence: PASS")
+    L.append("")
+    return L, fails
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--chains", default=os.path.join(BASE, "chains.jsonl"))
     ap.add_argument("--segs", type=int, default=8)
     ap.add_argument("--out", default=os.path.join(BASE, "verify_chains.report.md"))
+    ap.add_argument("--manifest", default="",
+                    help="chains manifest (default: chains-manifest.json next to --chains)")
+    ap.add_argument("--disjoint", action="store_true",
+                    help="treat the dataset as --disjoint even if it does not declare it")
     args = ap.parse_args()
 
     sessions = load_sessions()
@@ -153,6 +269,20 @@ def main() -> int:
                          ("in-half" if soft_half else "OUT-OF-HALF") if soft_half is not None else "-",
                          detail))
 
+    # ---- dataset independence (declared flags: chain build_flags | manifest | CLI)
+    declared = {"disjoint": args.disjoint, "unique_probes": False, "dedup_anchors": False}
+    mpath = args.manifest or os.path.join(os.path.dirname(os.path.abspath(args.chains)),
+                                          "chains-manifest.json")
+    try:
+        mind = json.load(open(mpath)).get("independence") or {}
+    except (OSError, ValueError):
+        mind = {}
+    for k in declared:
+        declared[k] = bool(declared[k] or mind.get(k)
+                           or any((c.get("build_flags") or {}).get(k) for c in chains))
+    indep_lines, indep_fails = independence(chains, declared)
+    fails.extend(indep_fails)
+
     # ---- report
     L = ["# verify_chains: independent re-validation", ""]
     L.append(f"chains: {len(chains)} | items: {len(rows)} "
@@ -167,6 +297,7 @@ def main() -> int:
         L.append(f"| {cid} | {'yes' if m else 'NO'} | {'yes' if cm else 'NO'} | "
                  f"{'/'.join(map(str, ch))} | {'/'.join(map(str, tk))} |")
     L.append("")
+    L.extend(indep_lines)
     L.append("## Gate rates")
     L.append("")
     L.append("| gate | pass | applicable | rate |")
