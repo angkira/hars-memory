@@ -2670,7 +2670,9 @@ async def _compute_hybrid_block(
 # session's chunk store and is APPENDED after the fused top_k (never evicting
 # an existing candidate), mirroring the ripgrep channel's presence guarantee.
 # Fully fail-soft: any problem degrades to zero session hits plus a reason in
-# the response's `session` block, and the rest of recall is unaffected.
+# the response's `session` block, and the rest of recall is unaffected. A
+# query-embedding failure is NOT such a problem: lexical scoring needs no
+# embedder, so the channel keeps running and flags `degraded: lexical_only`.
 SESSION_CHANNEL_NAME = "session"
 SESSION_CHUNKS_FILENAME = "kv_store_text_chunks.json"
 SESSION_VDB_FILENAME = "vdb_chunks.json"
@@ -2780,7 +2782,11 @@ async def _compute_session_channel(
     Skips (with an explicit reason) in subgraph mode, for an already-merged
     session, for an unknown session, or when the session's stores are missing.
     The channel never raises: every failure becomes ``{"error": ...}`` in the
-    block plus zero hits.
+    block plus zero hits. A query-embedding failure/timeout does NOT zero the
+    channel: it falls back to lexical F1 scoring and flags
+    ``degraded: "lexical_only"``. ``status`` is one of ``ok``, ``no_hits``,
+    ``degraded``, ``skipped``, ``unknown_session`` or ``error`` so a caller
+    can tell a broken channel from a legitimate empty result.
     """
     sid = str(session_id or "").strip()
     block: dict[str, Any] = {"session_id": sid, "hits": 0, "merged": False}
@@ -2796,6 +2802,8 @@ async def _compute_session_channel(
         session_dir = session_store.session_dir(sid)
     except Exception as exc:  # noqa: BLE001 -- fail-soft by contract
         logger.warning("Session recall channel unavailable: %s", exc)
+        block["status"] = "error"
+        block["error_kind"] = "channel"
         block["error"] = str(exc)
         await trace_emit(
             "session_hits",
@@ -2809,6 +2817,7 @@ async def _compute_session_channel(
         return block, []
 
     if session_store.mode != "split":
+        block["status"] = "skipped"
         block["skipped"] = "subgraph mode indexes compactions directly into the main graph"
         await trace_emit(
             "session_hits",
@@ -2821,6 +2830,7 @@ async def _compute_session_channel(
         )
         return block, []
     if not session_dir.is_dir():
+        block["status"] = "unknown_session"
         block["error"] = "unknown session"
         await trace_emit(
             "session_hits",
@@ -2834,6 +2844,7 @@ async def _compute_session_channel(
         return block, []
     if (session_dir / SESSION_MERGED_FILENAME).is_file():
         block["merged"] = True
+        block["status"] = "skipped"
         block["skipped"] = "session already merged into the main index"
         await trace_emit(
             "session_hits",
@@ -2846,21 +2857,37 @@ async def _compute_session_channel(
         )
         return block, []
 
+    # Query embedding is only needed for the cosine half of the score. When the
+    # embedder fails or times out the channel degrades to lexical F1 only and
+    # says so (`degraded: "lexical_only"` + `error`/`error_kind`) instead of
+    # silently returning zero hits.
+    query_vec: Any = None
     try:
         import numpy as np
 
         embed_func = getattr(rag, "embedding_func", None)
         if embed_func is None:
             raise RuntimeError("recall embedding function unavailable")
-        raw_query = await embed_func([question], context="query")
+        embed_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
+        raw_query = await asyncio.wait_for(
+            embed_func([question], context="query"), timeout=embed_timeout
+        )
         query_vec = np.asarray(raw_query, dtype=np.float32).reshape(-1)
         query_norm = float(np.linalg.norm(query_vec))
         if query_norm > 0.0:
             query_vec = query_vec / query_norm
-    except Exception as exc:  # noqa: BLE001 -- fail-soft
-        logger.warning("Session recall channel embedding failed (session=%s): %s", sid, exc)
-        block["error"] = f"query embedding failed: {exc}"
-        return block, []
+    except Exception as exc:  # noqa: BLE001 -- degrade to lexical-only
+        query_vec = None
+        detail = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else repr(exc))
+        logger.warning(
+            "Session recall channel embedding failed (session=%s), lexical-only fallback: %s: %s",
+            sid,
+            type(exc).__name__,
+            detail,
+        )
+        block["degraded"] = "lexical_only"
+        block["error_kind"] = "embedding"
+        block["error"] = f"query embedding failed ({type(exc).__name__}): {detail}"
 
     def _search() -> tuple[list[Any], dict[str, Any]]:
         import json
@@ -2887,12 +2914,18 @@ async def _compute_session_channel(
         vdb = vdb_raw if isinstance(vdb_raw, dict) else {}
         vector_ids, matrix = _session_vectors_from_vdb(vdb)
         cosine_by_id: dict[str, float] = {}
-        if matrix is not None and vector_ids:
-            norms = np.linalg.norm(matrix, axis=1)
-            norms[norms == 0.0] = 1.0
-            sims = (matrix @ query_vec) / norms
-            for chunk_id, score in zip(vector_ids, sims, strict=False):
-                cosine_by_id[chunk_id] = float(np.clip(score, -1.0, 1.0))
+        vector_error: str | None = None
+        if query_vec is not None and matrix is not None and vector_ids:
+            try:
+                norms = np.linalg.norm(matrix, axis=1)
+                norms[norms == 0.0] = 1.0
+                sims = (matrix @ query_vec) / norms
+                for chunk_id, score in zip(vector_ids, sims, strict=False):
+                    cosine_by_id[chunk_id] = float(np.clip(score, -1.0, 1.0))
+            except (ValueError, TypeError) as exc:
+                # e.g. query/vector dimension mismatch: keep the lexical half.
+                cosine_by_id = {}
+                vector_error = f"vector scoring failed ({type(exc).__name__}): {exc}"
 
         query_tokens = _session_token_set(question)
         paths_by_id: dict[str, str] = {}
@@ -2929,33 +2962,67 @@ async def _compute_session_channel(
             )
             for final, cosine, lexical, chunk_id, meta in candidates[:limit]
         ]
+        entities, relations = 0, 0
+        graph_counts = getattr(session_store, "_graph_counts", None)
+        if callable(graph_counts):
+            try:
+                entities, relations = graph_counts(session_dir)
+            except Exception as exc:  # noqa: BLE001 -- stats are fail-soft
+                logger.debug("Session recall channel: graph counts unavailable: %s", exc)
         stats = {
             "chunks_indexed": len(chunks),
             "vectors_indexed": len(vector_ids),
+            "entities": entities,
+            "relations": relations,
             "scored": len(scored),
             "below_threshold": max(0, len(scored) - len(candidates)),
             "min_score": HARS_MEMORY_SESSION_MIN_SCORE,
         }
+        if vector_error is not None:
+            stats["vector_error"] = vector_error
         return fused, stats
 
     try:
         fused, stats = await run_blocking(_search)
-    except Exception as exc:  # noqa: BLE001 -- fail-soft
+    except Exception as exc:  # noqa: BLE001 -- reported, never an empty "success"
         logger.warning("Session recall channel failed (session=%s): %s", sid, exc)
-        block["error"] = str(exc)
+        block["status"] = "error"
+        block["error_kind"] = "channel"
+        block["error"] = f"session channel failed ({type(exc).__name__}): {exc}"
+        await trace_emit(
+            "session_hits",
+            enabled=True,
+            skipped=True,
+            reason="channel_failed",
+            session_id=sid,
+            latency_ms=None,
+            hits=[],
+        )
         return block, []
 
+    vector_error = stats.pop("vector_error", None)
+    if vector_error is not None and "degraded" not in block:
+        block["degraded"] = "lexical_only"
+        block["error_kind"] = "vector_scoring"
+        block["error"] = vector_error
     elapsed_ms = round((time.monotonic() - started) * 1000.0, 2)
     block.update({
         "hits": len(fused),
         "latency_ms": elapsed_ms,
         **stats,
     })
+    # `status` separates a degraded-but-working channel from a legitimate
+    # empty result: "ok" (hits), "no_hits" (searched, nothing above the
+    # cutoff or an empty session store), "degraded" (lexical-only scoring).
+    if "degraded" in block:
+        block["status"] = "degraded"
+    else:
+        block["status"] = "ok" if fused else "no_hits"
     await trace_emit(
         "session_hits",
         enabled=True,
         skipped=False,
-        reason=None,
+        reason=block.get("degraded"),
         session_id=sid,
         latency_ms=elapsed_ms,
         hits=[
@@ -3106,7 +3173,7 @@ def _lean_recall_response(
     kept_fields = {
         "ok", "error", "answer", "mode", "lightrag_mode", "mode_fallback", "graph_branch", "top_k",
         "fetch_top_k", "fetch_top_k_source", "question", "last_ingest", "stale_days",
-        "staleness_warning", "session", "session_id",
+        "staleness_warning", "session", "session_id", "error_kind",
     }
     if not include_answer:
         kept_fields.discard("answer")
@@ -4328,7 +4395,8 @@ async def list_tools() -> list[Tool]:
             (
                 "Report session compaction inventory. Without session_id: every session under "
                 "HARS_MEMORY_SESSIONS_DIR with compaction count, merge state, graph entity/"
-                "relation counts and index dir. With session_id: just that session. "
+                "relation counts, chunks_indexed/vectors_indexed and index dir. With "
+                "session_id: just that session. "
                 "GPU-free, no LLM calls; corrupt/missing files read as zeros."
             ),
             {
@@ -4834,7 +4902,13 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                         exc,
                     )
                     session_block, session_chunks = (
-                        {"session_id": session_id_arg, "hits": 0, "error": str(exc)},
+                        {
+                            "session_id": session_id_arg,
+                            "hits": 0,
+                            "status": "error",
+                            "error_kind": "channel",
+                            "error": f"session channel failed ({type(exc).__name__}): {exc}",
+                        },
                         [],
                     )
                 if session_chunks:
@@ -4994,6 +5068,19 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                         logger.warning("memory_recall: %s", recall_error)
                     else:
                         recall_error = "no context retrieved for this question"
+                    # Never an unexplained empty failure when a session was
+                    # requested: say whether the session channel itself broke
+                    # (`error_kind: session_channel`) or simply found nothing
+                    # (`no_hits`), and carry the channel's own error text.
+                    recall_error_kind: str | None = None
+                    if recall_error is not None:
+                        recall_error_kind = "no_hits"
+                        if session_block is not None and session_block.get("error"):
+                            if session_block.get("status") == "error":
+                                recall_error_kind = "session_channel"
+                            recall_error = (
+                                f"{recall_error}; session channel: {session_block['error']}"
+                            )
                     # Live trace (SSE): graph pass + assembled context. The
                     # entity/relation/source rows are *derived* by parsing the
                     # rendered context (the only place they exist on this path);
@@ -5095,6 +5182,8 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                     if session_block is not None:
                         response["session_id"] = session_id_arg
                         response["session"] = session_block
+                        if recall_error_kind is not None:
+                            response["error_kind"] = recall_error_kind
                     if debug:
                         fused = hybrid_block.get("fused_chunks") or []
                         response["debug"] = {
@@ -5245,17 +5334,25 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 _emit_recall_event(
                     ok=False, results=[], graph_channel_ms=None, context_priority_applied=None,
                 )
-                return json_text({
+                failure: dict[str, Any] = {
                     "ok": False,
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": str(exc) or type(exc).__name__,
                     "hint": (
                         "Ensure the index is built and the embedding backend is reachable "
                         "(context_only path uses no LLM)."
                         if context_only
                         else "Ensure the query LLM is running and the index is built."
                     ),
-                })
+                }
+                if session_block is not None:
+                    # Keep the session channel's own state visible: a graph/LLM
+                    # failure here says nothing about whether the session
+                    # channel found anything.
+                    failure["error_kind"] = "recall_exception"
+                    failure["session_id"] = session_id_arg
+                    failure["session"] = session_block
+                return json_text(failure)
 
         # ------------------------------------------------------------------ #
         # memory_remember                                                     #

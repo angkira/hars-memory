@@ -545,3 +545,50 @@ def test_session_status_ignores_non_session_directories(tmp_path: Path) -> None:
     (tmp_path / "index" / "sessions" / "loose-file.txt").write_text("x", encoding="utf-8")
     listing = store.session_status()
     assert listing["sessions"] == []
+
+
+def test_session_status_exposes_chunk_and_vector_counts(tmp_path: Path) -> None:
+    """A persistence gate needs entities/relations/vectors_indexed, not only
+    document counts, to detect a session that was stored but never indexed."""
+    store = _prepare_split_session(tmp_path, session_id="sess-idx")
+    session_dir = tmp_path / "index" / "sessions" / "sess-idx"
+    _write_json(
+        session_dir / session_memory_module.TEXT_CHUNKS_FILENAME,
+        {"chunk-1": {"content": "a"}, "chunk-2": {"content": "b"}, "bad": "not-a-record"},
+    )
+    _write_json(
+        session_dir / session_memory_module.VDB_CHUNKS_FILENAME,
+        {"embedding_dim": 3, "data": [{"__id__": "chunk-1"}, {"__id__": "chunk-2"}]},
+    )
+
+    detail = store.session_status("sess-idx")
+
+    assert detail["compactions"] == 3
+    assert detail["entities"] == 3
+    assert detail["relations"] == 0
+    assert detail["chunks_indexed"] == 2
+    assert detail["vectors_indexed"] == 2
+    listed = {entry["session_id"]: entry for entry in store.session_status()["sessions"]}
+    assert listed["sess-idx"]["vectors_indexed"] == 2
+    assert listed["sess-idx"]["chunks_indexed"] == 2
+
+
+def test_session_status_index_counts_are_fail_soft(tmp_path: Path) -> None:
+    store = _prepare_split_session(tmp_path, session_id="sess-empty")
+    session_dir = tmp_path / "index" / "sessions" / "sess-empty"
+    (session_dir / session_memory_module.TEXT_CHUNKS_FILENAME).write_text(
+        "{not json", encoding="utf-8"
+    )
+    _write_json(session_dir / session_memory_module.VDB_CHUNKS_FILENAME, {"data": "oops"})
+
+    detail = store.session_status("sess-empty")
+
+    # Documents exist but nothing was embedded: the gate must see zeros.
+    assert detail["compactions"] == 3
+    assert detail["chunks_indexed"] == 0
+    assert detail["vectors_indexed"] == 0
+
+    unknown = store.session_status("never-seen")
+    assert unknown["chunks_indexed"] == 0
+    assert unknown["vectors_indexed"] == 0
+    assert unknown["entities"] == 0

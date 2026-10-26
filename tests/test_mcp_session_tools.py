@@ -557,3 +557,213 @@ def test_simulation_30_compactions_batches_and_merge(
     status = store.session_status(SESSION_ID)
     assert status["merged"] is True
     assert status["compactions"] == 30
+
+
+# ---------------------------------------------------------------------------
+# (vi) degraded / failure reporting of the session channel
+# ---------------------------------------------------------------------------
+
+
+async def _embed_raises(texts: list[str], context: str | None = None) -> np.ndarray:  # noqa: ARG001
+    raise RuntimeError("embedder unreachable at 127.0.0.1:8791 (HTTP 530)")
+
+
+async def _embed_hangs(texts: list[str], context: str | None = None) -> np.ndarray:  # noqa: ARG001
+    await asyncio.sleep(5)
+    return np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+
+
+async def _embed_wrong_dim(texts: list[str], context: str | None = None) -> np.ndarray:  # noqa: ARG001
+    return np.array([[1.0, 0.0]], dtype=np.float32)
+
+
+class _FailingGraphRag(_RecallRag):
+    async def aquery(self, _question: str, *, param: object) -> str:  # noqa: ARG002
+        raise RuntimeError("graph backend returned HTTP 530")
+
+
+def _call_recall_with(
+    mod: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    embedding_func: Any = _embed_query,
+    rag_cls: type = _RecallRag,
+    base_chunks: bool = True,
+    **args: Any,
+) -> dict[str, Any]:
+    """`_call_recall` with a configurable embedder, RAG and base fused chunks."""
+    hybrid = _hybrid_fixture()
+    if not base_chunks:
+        hybrid["fused_chunks"] = []
+
+    async def fake_hybrid(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(hybrid)
+
+    monkeypatch.setattr(mod, "_compute_hybrid_block", fake_hybrid)
+    mod._rag_instance = rag_cls([], embedding_func=embedding_func)
+    result = asyncio.run(mod.call_tool(
+        "memory_recall",
+        {"question": "Q7X42 sidecar gate", "ll_keywords": ["Q7X42"], "context_only": True, **args},
+    ))
+    return json.loads(result[0].text)
+
+
+def test_recall_session_channel_falls_back_to_lexical_when_embedding_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+
+    data = _call_recall_with(
+        mod, monkeypatch, embedding_func=_embed_raises, base_chunks=False,
+        session_id=SESSION_ID,
+    )
+
+    session = data["session"]
+    assert session["degraded"] == "lexical_only"
+    assert session["status"] == "degraded"
+    assert session["error_kind"] == "embedding"
+    assert "query embedding failed" in session["error"]
+    assert "HTTP 530" in session["error"]
+    # Lexical F1 alone still finds the matching compaction chunk.
+    assert session["hits"] == 1
+    session_chunks = [
+        chunk for chunk in data["hybrid"]["fused_chunks"] if chunk.get("channel") == "session"
+    ]
+    assert session_chunks[0]["dense_score"] == 0.0
+    assert session_chunks[0]["sparse_score"] > 0.2
+    assert data["ok"] is True
+    assert "sidecar" in data["context"]
+
+
+def test_recall_session_channel_embedding_timeout_degrades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    monkeypatch.setenv("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "0.05")
+
+    data = _call_recall_with(
+        mod, monkeypatch, embedding_func=_embed_hangs, session_id=SESSION_ID,
+    )
+
+    assert data["session"]["degraded"] == "lexical_only"
+    assert "TimeoutError" in data["session"]["error"]
+    assert data["session"]["hits"] == 1
+
+
+def test_recall_session_channel_dimension_mismatch_degrades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+
+    data = _call_recall_with(
+        mod, monkeypatch, embedding_func=_embed_wrong_dim, session_id=SESSION_ID,
+    )
+
+    assert data["session"]["degraded"] == "lexical_only"
+    assert data["session"]["error_kind"] == "vector_scoring"
+    assert data["session"]["hits"] == 1
+
+
+def test_recall_session_block_exposes_index_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import networkx as nx
+
+    session_dir = _write_session_fixture(tmp_path)
+    graph = nx.Graph()
+    graph.add_edge("Q7X42", "sidecar gate")
+    nx.write_graphml(graph, str(session_dir / session_memory_module.GRAPH_FILE_NAME))
+    mod = _recall_mod(tmp_path)
+
+    data = _call_recall(mod, monkeypatch, session_id=SESSION_ID)
+
+    session = data["session"]
+    assert session["status"] == "ok"
+    assert "degraded" not in session
+    assert "error" not in session
+    assert session["entities"] == 2
+    assert session["relations"] == 1
+    assert session["vectors_indexed"] == 2
+    assert session["chunks_indexed"] == 2
+
+
+def test_recall_session_channel_hard_failure_is_ok_false_with_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken session channel with nothing else to return must never look
+    like an empty success: ok=false, explicit error, error_kind set."""
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+
+    def broken_vdb(_vdb: dict[str, Any]) -> tuple[list[str], Any]:
+        raise RuntimeError("vdb decoder exploded")
+
+    monkeypatch.setattr(mod, "_session_vectors_from_vdb", broken_vdb)
+
+    data = _call_recall_with(mod, monkeypatch, base_chunks=False, session_id=SESSION_ID)
+
+    assert data["ok"] is False
+    assert not data["context"]
+    assert data["error_kind"] == "session_channel"
+    assert "session channel" in data["error"]
+    assert "vdb decoder exploded" in data["error"]
+    assert data["session"]["status"] == "error"
+    assert data["session"]["hits"] == 0
+
+
+def test_recall_session_legitimate_no_hits_is_distinguishable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path, HARS_MEMORY_SESSION_MIN_SCORE="1.5")
+
+    data = _call_recall_with(mod, monkeypatch, base_chunks=False, session_id=SESSION_ID)
+
+    assert data["ok"] is False
+    assert data["error"]
+    assert data["error_kind"] == "no_hits"
+    assert "session channel" not in data["error"]
+    assert data["session"]["status"] == "no_hits"
+    assert "error" not in data["session"]
+
+    lean = _call_recall_with(
+        mod, monkeypatch, base_chunks=False, session_id=SESSION_ID, view="lean"
+    )
+    assert lean["error_kind"] == "no_hits"
+
+
+def test_recall_exception_path_keeps_session_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+
+    data = _call_recall_with(
+        mod, monkeypatch, rag_cls=_FailingGraphRag, session_id=SESSION_ID,
+    )
+
+    assert data["ok"] is False
+    assert "HTTP 530" in data["error"]
+    assert data["error_kind"] == "recall_exception"
+    assert data["session"]["status"] == "ok"
+    assert data["session"]["hits"] == 1
+
+
+def test_memory_session_status_reports_vectors_indexed_from_real_store(
+    tmp_path: Path,
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+
+    detail = json.loads(asyncio.run(mod.call_tool(
+        "memory_session_status", {"session_id": SESSION_ID}
+    ))[0].text)
+
+    assert detail["ok"] is True
+    assert detail["vectors_indexed"] == 2
+    assert detail["chunks_indexed"] == 2
+    assert detail["entities"] == 0
+    assert detail["relations"] == 0

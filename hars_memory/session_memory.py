@@ -95,6 +95,9 @@ DEFAULT_MIN_SCORE = 0.2
 GRAPH_FILE_NAME = "graph_chunk_entity_relation.graphml"
 #: LightRAG's full-document KV store (``{doc_id: {"content": str}}``).
 FULL_DOCS_FILENAME = "kv_store_full_docs.json"
+#: LightRAG's chunk KV store and NanoVectorDB chunk-vector file.
+TEXT_CHUNKS_FILENAME = "kv_store_text_chunks.json"
+VDB_CHUNKS_FILENAME = "vdb_chunks.json"
 SEQ_FILENAME = "seq.json"
 MERGED_FILENAME = "merged.json"
 
@@ -528,6 +531,24 @@ class SessionMemoryStore:
             logger.debug("Session memory: cannot count graph %s: %s", graph_file, exc)
             return 0, 0
 
+    def _index_counts(self, working_dir: Path) -> tuple[int, int]:
+        """``(chunks_indexed, vectors_indexed)`` for a working dir; zeros on failure.
+
+        ``chunks_indexed`` counts the chunk KV store records and
+        ``vectors_indexed`` the rows of the NanoVectorDB chunk store, so a
+        caller can tell "compactions stored but never embedded" apart from a
+        fully indexed session.
+        """
+        chunks = _read_json(working_dir / TEXT_CHUNKS_FILENAME)
+        chunks_indexed = sum(1 for value in chunks.values() if isinstance(value, dict))
+        vdb_data = _read_json(working_dir / VDB_CHUNKS_FILENAME).get("data")
+        vectors_indexed = (
+            sum(1 for record in vdb_data if isinstance(record, dict))
+            if isinstance(vdb_data, list)
+            else 0
+        )
+        return chunks_indexed, vectors_indexed
+
     def _alias_hints(self, session_id: str) -> list[str]:
         """Map session-graph entities onto main-graph entities.
 
@@ -681,6 +702,8 @@ class SessionMemoryStore:
             "merged_at": None,
             "entities": 0,
             "relations": 0,
+            "chunks_indexed": 0,
+            "vectors_indexed": 0,
         }
         if not session_dir.is_dir():
             return detail
@@ -718,13 +741,19 @@ class SessionMemoryStore:
         entities, relations = self._graph_counts(session_dir)
         detail["entities"] = entities
         detail["relations"] = relations
+        chunks_indexed, vectors_indexed = self._index_counts(session_dir)
+        detail["chunks_indexed"] = chunks_indexed
+        detail["vectors_indexed"] = vectors_indexed
         return detail
 
     def session_status(self, session_id: str | None = None) -> dict[str, Any]:
         """Session inventory (no arg) or one session's detail (with arg).
 
         Every statistic is fail-soft: corrupt JSON or a missing GraphML file
-        reads as zeros rather than raising.
+        reads as zeros rather than raising. ``entities``/``relations`` come
+        from the session GraphML, ``chunks_indexed``/``vectors_indexed`` from
+        the chunk KV store and chunk vector store (split mode; in subgraph
+        mode the session directory holds no index, so they stay 0).
         """
         if session_id is not None:
             return self._session_detail(session_id)
