@@ -55,6 +55,8 @@ candidate ranking, with the LightRAG graph pass as an independent second branch.
 | `max_chars` | `integer` | `15000` | Per-call total char budget for the assembled `context`; `0` = no cap. Default from `HARS_MEMORY_CONTEXT_MAX_CHARS` |
 | `debug` | `boolean` | `false` | Include debug data: `fused_chunks`, `latency_breakdown`, `llm_usage`, `raw_result` |
 | `session_id` | `string` | — | Optional session id: appends that session's unmerged compaction chunks (cosine + lexical F1) as `session:<sid>:<chunk_id>` entries, adds a `session` status block. No behavior change when omitted |
+| `session_graph` | `boolean` | env `HARS_MEMORY_SESSION_GRAPH` (off) | Opt-in, needs `session_id` + `context_only`. Also queries the session's own LightRAG graph (hybrid local+global, `only_need_context`, file-backed Nano/NetworkX storages, never the main collections) and puts its `Knowledge Graph Data (Entity/Relationship)` sections ABOVE the unchanged chunk section of `context`. Keywords: caller `ll_keywords`/`hl_keywords` if given, else ONE extractor-model LLM call (cached per question+session), else the question text. Adds a top-level `session_graph` block: `status` (`ok`/`empty`/`skipped`/`unknown_session`/`error`), `keyword_source` (`caller`/`llm`/`question_fallback`), `ll_keywords`, `hl_keywords`, `entities`, `relations`, `empty`, `latency_ms`, `keyword_latency_ms`, `query_latency_ms`, and `error` on failure (an empty graph is `empty: true`, not an error; chunks are never affected). Off/absent: response byte-identical to before |
+| `session_graph_mode` | `enum` | `hybrid` | `hybrid`/`local`/`global`/`mix` LightRAG mode for the session graph |
 
 ### Response shape
 

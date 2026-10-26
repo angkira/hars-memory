@@ -3039,6 +3039,307 @@ async def _compute_session_channel(
     return block, fused
 
 
+# ---------------------------------------------------------------------------
+# Session-graph recall (opt-in): query the per-session LightRAG graph
+# ---------------------------------------------------------------------------
+# Plan: .plans/2026-10-26_session-graph-recall.md (Option A). In split mode the
+# compaction documents are extracted into a per-session LightRAG working dir
+# (NanoVectorDB + NetworkX), but the session channel above only reads its CHUNK
+# stores. With `session_graph=true` (or HARS_MEMORY_SESSION_GRAPH=on) recall also
+# runs a hybrid (local+global) `only_need_context` LightRAG query against that
+# session graph and splices its Entity / Relationship sections ABOVE the
+# unchanged chunk section. Default OFF: the payload is then byte-identical to a
+# build without this feature.
+SESSION_GRAPH_ENV = "HARS_MEMORY_SESSION_GRAPH"
+SESSION_GRAPH_MODES = ("hybrid", "local", "global", "mix")
+SESSION_GRAPH_RAG_CACHE_MAX = 8
+SESSION_GRAPH_KEYWORD_CACHE_MAX = 512
+_CONTEXT_RELATION_SECTION_HEADER = "Knowledge Graph Data (Relationship):"
+_SESSION_GRAPH_SIGNATURE_FILES = (
+    "graph_chunk_entity_relation.graphml",
+    "vdb_entities.json",
+    "vdb_relationships.json",
+    "vdb_chunks.json",
+    "kv_store_text_chunks.json",
+    "kv_store_full_entities.json",
+    "kv_store_full_relations.json",
+)
+
+# sid -> (signature, rag). Rebuilt when a compaction rewrites the session files.
+_session_graph_rags: dict[str, tuple[tuple, Any]] = {}
+_session_graph_locks: dict[str, asyncio.Lock] = {}
+# (sid, sha1(question)) -> (ll_keywords, hl_keywords), insertion-ordered.
+_session_graph_keyword_cache: dict[tuple[str, str], tuple[list[str], list[str]]] = {}
+
+_SESSION_GRAPH_KEYWORD_SYSTEM = (
+    "You extract search keywords for a knowledge-graph lookup. Reply with ONE JSON object "
+    "and nothing else: {\"high_level_keywords\": [...], \"low_level_keywords\": [...]}. "
+    "high_level_keywords: overarching themes/concepts the question is about (2-5). "
+    "low_level_keywords: specific entities, names, identifiers, file paths, numbers "
+    "(copy identifiers VERBATIM, 2-8)."
+)
+
+
+def _session_graph_enabled(arg: Any) -> bool:
+    """Per-call `session_graph` wins; absent -> HARS_MEMORY_SESSION_GRAPH (default off)."""
+    if arg is not None:
+        return bool(arg)
+    return os.environ.get(SESSION_GRAPH_ENV, "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _session_graph_signature(session_dir: Path) -> tuple:
+    sig = []
+    for name in _SESSION_GRAPH_SIGNATURE_FILES:
+        try:
+            st = (session_dir / name).stat()
+            sig.append((name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append((name, None, None))
+    return tuple(sig)
+
+
+async def _get_session_graph_rag(sid: str, session_dir: Path) -> Any:
+    """Return a LightRAG over *session_dir* (file-backed storages ONLY, never the
+    main Qdrant collections), cached per (sid, file signature). Caller holds the
+    per-session lock."""
+    signature = _session_graph_signature(session_dir)
+    cached = _session_graph_rags.get(sid)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    if cached is not None:
+        _session_graph_rags.pop(sid, None)
+        try:
+            await cached[1].finalize_storages()
+        except Exception:  # noqa: BLE001 -- best effort
+            logger.debug("session graph rag finalize failed (sid=%s)", sid, exc_info=True)
+    from hars_memory.server.lightrag_init import create_lightrag
+    from hars_memory.session_memory import _SESSION_GRAPH_STORAGE, _SESSION_VECTOR_STORAGE
+
+    rag = create_lightrag(
+        working_dir=str(session_dir),
+        vector_storage=_SESSION_VECTOR_STORAGE,
+        graph_storage=_SESSION_GRAPH_STORAGE,
+    )
+    await rag.initialize_storages()  # type: ignore[attr-defined]
+    while len(_session_graph_rags) >= SESSION_GRAPH_RAG_CACHE_MAX:
+        old_sid = next(iter(_session_graph_rags))
+        _, old = _session_graph_rags.pop(old_sid)
+        try:
+            await old.finalize_storages()
+        except Exception:  # noqa: BLE001
+            pass
+    _session_graph_rags[sid] = (signature, rag)
+    return rag
+
+
+def _parse_keyword_json(text: Any) -> tuple[list[str], list[str]]:
+    """Parse the keyword LLM reply -> (ll, hl). Raises ValueError when unusable."""
+    raw = str(text or "")
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON object in keyword reply")
+    data = json.loads(raw[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("keyword reply is not a JSON object")
+
+    def _clean(value: Any) -> list[str]:
+        items = value if isinstance(value, list) else []
+        return [s for s in (str(i).strip() for i in items) if s][:12]
+
+    ll = _clean(data.get("low_level_keywords"))
+    hl = _clean(data.get("high_level_keywords"))
+    if not ll and not hl:
+        raise ValueError("keyword reply had no keywords")
+    return ll, hl
+
+
+async def _resolve_session_graph_keywords(
+    rag: Any, question: str, sid: str, ll: list[str], hl: list[str]
+) -> tuple[list[str], list[str], str, dict[str, Any]]:
+    """caller > ONE extractor-model LLM call (cached per question+session) >
+    question text. Returns (ll, hl, keyword_source, extra block fields)."""
+    import hashlib
+
+    if ll or hl:
+        return ll, hl, "caller", {}
+    key = (sid, hashlib.sha1(question.encode("utf-8")).hexdigest())
+    cached = _session_graph_keyword_cache.get(key)
+    if cached is not None:
+        return list(cached[0]), list(cached[1]), "llm", {"keyword_cached": True}
+    started = time.monotonic()
+    extra: dict[str, Any] = {}
+    try:
+        llm = getattr(rag, "llm_model_func", None)
+        if llm is None:
+            raise RuntimeError("session rag has no llm_model_func")
+        timeout = float(os.environ.get("HARS_MEMORY_SESSION_GRAPH_KEYWORD_TIMEOUT_SECONDS", "30"))
+        reply = await asyncio.wait_for(
+            llm(f"Question: {question}", system_prompt=_SESSION_GRAPH_KEYWORD_SYSTEM),
+            timeout=timeout,
+        )
+        k_ll, k_hl = _parse_keyword_json(reply)
+        extra["keyword_latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        while len(_session_graph_keyword_cache) >= SESSION_GRAPH_KEYWORD_CACHE_MAX:
+            _session_graph_keyword_cache.pop(next(iter(_session_graph_keyword_cache)))
+        _session_graph_keyword_cache[key] = (k_ll, k_hl)
+        return k_ll, k_hl, "llm", extra
+    except Exception as exc:  # noqa: BLE001 -- documented fallback
+        detail = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else repr(exc))
+        logger.warning("session graph keyword extraction failed (sid=%s): %s: %s", sid, type(exc).__name__, detail)
+        extra["keyword_latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        extra["keyword_error"] = f"{type(exc).__name__}: {detail}"
+        return [question], [question], "question_fallback", extra
+
+
+def _kg_block_lines(context: str, header: str) -> list[str]:
+    block = _extract_fenced_block(context, header)
+    if block is None:
+        return []
+    return [line for line in block[2].splitlines() if line.strip()]
+
+
+async def _compute_session_graph_context(
+    question: str,
+    session_id: str,
+    *,
+    ll_keywords: list[str],
+    hl_keywords: list[str],
+    mode: str = "hybrid",
+    top_k: int = DEFAULT_QUERY_TOP_K,
+    fetch_top_k: int | None = None,
+    project_id: str = "default",
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Return ``(session_graph block, entity JSON lines, relation JSON lines)``.
+
+    Never raises. ``status``: ok | empty | skipped | unknown_session | error.
+    An empty graph result is ``status="empty", empty=True`` (not an error); any
+    failure is ``status="error"`` with ``error``. Always carries
+    ``keyword_source`` (caller|llm|question_fallback) once keywords were resolved.
+    """
+    started = time.monotonic()
+    block: dict[str, Any] = {"enabled": True, "mode": mode, "session_id": str(session_id or "").strip()}
+
+    def _done(status: str, **fields: Any) -> tuple[dict[str, Any], list[str], list[str]]:
+        block["status"] = status
+        block.update(fields)
+        block["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        return block, [], []
+
+    sid = block["session_id"]
+    if not sid:
+        return _done("skipped", skipped="session_graph needs a session_id")
+    try:
+        from hars_memory.session_memory import validate_session_id
+
+        sid = validate_session_id(sid)
+        block["session_id"] = sid
+        store = _get_session_store(project_id)
+        session_dir = store.session_dir(sid)
+    except Exception as exc:  # noqa: BLE001
+        return _done("error", error=f"session graph unavailable ({type(exc).__name__}): {exc}")
+    if store.mode != "split":
+        return _done("skipped", skipped="subgraph mode indexes compactions directly into the main graph")
+    if not session_dir.is_dir():
+        return _done("unknown_session", error="unknown session")
+    if (session_dir / SESSION_MERGED_FILENAME).is_file():
+        return _done("skipped", skipped="session already merged into the main index", merged=True)
+    if mode not in SESSION_GRAPH_MODES:
+        return _done("error", error=f"session_graph_mode must be one of {', '.join(SESSION_GRAPH_MODES)}")
+
+    lock = _session_graph_locks.setdefault(sid, asyncio.Lock())
+    try:
+        async with lock:
+            rag = await _get_session_graph_rag(sid, session_dir)
+            ll, hl, source, extra = await _resolve_session_graph_keywords(
+                rag, question, sid, ll_keywords, hl_keywords
+            )
+            block.update({"keyword_source": source, "ll_keywords": ll, "hl_keywords": hl, **extra})
+            from lightrag import QueryParam  # type: ignore[import-not-found]
+
+            query_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
+            query_started = time.monotonic()
+            raw = await asyncio.wait_for(
+                rag.aquery(  # type: ignore[attr-defined]
+                    question,
+                    param=QueryParam(
+                        mode=mode,
+                        top_k=top_k,
+                        chunk_top_k=fetch_top_k or top_k,
+                        only_need_context=True,
+                        ll_keywords=ll,
+                        hl_keywords=hl,
+                        enable_rerank=False,
+                        max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
+                        max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
+                    ),
+                ),
+                timeout=query_timeout,
+            )
+            block["query_latency_ms"] = round((time.monotonic() - query_started) * 1000, 1)
+    except Exception as exc:  # noqa: BLE001 -- explicit error field, never silent
+        detail = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else repr(exc))
+        logger.warning("memory_recall session graph failed (session=%s): %s: %s", sid, type(exc).__name__, detail)
+        return _done("error", error=f"session graph query failed ({type(exc).__name__}): {detail}")
+
+    text = raw if isinstance(raw, str) else ""
+    entities = _kg_block_lines(text, _CONTEXT_ENTITY_SECTION_HEADER)
+    relations = _kg_block_lines(text, _CONTEXT_RELATION_SECTION_HEADER)
+    block["entities"] = len(entities)
+    block["relations"] = len(relations)
+    if not entities and not relations:
+        _done("empty", empty=True)
+        return block, [], []
+    _done("ok", empty=False)
+    return block, entities, relations
+
+
+def _splice_session_kg(
+    context: str | None, entity_lines: list[str], relation_lines: list[str]
+) -> str | None:
+    """Put the session KG sections ABOVE the chunk section of *context*.
+
+    The chunk / reference sections are left byte-for-byte unchanged. If the
+    context already has KG sections (main graph branch), session lines go first
+    inside them; missing KG sections are inserted before the chunk section. With
+    no context at all a KG-only context is built. Returns the context unchanged
+    when there is nothing to splice.
+    """
+    if not entity_lines and not relation_lines:
+        return context
+
+    def _section(header: str, lines: list[str]) -> str:
+        return header + "\n\n```json\n" + "\n".join(lines) + "\n```\n\n"
+
+    kg_text = _section(_CONTEXT_ENTITY_SECTION_HEADER, entity_lines) + _section(
+        _CONTEXT_RELATION_SECTION_HEADER, relation_lines
+    )
+    if not context or not str(context).strip():
+        return "\n" + kg_text
+    result = context
+    have_entity = _extract_fenced_block(result, _CONTEXT_ENTITY_SECTION_HEADER) is not None
+    have_relation = _extract_fenced_block(result, _CONTEXT_RELATION_SECTION_HEADER) is not None
+    if not have_entity and not have_relation:
+        idx = result.find(_CONTEXT_CHUNK_SECTION_HEADER)
+        if idx == -1:
+            return "\n" + kg_text + result.lstrip("\n")
+        return result[:idx] + kg_text + result[idx:]
+    for header, lines, present in (
+        (_CONTEXT_ENTITY_SECTION_HEADER, entity_lines, have_entity),
+        (_CONTEXT_RELATION_SECTION_HEADER, relation_lines, have_relation),
+    ):
+        if not lines:
+            continue
+        if present:
+            start, end, existing = _extract_fenced_block(result, header)  # type: ignore[misc]
+            merged = "\n".join(lines + ([existing] if existing.strip() else []))
+            result = result[:start] + merged + result[end:]
+        else:
+            idx = result.find(_CONTEXT_CHUNK_SECTION_HEADER)
+            sect = _section(header, lines)
+            result = (result[:idx] + sect + result[idx:]) if idx != -1 else result + "\n" + sect
+    return result
+
+
 def _session_chunk_payload(chunk: Any) -> dict[str, Any]:
     """Serialise a session-channel FusedChunk into the hybrid fused_chunks shape."""
     payload = {
@@ -3173,7 +3474,7 @@ def _lean_recall_response(
     kept_fields = {
         "ok", "error", "answer", "mode", "lightrag_mode", "mode_fallback", "graph_branch", "top_k",
         "fetch_top_k", "fetch_top_k_source", "question", "last_ingest", "stale_days",
-        "staleness_warning", "session", "session_id", "error_kind",
+        "staleness_warning", "session", "session_id", "error_kind", "session_graph",
     }
     if not include_answer:
         kept_fields.discard("answer")
@@ -4306,6 +4607,28 @@ async def list_tools() -> list[Tool]:
                         "the reason and zero hits; recall itself is unaffected."
                     ),
                 },
+                "session_graph": {
+                    "type": "boolean",
+                    "description": (
+                        "Opt-in (default: env HARS_MEMORY_SESSION_GRAPH, itself off). With a "
+                        "`session_id` (split mode, unmerged) also query that session's own "
+                        "LightRAG graph (hybrid local+global, context only) and put its "
+                        "`Knowledge Graph Data (Entity/Relationship)` sections ABOVE the unchanged "
+                        "chunk section of `context`. Keywords: caller `ll_keywords`/`hl_keywords` "
+                        "if given, else one extractor-model LLM call (cached per question+session), "
+                        "else the question text. Reported in a top-level `session_graph` block "
+                        "(`status` ok|empty|skipped|unknown_session|error, `keyword_source` "
+                        "caller|llm|question_fallback, entities, relations, latency_ms); an empty "
+                        "result is `empty: true`, a failure is `status: error` + `error`. Absent/off: "
+                        "the response is byte-identical to before. Requires context_only=true."
+                    ),
+                },
+                "session_graph_mode": {
+                    "type": "string",
+                    "enum": list(SESSION_GRAPH_MODES),
+                    "default": "hybrid",
+                    "description": "LightRAG query mode for the session graph (default hybrid = local+global).",
+                },
                 "debug": {
                     "type": "boolean",
                     "default": False,
@@ -4918,6 +5241,31 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                     ]
                 hybrid_block["session"] = session_block
 
+            # Optional session-graph channel (opt-in; absent/off adds nothing).
+            session_graph_block: dict[str, Any] | None = None
+            sg_entity_lines: list[str] = []
+            sg_relation_lines: list[str] = []
+            if _session_graph_enabled(args.get("session_graph")):
+                if not context_only:
+                    session_graph_block = {
+                        "enabled": True,
+                        "status": "skipped",
+                        "skipped": "session_graph requires context_only=true",
+                    }
+                else:
+                    session_graph_block, sg_entity_lines, sg_relation_lines = (
+                        await _compute_session_graph_context(
+                            question,
+                            session_id_arg,
+                            ll_keywords=ll_keywords,
+                            hl_keywords=hl_keywords,
+                            mode=str(args.get("session_graph_mode") or "hybrid"),
+                            top_k=top_k,
+                            fetch_top_k=fetch_top_k,
+                            project_id=project_id,
+                        )
+                    )
+
             # Usage-tracking envelope shared by every return path below (success or
             # failure) — see logging_setup.log_query_event. graph_channel_ms is
             # filled in around the LightRAG aquery/aquery_llm call itself (it does
@@ -5049,6 +5397,12 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                         )
                         if context_for_response is not None:
                             context_priority_applied = CONTEXT_PRIORITY_FUSION_ONLY
+                    if sg_entity_lines or sg_relation_lines:
+                        context_for_response = _splice_session_kg(
+                            context_for_response if isinstance(context_for_response, str) else None,
+                            sg_entity_lines,
+                            sg_relation_lines,
+                        )
                     has_context = bool(
                         context_for_response and str(context_for_response).strip()
                     )
@@ -5184,6 +5538,8 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                         response["session"] = session_block
                         if recall_error_kind is not None:
                             response["error_kind"] = recall_error_kind
+                    if session_graph_block is not None:
+                        response["session_graph"] = session_graph_block
                     if debug:
                         fused = hybrid_block.get("fused_chunks") or []
                         response["debug"] = {

@@ -767,3 +767,310 @@ def test_memory_session_status_reports_vectors_indexed_from_real_store(
     assert detail["chunks_indexed"] == 2
     assert detail["entities"] == 0
     assert detail["relations"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Session-graph recall (opt-in, .plans/2026-10-26_session-graph-recall.md)
+# ---------------------------------------------------------------------------
+
+_KG_CONTEXT = (
+    "\nKnowledge Graph Data (Entity):\n\n```json\n"
+    '{"entity": "Q7X42", "type": "experiment", "description": "stabilized the sidecar gate"}\n'
+    '{"entity": "sidecar gate", "type": "component", "description": "gate at step 80"}\n'
+    "```\n\nKnowledge Graph Data (Relationship):\n\n```json\n"
+    '{"entity1": "Q7X42", "entity2": "sidecar gate", "description": "stabilized"}\n'
+    "```\n\nDocument Chunks (Each entry has a reference_id refer to the `Reference Document List`):"
+    "\n\n```json\n{\"reference_id\": \"1\", \"content\": \"IGNORED chunk from the session rag\"}\n"
+    "```\n\nReference Document List (Each entry starts with a [reference_id] that corresponds "
+    "to entries in the Document Chunks):\n\n```\n[1] ignored.md\n```\n"
+)
+
+
+class _SessionGraphRag:
+    def __init__(
+        self,
+        context: Any = _KG_CONTEXT,
+        *,
+        llm_reply: str | Exception = (
+            '{"high_level_keywords": ["gate stabilisation"], "low_level_keywords": ["Q7X42"]}'
+        ),
+        raises: Exception | None = None,
+    ) -> None:
+        self.context = context
+        self.llm_reply = llm_reply
+        self.raises = raises
+        self.queries: list[Any] = []
+        self.llm_calls = 0
+
+    async def aquery(self, question: str, param: Any) -> Any:
+        self.queries.append((question, param))
+        if self.raises is not None:
+            raise self.raises
+        return self.context
+
+    async def llm_model_func(self, prompt: str, system_prompt: str | None = None, **_kw: Any) -> str:  # noqa: ARG002
+        self.llm_calls += 1
+        if isinstance(self.llm_reply, Exception):
+            raise self.llm_reply
+        return self.llm_reply
+
+
+def _patch_sg_rag(mod: Any, monkeypatch: pytest.MonkeyPatch, sg_rag: _SessionGraphRag) -> None:
+    async def fake_get(_sid: str, _dir: Path) -> _SessionGraphRag:
+        return sg_rag
+
+    monkeypatch.setattr(mod, "_get_session_graph_rag", fake_get)
+    mod._session_graph_keyword_cache.clear()
+
+
+def _stable(data: Any) -> str:
+    """Canonical JSON with wall-clock fields removed (everything else byte-exact)."""
+    def strip(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {k: strip(v) for k, v in node.items() if k != "latency_ms"}
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        return node
+    return json.dumps(strip(data), sort_keys=True)
+
+
+def _chunk_section(context: str) -> str:
+    return context[context.index("Document Chunks"):]
+
+
+def test_session_graph_off_payload_is_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    sg_rag = _SessionGraphRag()
+    _patch_sg_rag(mod, monkeypatch, sg_rag)
+
+    golden = _stable(_call_recall(mod, monkeypatch, session_id=SESSION_ID))
+    off = _stable(_call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=False))
+    assert off == golden
+    assert "session_graph" not in golden
+    assert sg_rag.queries == []
+
+    monkeypatch.setenv("HARS_MEMORY_SESSION_GRAPH", "0")
+    assert _stable(_call_recall(mod, monkeypatch, session_id=SESSION_ID)) == golden
+
+
+def test_session_graph_on_splices_kg_above_unchanged_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    sg_rag = _SessionGraphRag()
+    _patch_sg_rag(mod, monkeypatch, sg_rag)
+
+    off = _call_recall(mod, monkeypatch, session_id=SESSION_ID)
+    on = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True)
+
+    ctx = on["context"]
+    assert ctx.index("Knowledge Graph Data (Entity)") < ctx.index("Knowledge Graph Data (Relationship)")
+    assert ctx.index("Knowledge Graph Data (Relationship)") < ctx.index("Document Chunks")
+    assert '"entity": "Q7X42"' in ctx
+    assert "IGNORED chunk" not in ctx  # session rag's own chunk section is discarded
+    assert _chunk_section(ctx) == _chunk_section(off["context"])  # chunk side unchanged
+    sg = on["session_graph"]
+    assert (sg["status"], sg["entities"], sg["relations"], sg["empty"]) == ("ok", 2, 1, False)
+    assert sg["keyword_source"] == "caller"
+    assert sg["ll_keywords"] == ["Q7X42"]
+    assert sg["mode"] == "hybrid"
+    assert sg_rag.llm_calls == 0
+    (_q, param), = sg_rag.queries
+    assert param.mode == "hybrid" and param.only_need_context is True and param.enable_rerank is False
+    # everything else in the payload is unchanged
+    for key in ("session", "hybrid", "graph_branch"):
+        assert _stable(on[key]) == _stable(off[key])
+
+
+def test_session_graph_env_default_on_and_arg_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    monkeypatch.setenv("HARS_MEMORY_SESSION_GRAPH", "on")
+    _patch_sg_rag(mod, monkeypatch, _SessionGraphRag())
+    assert _call_recall(mod, monkeypatch, session_id=SESSION_ID)["session_graph"]["status"] == "ok"
+    assert "session_graph" not in _call_recall(
+        mod, monkeypatch, session_id=SESSION_ID, session_graph=False
+    )
+
+
+def test_session_graph_keyword_order_caller_llm_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+
+    # llm: no caller keywords -> exactly ONE extractor call, then cached per question+session
+    sg_rag = _SessionGraphRag()
+    _patch_sg_rag(mod, monkeypatch, sg_rag)
+    a = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True, ll_keywords=[])
+    b = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True, ll_keywords=[])
+    assert a["session_graph"]["keyword_source"] == "llm"
+    assert a["session_graph"]["ll_keywords"] == ["Q7X42"]
+    assert a["session_graph"]["hl_keywords"] == ["gate stabilisation"]
+    assert b["session_graph"]["keyword_cached"] is True
+    assert sg_rag.llm_calls == 1
+    assert sg_rag.queries[0][1].ll_keywords == ["Q7X42"]
+    assert sg_rag.queries[0][1].hl_keywords == ["gate stabilisation"]
+
+    # question fallback: llm raises / returns garbage; not cached
+    for reply in (RuntimeError("boom"), "not json"):
+        sg_rag = _SessionGraphRag(llm_reply=reply)
+        _patch_sg_rag(mod, monkeypatch, sg_rag)
+        c = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True, ll_keywords=[])
+        sg = c["session_graph"]
+        assert sg["keyword_source"] == "question_fallback"
+        assert sg["ll_keywords"] == sg["hl_keywords"] == ["Q7X42 sidecar gate"]
+        assert sg["keyword_error"]
+        assert sg["status"] == "ok"  # still queried with the fallback keywords
+
+
+def test_session_graph_empty_is_reported_not_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    _patch_sg_rag(mod, monkeypatch, _SessionGraphRag(context="[no-context]"))
+    off = _call_recall(mod, monkeypatch, session_id=SESSION_ID)
+    on = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True)
+    sg = on["session_graph"]
+    assert sg["empty"] is True and sg["status"] == "empty" and "error" not in sg
+    assert on["context"] == off["context"]
+
+
+def test_session_graph_error_is_explicit_and_chunks_unaffected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    off = _call_recall(mod, monkeypatch, session_id=SESSION_ID)
+    _patch_sg_rag(mod, monkeypatch, _SessionGraphRag(raises=RuntimeError("graph exploded")))
+    on = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True)
+    assert on["ok"] is True
+    assert on["session_graph"]["status"] == "error"
+    assert "graph exploded" in on["session_graph"]["error"]
+    assert on["session_graph"]["keyword_source"] == "caller"
+    assert on["context"] == off["context"]
+
+    async def build_fails(_sid: str, _dir: Path) -> Any:
+        raise OSError("cannot load storages")
+
+    monkeypatch.setattr(mod, "_get_session_graph_rag", build_fails)
+    on = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True)
+    assert on["session_graph"]["status"] == "error" and "cannot load" in on["session_graph"]["error"]
+    assert on["context"] == off["context"]
+
+
+def test_session_graph_skips_merged_unknown_subgraph_and_no_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path, merged=True)
+    mod = _recall_mod(tmp_path)
+    sg_rag = _SessionGraphRag()
+    _patch_sg_rag(mod, monkeypatch, sg_rag)
+    assert _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True)[
+        "session_graph"]["status"] == "skipped"
+    unk = _call_recall(mod, monkeypatch, session_id="nope", session_graph=True)
+    assert unk["session_graph"]["status"] == "unknown_session"
+    assert _call_recall(mod, monkeypatch, session_graph=True)["session_graph"]["status"] == "skipped"
+    sub = _recall_mod(tmp_path, HARS_MEMORY_SESSION_MODE="subgraph")
+    _patch_sg_rag(sub, monkeypatch, sg_rag)
+    assert _call_recall(sub, monkeypatch, session_id=SESSION_ID, session_graph=True)[
+        "session_graph"]["status"] == "skipped"
+    assert sg_rag.queries == []
+
+
+def test_session_graph_lean_view_keeps_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    _patch_sg_rag(mod, monkeypatch, _SessionGraphRag())
+    lean = _call_recall(mod, monkeypatch, session_id=SESSION_ID, session_graph=True, view="lean")
+    assert lean["session_graph"]["status"] == "ok"
+
+
+def test_splice_session_kg_merges_into_existing_main_sections(tmp_path: Path) -> None:
+    mod = _recall_mod(tmp_path)
+    main = (
+        "\nKnowledge Graph Data (Entity):\n\n```json\n{\"entity\": \"MAIN\"}\n```\n\n"
+        "Knowledge Graph Data (Relationship):\n\n```json\n{\"entity1\": \"MAIN\"}\n```\n\n"
+        "Document Chunks (Each entry has a reference_id refer to the `Reference Document List`):"
+        "\n\n```json\n{\"c\": 1}\n```\n"
+    )
+    out = mod._splice_session_kg(main, ['{"entity": "SESS"}'], ['{"entity1": "SESS"}'])
+    assert out.index('"SESS"') < out.index('"MAIN"')  # session first inside the same section
+    assert out.count("Knowledge Graph Data (Entity)") == 1
+    assert _chunk_section(out) == _chunk_section(main)
+    only_kg = mod._splice_session_kg(None, ['{"entity": "S"}'], [])
+    assert "Knowledge Graph Data (Entity)" in only_kg and "Document Chunks" not in only_kg
+    assert mod._splice_session_kg(main, [], []) == main
+
+
+def test_session_graph_rag_uses_file_backed_storages_even_with_qdrant_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_dir = _write_session_fixture(tmp_path)
+    mod = _recall_mod(
+        tmp_path, HARS_MEMORY_VECTOR_STORAGE="QdrantVectorDBStorage", HARS_MEMORY_GRAPH_STORAGE="Neo4JStorage"
+    )
+    captured: dict[str, Any] = {}
+
+    class _Rag:
+        async def initialize_storages(self) -> None:
+            captured["init"] = True
+
+    def fake_create(**kwargs: Any) -> _Rag:
+        captured.update(kwargs)
+        return _Rag()
+
+    import hars_memory.server.lightrag_init as li
+
+    monkeypatch.setattr(li, "create_lightrag", fake_create)
+    mod._session_graph_rags.clear()
+    rag = asyncio.run(mod._get_session_graph_rag(SESSION_ID, session_dir))
+    assert captured["vector_storage"] == "NanoVectorDBStorage"
+    assert captured["graph_storage"] == "NetworkXStorage"
+    assert captured["working_dir"] == str(session_dir) and captured["init"]
+    # cached while the files are unchanged, rebuilt when a compaction rewrites them
+    assert asyncio.run(mod._get_session_graph_rag(SESSION_ID, session_dir)) is rag
+    (session_dir / "vdb_entities.json").write_text("{}", encoding="utf-8")
+    assert asyncio.run(mod._get_session_graph_rag(SESSION_ID, session_dir)) is not rag
+
+
+def test_session_graph_with_main_branch_skipped_runs_only_session_aquery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_session_fixture(tmp_path)
+    mod = _recall_mod(tmp_path)
+    sg_rag = _SessionGraphRag()
+    _patch_sg_rag(mod, monkeypatch, sg_rag)
+    main_calls: list[Any] = []
+
+    class _CountingRag(_RecallRag):
+        async def aquery(self, question: str, *, param: object) -> str:  # noqa: ARG002
+            main_calls.append(question)
+            return "[no-context]"
+
+    hybrid = _hybrid_fixture()
+
+    async def fake_hybrid(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return copy.deepcopy(hybrid)
+
+    monkeypatch.setattr(mod, "_compute_hybrid_block", fake_hybrid)
+    mod._rag_instance = _CountingRag([], embedding_func=_embed_query)
+    out = asyncio.run(mod.call_tool("memory_recall", {
+        "question": "Q7X42 sidecar gate", "context_only": True,
+        "session_id": SESSION_ID, "session_graph": True,
+    }))
+    data = json.loads(out[0].text)
+    assert data["graph_branch"]["enabled"] is False  # no caller keywords -> main graph skipped
+    assert main_calls == []
+    assert len(sg_rag.queries) == 1
+    assert data["session_graph"]["keyword_source"] == "llm"
+    assert "Knowledge Graph Data (Entity)" in data["context"]

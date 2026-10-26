@@ -87,6 +87,8 @@ directory and is consolidated into the main index later by `memory_merge_session
 | Variable | Default | Description |
 |---|---|---|
 | `HARS_MEMORY_SESSION_MODE` | `split` | `split` (per-session isolated working dir, merged on demand) or `subgraph` (ingest compactions directly into the main graph) |
+| `HARS_MEMORY_SESSION_GRAPH` | off | Default for `memory_recall`'s `session_graph` flag (`1`/`true`/`on`/`yes` = on). A per-call `session_graph` always wins. Off keeps the recall payload byte-identical |
+| `HARS_MEMORY_SESSION_GRAPH_KEYWORD_TIMEOUT_SECONDS` | `30` | Timeout of the single extractor-model keyword call (no caller keywords); on failure/timeout the question text is used and `keyword_source` is `question_fallback` |
 | `HARS_MEMORY_SESSIONS_DIR` | `<HARS_MEMORY_INDEX_DIR>/sessions` | Root directory holding one sub-directory per session id (split mode). Session ids are validated against `[A-Za-z0-9._-]{1,128}` |
 | `HARS_MEMORY_SESSION_INDEX_BS` | `25` | Documents per ingest batch for compaction indexing, clamped to `1..256`. Also used as the session embedding batch size |
 | `HARS_MEMORY_SESSION_MIN_SCORE` | `0.2` | `memory_recall` session-channel cutoff: chunks scoring below this (max of cosine and lexical F1) are dropped |
