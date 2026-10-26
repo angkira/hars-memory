@@ -194,9 +194,16 @@ cp -a runs/<MERGED>/sessions "$D"/sessions                 # HARS graphs
   `memory_tokens` ratio gate from the kept records and prints it; it never reads or writes
   run_budget.json). Do NOT hand-merge the per-batch run_budget.json files (batch 1 has none;
   it was killed pre-end, and the runner computes it over all chains incl. invalid ones).
-  Merge is manual (script below); no merge script exists in `scripts/`.
+  Use `scripts/merge_runs.py` (below); it recomputes run_budget.json and refuses duplicate (qid,arm),
+  invalid chains, recall_error rows and mixed configs. The manual shell fallback follows it.
 
 ```bash
+# preferred:
+python3 scripts/merge_runs.py --out runs/merged-$(date -u +%Y%m%dT%H%M%S) \
+  --chains chains.jsonl runs/<D1> runs/<D2> runs/<D3>
+# funnel (step 5): python3 scripts/funnel_chains.py --run runs/<MERGED> --chains chains.jsonl \
+#   --graph-store /tmp/opencode/nc-eval/hars-data-chain-glm/sessions
+# manual fallback:
 cd /tmp/opencode/nc-eval/runs
 M=merged-$(date -u +%Y%m%dT%H%M%S); mkdir -p "$M"
 D1=full-20261026T021613; D2=<CLEAN-BATCH-A-DIR>; D3=fullC-<TS>
