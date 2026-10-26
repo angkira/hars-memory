@@ -1,0 +1,506 @@
+{
+ "calls": 1098,
+ "in": 1904818,
+ "out": 765564,
+ "usd": 0.573264,
+ "by_tag": {
+  "index-token": {
+   "calls": 394,
+   "in": 1639547,
+   "out": 641667,
+   "usd": 0.484788
+  },
+  "ru:2020-12-21:r0": {
+   "calls": 1,
+   "in": 628,
+   "out": 972,
+   "usd": 0.000549
+  },
+  "ru:how-to-get-ssh-access-to-the-agent:r0": {
+   "calls": 1,
+   "in": 1335,
+   "out": 1149,
+   "usd": 0.000708
+  },
+  "ru:2021-02-01:r0": {
+   "calls": 1,
+   "in": 755,
+   "out": 1107,
+   "usd": 0.000629
+  },
+  "ru:2021-02-15:r0": {
+   "calls": 1,
+   "in": 687,
+   "out": 1086,
+   "usd": 0.000612
+  },
+  "ru:2021-01-18:r0": {
+   "calls": 1,
+   "in": 1148,
+   "out": 1218,
+   "usd": 0.000724
+  },
+  "ru:build-agents-how-can-sre-help-you:r0": {
+   "calls": 1,
+   "in": 1094,
+   "out": 1570,
+   "usd": 0.000894
+  },
+  "ru:index:r0": {
+   "calls": 8,
+   "in": 12339,
+   "out": 9452,
+   "usd": 0.00596
+  },
+  "ru:blog-post-about-sre:r0": {
+   "calls": 1,
+   "in": 859,
+   "out": 807,
+   "usd": 0.000489
+  },
+  "ru:rackmount-shelf:r0": {
+   "calls": 1,
+   "in": 2106,
+   "out": 1332,
+   "usd": 0.000877
+  },
+  "ru:solution:r0": {
+   "calls": 1,
+   "in": 1727,
+   "out": 1114,
+   "usd": 0.00073
+  },
+  "ru:sre-5146-jbcc-support-gke-clusters-with-dns-endpoint:r0": {
+   "calls": 1,
+   "in": 872,
+   "out": 927,
+   "usd": 0.000551
+  },
+  "ru:angular-decorators:r0": {
+   "calls": 1,
+   "in": 1654,
+   "out": 1135,
+   "usd": 0.000733
+  },
+  "ru:customers-pain-points:r0": {
+   "calls": 1,
+   "in": 1362,
+   "out": 1151,
+   "usd": 0.000712
+  },
+  "ru:how-to-manage-kafka:r0": {
+   "calls": 1,
+   "in": 1248,
+   "out": 1397,
+   "usd": 0.000823
+  },
+  "ru:serving-static-brief:r0": {
+   "calls": 1,
+   "in": 736,
+   "out": 1026,
+   "usd": 0.000587
+  },
+  "ru:how-to-build-vyos-ami:r0": {
+   "calls": 1,
+   "in": 1655,
+   "out": 1287,
+   "usd": 0.000809
+  },
+  "ru:feature-set:r0": {
+   "calls": 1,
+   "in": 2353,
+   "out": 1295,
+   "usd": 0.000883
+  },
+  "ru:ses-controller:r0": {
+   "calls": 1,
+   "in": 933,
+   "out": 1236,
+   "usd": 0.000711
+  },
+  "ru:new-employee-and-teamcity-build-agents:r0": {
+   "calls": 1,
+   "in": 1240,
+   "out": 899,
+   "usd": 0.000574
+  },
+  "ru:spending-dashboards-vision:r0": {
+   "calls": 1,
+   "in": 1196,
+   "out": 1359,
+   "usd": 0.000799
+  },
+  "ru:whole-company-infrastructure-automation:r0": {
+   "calls": 1,
+   "in": 994,
+   "out": 1215,
+   "usd": 0.000707
+  },
+  "ru:alert-handling:r0": {
+   "calls": 1,
+   "in": 1655,
+   "out": 1058,
+   "usd": 0.000695
+  },
+  "ru:pi-more-clear-process:r0": {
+   "calls": 1,
+   "in": 746,
+   "out": 955,
+   "usd": 0.000552
+  },
+  "ru:entrypoint:r0": {
+   "calls": 1,
+   "in": 2789,
+   "out": 1129,
+   "usd": 0.000843
+  },
+  "ru:planning-v1-5:r0": {
+   "calls": 1,
+   "in": 1609,
+   "out": 1355,
+   "usd": 0.000838
+  },
+  "ru:pi-elimination-toil:r0": {
+   "calls": 1,
+   "in": 1598,
+   "out": 1675,
+   "usd": 0.000997
+  },
+  "ru:planning:r0": {
+   "calls": 1,
+   "in": 556,
+   "out": 1099,
+   "usd": 0.000605
+  },
+  "ru:service-minimal-requirements:r0": {
+   "calls": 1,
+   "in": 1796,
+   "out": 1149,
+   "usd": 0.000754
+  },
+  "ru:zero-trust-access-to-none-http-services:r0": {
+   "calls": 1,
+   "in": 1595,
+   "out": 901,
+   "usd": 0.00061
+  },
+  "ru:technical-design:r0": {
+   "calls": 1,
+   "in": 2828,
+   "out": 1387,
+   "usd": 0.000976
+  },
+  "ru:g2-endpoint-verification:r0": {
+   "calls": 1,
+   "in": 654,
+   "out": 1335,
+   "usd": 0.000733
+  },
+  "ru:g7-blue-helm:r0": {
+   "calls": 1,
+   "in": 1612,
+   "out": 1405,
+   "usd": 0.000864
+  },
+  "ru:space-cost:r0": {
+   "calls": 1,
+   "in": 1041,
+   "out": 1490,
+   "usd": 0.000849
+  },
+  "ru:alerts-workflow:r0": {
+   "calls": 1,
+   "in": 796,
+   "out": 1427,
+   "usd": 0.000793
+  },
+  "ru:august-2021-retra:r0": {
+   "calls": 1,
+   "in": 678,
+   "out": 1074,
+   "usd": 0.000605
+  },
+  "ru:july-2021-retra:r0": {
+   "calls": 1,
+   "in": 654,
+   "out": 903,
+   "usd": 0.000517
+  },
+  "ru:november-2021-retra:r0": {
+   "calls": 1,
+   "in": 735,
+   "out": 1146,
+   "usd": 0.000647
+  },
+  "ru:18-06-2021-retra-recap:r0": {
+   "calls": 1,
+   "in": 662,
+   "out": 1210,
+   "usd": 0.000671
+  },
+  "ru:planning-july2020-1-2:r0": {
+   "calls": 1,
+   "in": 848,
+   "out": 883,
+   "usd": 0.000526
+  },
+  "ru:october-2021-retra:r0": {
+   "calls": 1,
+   "in": 1170,
+   "out": 1147,
+   "usd": 0.000691
+  },
+  "ru:planning-july2020-2-2:r0": {
+   "calls": 1,
+   "in": 684,
+   "out": 1168,
+   "usd": 0.000652
+  },
+  "ru:planning-september2020-1-2:r0": {
+   "calls": 1,
+   "in": 670,
+   "out": 1058,
+   "usd": 0.000596
+  },
+  "ru:september-2021-retra:r0": {
+   "calls": 1,
+   "in": 736,
+   "out": 938,
+   "usd": 0.000543
+  },
+  "ru:planning-2021-goals:r0": {
+   "calls": 1,
+   "in": 914,
+   "out": 1835,
+   "usd": 0.001009
+  },
+  "ru:new-cni-driver-to-choose:r0": {
+   "calls": 1,
+   "in": 706,
+   "out": 1377,
+   "usd": 0.000759
+  },
+  "ru:configure-vault-for-new-aws-account:r0": {
+   "calls": 1,
+   "in": 2425,
+   "out": 867,
+   "usd": 0.000676
+  },
+  "ru:vm-templates-code-review-process:r0": {
+   "calls": 1,
+   "in": 1458,
+   "out": 1467,
+   "usd": 0.000879
+  },
+  "ru:upgrading-dev-vault-in-shared-account:r0": {
+   "calls": 1,
+   "in": 1625,
+   "out": 1174,
+   "usd": 0.000749
+  },
+  "ru:welcome-letter-for-newcomers-to-the-sre-team:r0": {
+   "calls": 1,
+   "in": 908,
+   "out": 1386,
+   "usd": 0.000784
+  },
+  "r7:dup": {
+   "calls": 135,
+   "in": 40432,
+   "out": 8720,
+   "usd": 0.008403
+  },
+  "r7:judge": {
+   "calls": 348,
+   "in": 136599,
+   "out": 30175,
+   "usd": 0.028747
+  },
+  "r7:kw:r001": {
+   "calls": 1,
+   "in": 143,
+   "out": 141,
+   "usd": 8.5e-05
+  },
+  "r7:kw:r006": {
+   "calls": 1,
+   "in": 165,
+   "out": 187,
+   "usd": 0.00011
+  },
+  "r7:kw:r011": {
+   "calls": 1,
+   "in": 139,
+   "out": 138,
+   "usd": 8.3e-05
+  },
+  "r7:kw:r016": {
+   "calls": 1,
+   "in": 156,
+   "out": 143,
+   "usd": 8.7e-05
+  },
+  "r7:kw:r021": {
+   "calls": 1,
+   "in": 191,
+   "out": 133,
+   "usd": 8.6e-05
+  },
+  "r7:kw:r026": {
+   "calls": 1,
+   "in": 141,
+   "out": 144,
+   "usd": 8.6e-05
+  },
+  "r7:kw:r031": {
+   "calls": 1,
+   "in": 168,
+   "out": 400,
+   "usd": 0.000217
+  },
+  "r7:kw:r036": {
+   "calls": 1,
+   "in": 136,
+   "out": 206,
+   "usd": 0.000117
+  },
+  "r7:kw:r041": {
+   "calls": 1,
+   "in": 145,
+   "out": 150,
+   "usd": 8.9e-05
+  },
+  "r7:kw:r046": {
+   "calls": 1,
+   "in": 160,
+   "out": 155,
+   "usd": 9.3e-05
+  },
+  "r7:kw:r056": {
+   "calls": 1,
+   "in": 168,
+   "out": 202,
+   "usd": 0.000118
+  },
+  "r7:kw:r064": {
+   "calls": 1,
+   "in": 140,
+   "out": 161,
+   "usd": 9.5e-05
+  },
+  "r7:kw:r072": {
+   "calls": 1,
+   "in": 182,
+   "out": 216,
+   "usd": 0.000126
+  },
+  "r7:kw:r080": {
+   "calls": 1,
+   "in": 180,
+   "out": 241,
+   "usd": 0.000139
+  },
+  "r7:kw:r088": {
+   "calls": 1,
+   "in": 149,
+   "out": 157,
+   "usd": 9.3e-05
+  },
+  "r7:kw:r096": {
+   "calls": 1,
+   "in": 138,
+   "out": 119,
+   "usd": 7.3e-05
+  },
+  "r7:kw:r098": {
+   "calls": 1,
+   "in": 161,
+   "out": 200,
+   "usd": 0.000116
+  },
+  "r7:kw:r100": {
+   "calls": 1,
+   "in": 163,
+   "out": 143,
+   "usd": 8.8e-05
+  },
+  "r7:kw:r102": {
+   "calls": 1,
+   "in": 140,
+   "out": 119,
+   "usd": 7.3e-05
+  },
+  "r7:kw:r104": {
+   "calls": 1,
+   "in": 141,
+   "out": 116,
+   "usd": 7.2e-05
+  },
+  "r7:kw:r106": {
+   "calls": 1,
+   "in": 139,
+   "out": 161,
+   "usd": 9.4e-05
+  },
+  "r7:kw:r108": {
+   "calls": 1,
+   "in": 160,
+   "out": 176,
+   "usd": 0.000104
+  },
+  "r7:kw:r110": {
+   "calls": 1,
+   "in": 153,
+   "out": 152,
+   "usd": 9.1e-05
+  },
+  "r7:kw:r112": {
+   "calls": 1,
+   "in": 187,
+   "out": 101,
+   "usd": 6.9e-05
+  },
+  "r7:kw:r114": {
+   "calls": 1,
+   "in": 156,
+   "out": 157,
+   "usd": 9.4e-05
+  },
+  "r7:kw:r124": {
+   "calls": 1,
+   "in": 159,
+   "out": 145,
+   "usd": 8.8e-05
+  },
+  "r7:kw:r126": {
+   "calls": 1,
+   "in": 159,
+   "out": 217,
+   "usd": 0.000124
+  },
+  "r7:kw:r128": {
+   "calls": 1,
+   "in": 161,
+   "out": 125,
+   "usd": 7.9e-05
+  },
+  "r7:kw:r130": {
+   "calls": 1,
+   "in": 155,
+   "out": 98,
+   "usd": 6.4e-05
+  },
+  "r7:kw:r132": {
+   "calls": 1,
+   "in": 136,
+   "out": 109,
+   "usd": 6.8e-05
+  },
+  "r5_query_twin": {
+   "calls": 135,
+   "in": 12500,
+   "out": 13358,
+   "usd": 0.007929
+  }
+ }
+}

@@ -1,0 +1,72 @@
+{
+  "winner": "lightgbm",
+  "features": "eval_agentic-data/ltr_train_300.jsonl",
+  "train_queries": 223,
+  "valid_queries": 74,
+  "results": {
+    "lightgbm": {
+      "format": "lightgbm_txt",
+      "model_file": "ranker.lgb.txt",
+      "metrics": {
+        "valid": {
+          "queries": 74.0,
+          "ndcg@10": 0.897256326954453,
+          "hit@10": 1.0,
+          "mrr": 0.9076576576576577,
+          "base_ndcg@10": 0.8813155517412763,
+          "base_hit@10": 1.0,
+          "base_mrr": 0.8810810810810811
+        },
+        "train": {
+          "queries": 223.0,
+          "ndcg@10": 0.9142120849238408,
+          "hit@10": 0.9955156950672646,
+          "mrr": 0.9217488789237669,
+          "base_ndcg@10": 0.8705640467393246,
+          "base_hit@10": 0.9820627802690582,
+          "base_mrr": 0.8799713676955829
+        }
+      },
+      "hyperparams": {
+        "num_boost_round": 400,
+        "early_stopping_rounds": 40,
+        "best_iteration": 5,
+        "objective": "lambdarank",
+        "num_leaves": 15,
+        "learning_rate": 0.05
+      }
+    },
+    "mlp": {
+      "format": "mlp_json",
+      "model_file": "ranker_mlp.json",
+      "metrics": {
+        "valid": {
+          "queries": 74.0,
+          "ndcg@10": 0.8747924768569045,
+          "hit@10": 0.972972972972973,
+          "mrr": 0.8867737302519911,
+          "base_ndcg@10": 0.8813155517412763,
+          "base_hit@10": 1.0,
+          "base_mrr": 0.8810810810810811
+        },
+        "train": {
+          "queries": 223.0,
+          "ndcg@10": 0.8984308061379388,
+          "hit@10": 0.9955156950672646,
+          "mrr": 0.9005231689088191,
+          "base_ndcg@10": 0.8705640467393246,
+          "base_hit@10": 0.9820627802690582,
+          "base_mrr": 0.8799713676955829
+        }
+      },
+      "hyperparams": {
+        "hidden": [
+          16,
+          8
+        ],
+        "epochs": 150,
+        "objective": "ranknet"
+      }
+    }
+  }
+}

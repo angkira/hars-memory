@@ -1,0 +1,50 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: memory-travel
+  labels:
+    app.kubernetes.io/name: memory-travel
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: hars-memory
+  annotations:
+    # Standard Nginx Ingress Controller
+    kubernetes.io/ingress.class: nginx
+    
+    # Required for Live Recall Trace SSE streaming
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    
+    # Optional TLS / cert-manager annotations
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+    # Optional OAuth2 / SSO Authentication (e.g. oauth2-proxy or Keycloak)
+    # nginx.ingress.kubernetes.io/auth-url: "https://auth.example.com/oauth2/auth"
+    # nginx.ingress.kubernetes.io/auth-signin: "https://auth.example.com/oauth2/start?rd=$escaped_request_uri"
+spec:
+  # ingressClassName: nginx
+  # tls:
+  #   - hosts:
+  #       - memory-travel.example.com
+  #     secretName: memory-travel-tls
+  rules:
+    - host: memory-travel.example.com
+      http:
+        paths:
+          # Sub-path routing (/travel)
+          - path: /travel
+            pathType: Prefix
+            backend:
+              service:
+                name: memory-travel
+                port:
+                  name: http
+          # Standalone root routing (/) - uncomment if deploying directly at root domain
+          # - path: /
+          #   pathType: Prefix
+          #   backend:
+          #     service:
+          #       name: memory-travel
+          #       port:
+          #         name: http

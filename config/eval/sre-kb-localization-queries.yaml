@@ -1,0 +1,82 @@
+# T1-T9 in-file localization questions over the sre-support-pier KB, taken from
+# sre-support-pier/tmp/memory-eval/results.md (2026-10-01 baseline run against the
+# token-chunked index).  Loadable by `python -m hars_memory.eval.ab_bench ab --queries`
+# (doc-level scoring: id/type/question/gold_docs; gold names are the FLATTENED file_path
+# LightRAG stores) and by scripts/localization_check.py (chunk-level: `fact` = regex that
+# must appear in a retrieved chunk, `heading` = text that must appear in the SAME chunk,
+# i.e. the chunk carries the section it belongs to).  Extra keys are ignored by ab_bench.
+#
+# Doc-level scores will be near-saturated for both indexes (9/9 right file in the baseline);
+# the chunk-level `fact`/`heading` check is what shows the chunker difference.
+meta:
+  corpus: sre-support-pier (kb/ + repos/sre-docs/docs ...)
+  source: sre-support-pier/tmp/memory-eval/results.md
+  scoring_unit: document (file_path)
+
+queries:
+  - id: t1
+    type: conceptual
+    question: "When rotating a dockerconfigjson secret with two registries in the credential rotation controller, what happens to the auth fields?"
+    gold_docs: [kubernetes-credential-rotation-index.md]
+    fact: "(?i)all registries|preserv"
+    heading: "Format Preservation Details"
+
+  - id: t2
+    type: conceptual
+    question: "Какие действия выполняет контроллер при Abandon проекта TeamCity (финалайзер, архивация, события)?"
+    gold_docs: [platform-cloud-console-teamcity-integration-how-abandoning-projects-works.md]
+    fact: "teamcity-project-finalizer"
+    heading: "## TeamCityProject"
+
+  - id: t3
+    type: conceptual
+    question: "What is the validation regex and max length for repositoryName in the GitHubConnection spec?"
+    gold_docs:
+      - kubernetes-githubconnection-index.md
+      - kubernetes-githubconnection-reference.md
+    fact: "\\^\\[a-zA-Z0-9\\._-\\]\\+\\$"
+    heading: "repositoryName"
+
+  - id: t4
+    type: conceptual
+    question: "Default value of iceberg commit interval and timeout for the Kafka Connect Iceberg sink connector"
+    gold_docs: [kubernetes-kafka-controller-kafka-connect-kafka-connector-operations-kafka-connect-iceberg-sink-configuration-reference.md]
+    fact: "iceberg\\.control\\.commit\\.interval-ms"
+    heading: "Iceberg Control"
+
+  - id: t5
+    type: conceptual
+    question: "Можно ли указать s3:* в политике бакета, управляемого object storage controller, и какая секция политики имеет приоритет?"
+    gold_docs: [kubernetes-object-storage-controller-aws-s3-buckets-operations-configuring-s3-bucket-policy.md]
+    fact: "s3:\\*"
+    heading: "General Rules and Constraints"
+
+  - id: t6
+    type: conceptual
+    question: "Какая секция политики S3 бакета имеет приоритет: Custom, Structured или Public?"
+    gold_docs: [kubernetes-object-storage-controller-aws-s3-buckets-operations-configuring-s3-bucket-policy.md]
+    fact: "Custom Policy"
+    heading: "Policy Precedence"
+
+  - id: t7
+    type: conceptual
+    question: "Which command do I run in Vault console to get the secret id for the vault controller approle when bootstrapping a new cluster?"
+    gold_docs:
+      - platform-internal-how-to-articles-how-to-create-a-new-cluster.md
+      - internal-how-to-articles-how-to-create-a-new-cluster.md
+    fact: "write -f -field=secret_id"
+    heading: "Deploy VaultController"
+
+  - id: t8
+    type: conceptual
+    question: "What are the default helm_version and skaffold_extra_params in the reusable GitHub workflow with Skaffold for EKS?"
+    gold_docs: [kubernetes-guides-how-to-setup-your-deployment-from-github-repository.md]
+    fact: "cluster_ca"
+    heading: "Option D"
+
+  - id: t9
+    type: conceptual
+    question: "Почему consumer.override.group.id должен совпадать с iceberg.connect.group-id и какая политика override нужна в KafkaConnect?"
+    gold_docs: [kubernetes-kafka-controller-kafka-connect-kafka-connector-operations-kafka-connect-iceberg-sink-configuration-reference.md]
+    fact: "connector\\.client\\.config\\.override\\.policy"
+    heading: "Critical pair"

@@ -1,0 +1,85 @@
+# TLS termination at the ingress controller. The app listens on plain HTTP
+# inside the pod; the OAuth issuer is the https origin in the ConfigMap.
+#
+# All OAuth endpoints are siblings of /mcp (discovery, /register,
+# /authorize, /token, /revoke). Routing only /mcp means clients get a 401
+# challenge they cannot follow.
+#
+# X-Forwarded-Proto: ingress-nginx sets it, but the app only trusts it from
+# the peers in FORWARDED_ALLOW_IPS (see base/configmap.yaml). Keep that value
+# as narrow as the controller's pod CIDR allows -- redirects and the derived
+# origin depend on it.
+#
+# Placeholders (the work overlay patches every one of them):
+#   spec.rules[0].host, spec.tls[0].hosts[0], spec.tls[0].secretName
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hars-memory-mcp
+  labels:
+    app.kubernetes.io/name: hars-longterm-memory
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/part-of: hars
+  annotations:
+    # Streamable HTTP uses long-lived GET streams and SSE. Disable buffering
+    # and raise the read timeout; the default 60 s cuts idle MCP sessions.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - memory.example.com
+      secretName: hars-memory-tls
+  rules:
+    - host: memory.example.com
+      http:
+        paths:
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: hars-memory-mcp
+                port:
+                  name: mcp
+          - path: /.well-known
+            pathType: Prefix
+            backend:
+              service:
+                name: hars-memory-mcp
+                port:
+                  name: mcp
+          - path: /register
+            pathType: Prefix
+            backend:
+              service:
+                name: hars-memory-mcp
+                port:
+                  name: mcp
+          - path: /authorize
+            pathType: Prefix
+            backend:
+              service:
+                name: hars-memory-mcp
+                port:
+                  name: mcp
+          - path: /token
+            pathType: Prefix
+            backend:
+              service:
+                name: hars-memory-mcp
+                port:
+                  name: mcp
+          - path: /revoke
+            pathType: Prefix
+            backend:
+              service:
+                name: hars-memory-mcp
+                port:
+                  name: mcp

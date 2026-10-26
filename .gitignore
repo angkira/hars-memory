@@ -1,0 +1,65 @@
+.venv/
+.cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+reports/
+.reports/
+.env
+.env.*
+!.env.example
+*.sqlite3
+hars-memory-artifacts/
+
+# local secrets (litellm key)
+config/live-llm-e2e.env
+
+# search-research caches (large, reproducible)
+experiments/search-2026-10/cache/
+experiments/search-2026-10/*.log
+experiments/search-2026-10/ru/cache/
+# derived experiment data (indexes, candidate caches, result dumps): code and configs only
+experiments/**/cache/
+experiments/**/results/
+# session notes are local working notes: never tracked, never shipped
+.session/
+
+# Generated eval datasets (project-specific, not for commit)
+eval_agentic-data/
+eval_agentic/
+
+# local entity-alias overrides (deployment-specific spellings, never shipped)
+config/entity_aliases.local.yaml
+
+# ---------------------------------------------------------------------------
+# Artifacts: datasets, model weights, screenshots and build output never belong
+# in git. The code that produces them does; the bytes do not.
+# ---------------------------------------------------------------------------
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.tgz
+*.tar.gz
+
+# fine-tune data splits and run outputs (confidential research material)
+training/**/data/
+training/outputs/
+training/**/*.jsonl
+
+# visualizer build/render artifacts
+visualizer/app/dist/
+visualizer/app/node_modules/
+visualizer/docs/screenshots/
+visualizer/**/*.map
+
+
+# Local TLS material for the HTTP MCP endpoint (mkcert output, never committed)
+certs/

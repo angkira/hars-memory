@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hars-memory-mcp
+spec:
+  template:
+    spec:
+      containers:
+        - name: mcp
+          env:
+            - name: HARS_MEMORY_MCP_OAUTH_SIGNING_KEY_FILE
+              value: /etc/hars-memory/oauth/signing.key
+          volumeMounts:
+            - name: oauth-signing-key
+              mountPath: /etc/hars-memory/oauth
+              readOnly: true
+      volumes:
+        - name: oauth-signing-key
+          secret:
+            # Must exist BEFORE the pod starts; the mount is not optional.
+            secretName: hars-memory-oauth
+            defaultMode: 0440
+            items:
+              - key: signing-key.pem
+                path: signing.key

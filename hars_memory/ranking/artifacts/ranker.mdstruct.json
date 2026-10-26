@@ -1,0 +1,77 @@
+{
+  "manifest_version": 1,
+  "feature_names": [
+    "dense_norm",
+    "sparse_norm",
+    "ripgrep_norm",
+    "dense_score",
+    "sparse_score",
+    "ripgrep_score",
+    "fused_score",
+    "fused_gap_to_top",
+    "base_rank_reciprocal",
+    "dense_rank_reciprocal",
+    "sparse_rank_reciprocal",
+    "ripgrep_rank_reciprocal",
+    "channel_count",
+    "exact_identifier_match",
+    "content_term_overlap",
+    "chunk_len_log",
+    "doc_len_log",
+    "doc_age_days_log",
+    "section_depth",
+    "is_code_heavy",
+    "self_declared_deprecated",
+    "graph_entity_fanin_log",
+    "graph_entity_match"
+  ],
+  "format": "lightgbm_txt",
+  "model_file": "ranker.mdstruct.lgb.txt",
+  "dataset": {
+    "features_file": "collected live from the cleaned md_struct index (alpha=0.15)",
+    "feature_names": [
+      "dense_norm",
+      "sparse_norm",
+      "ripgrep_norm",
+      "dense_score",
+      "sparse_score",
+      "ripgrep_score",
+      "fused_score",
+      "fused_gap_to_top",
+      "base_rank_reciprocal",
+      "dense_rank_reciprocal",
+      "sparse_rank_reciprocal",
+      "ripgrep_rank_reciprocal",
+      "channel_count",
+      "exact_identifier_match",
+      "content_term_overlap",
+      "chunk_len_log",
+      "doc_len_log",
+      "doc_age_days_log",
+      "section_depth",
+      "is_code_heavy",
+      "self_declared_deprecated",
+      "graph_entity_fanin_log",
+      "graph_entity_match"
+    ],
+    "train": {
+      "queries": 1713,
+      "rows": 117105,
+      "positives": 8054.0
+    },
+    "sets": [
+      "hard1k_train",
+      "ltr_train"
+    ]
+  },
+  "feature_docs": "see hars_memory.ranking.features.FEATURE_DOCS",
+  "training": {
+    "objective": "lambdarank",
+    "n_estimators": 200,
+    "learning_rate": 0.05,
+    "num_leaves": 15,
+    "random_state": 7,
+    "alpha": 0.15,
+    "pool_depth": 40
+  }
+}

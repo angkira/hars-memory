@@ -1,0 +1,187 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hars-longterm-memory"
+version = "0.8.1"
+description = "Local, model-agnostic long-term memory service for the HARS/Cortex corpus"
+requires-python = ">=3.13"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+  # Core LightRAG (graph+vector) retrieval engine — one channel of memory_recall.
+  # PINNED to the builder's exact version (audit 2026-10-17; migration landed).
+  # The serving venv must read the store it serves, and the store format is
+  # version-sensitive:
+  #   * kv_store_doc_status.json rows written by LightRAG >= 1.5 carry
+  #     `content_hash` (1.4.16's DocProcessingStatus rejects it -> TypeError)
+  #     and statuses `parsing`/`analyzing` (1.4.16's get_status_counts()
+  #     raises KeyError on them). Measured on the 1.5.7 Colab snapshot:
+  #     1050/1340 rows un-constructible, get_status_counts() -> KeyError.
+  #   * The repo now IMPORTS under 1.5.7: `chunking_by_token_size` is imported
+  #     from `lightrag.chunker` (moved out of `lightrag.operate`), and
+  #     `DEFAULT_ENTITY_TYPES` is a local constant in eval/extractor_bench.py
+  #     (removed from `lightrag.constants`). See docs/VERSION_PIN.md.
+  # Pinned exactly to the version the Colab builder uses so reader == builder.
+  "lightrag-hku==1.5.7",
+  # CPU-only sentence embeddings (e5-large-v2, bge-m3, nomic-embed-text)
+  "sentence-transformers>=5.0.0",
+  # torch CPU wheel — resolved via the pytorch-cpu named index below
+  "torch>=2.0.0",
+  # Vector store (LightRAG-native backend)
+  "qdrant-client>=1.9.0",
+  # Official MCP SDK — used by hars_memory/mcp_server.py. Upper-bounded:
+  # mcp 2.x removed/renamed the Server.list_tools() decorator API this
+  # module uses (discovered when a fresh resolution in a downstream
+  # consumer picked mcp 2.1.1 and the server failed to even import).
+  # Every test in this project has only ever run against the 1.x line —
+  # bump the bound deliberately, with re-verification, not by drift.
+  "mcp>=1.0.0,<2.0.0",
+  # Config + HTTP
+  "pyyaml>=6.0",
+  "httpx>=0.27.0",
+  # Native Streamable HTTP transport + OAuth routes (hars_memory/http_server.py,
+  # hars_memory/mcp_oauth.py). Already a transitive dependency of mcp, declared
+  # explicitly because both modules import it directly.
+  "starlette>=0.37",
+  # Graph operations (entity search / subgraph in MCP server)
+  "networkx>=3.3",
+  # HTTP client used by gpu_guard.py
+  "requests>=2.32.0",
+  "bm25s>=0.3.10",
+  # Bounded retry/backoff for transient LLM-endpoint failures
+  # (server/lightrag_init.py::make_llm_func). Already pulled in transitively
+  # by lightrag-hku, but declared explicitly since we import it directly.
+  "tenacity>=9.0.0",
+  # Official OpenAI SDK — used directly by server/lightrag_init.py::make_llm_func
+  # as a thin adapter (AsyncOpenAI client construction, connection pooling,
+  # typed error taxonomy) around our own llama.cpp-server-facing completion
+  # call. lightrag-hku only declares this behind its optional "api" extra
+  # (see lightrag.llm.openai, which pip-installs it at import time via
+  # pipmaster if absent); we declare it explicitly so it is uv-managed
+  # instead of side-installed outside the lockfile. Version bound matches
+  # lightrag-hku's own "api" extra constraint.
+  "openai>=2.0.0,<3.0.0",
+  # trec_eval-standard retrieval metrics (Recall@k, nDCG@k, RR) for
+  # tools/memory/eval/metrics.py — wraps pytrec_eval_terrier (the actively
+  # maintained fork of the actual trec_eval C binary; ships prebuilt cp313
+  # wheels, unlike upstream pytrec_eval which is sdist-only and requires a
+  # C build). See metrics.py module docstring for the conventions this
+  # replaces vs keeps.
+  "ir-measures>=0.4.0",
+  # BPE tokenizer (cl100k_base) backing server/lightrag_init.py::resolve_tokenizer.
+  # Without it LightRAG's "token" budgets silently degrade to UTF-8 BYTE budgets
+  # (~4x over-chunking). Declared explicitly since we import it directly; the
+  # byte tokenizer remains as a fallback for hosts without the cached BPE asset.
+  "tiktoken>=0.7.0",
+  # gRPC server and client
+  "grpcio>=1.60.0",
+  "grpcio-health-checking>=1.60.0",
+  "protobuf>=5.0.0",
+  # Auth, key encryption at rest and JWT signing
+  "cryptography>=42.0.0",
+  "pyjwt>=2.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24.0",
+  "pytest-cov>=6.0",
+  "ruff==0.14.13",
+  "fastapi>=0.115.0",
+  "uvicorn>=0.34.0",
+  "python-multipart>=0.0.20",
+  "sqlalchemy>=2.0.0",
+  "psycopg[binary]>=3.2.0",
+  "boto3>=1.35.0",
+  "grpcio-tools>=1.60.0",
+]
+server = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.34.0",
+  "python-multipart>=0.0.20",
+  "sqlalchemy>=2.0.0",
+  "psycopg[binary]>=3.2.0",
+]
+s3 = ["boto3>=1.35.0"]
+# Learned channel-fusion ranker (hars_memory/ranking/*). Training and the
+# LightGBM artifact backend need lightgbm; INFERENCE over the shipped artifact
+# does not (the loader fails soft to the hand-tuned fusion when lightgbm is
+# absent, and the MLP artifact format is pure numpy).
+ltr = ["lightgbm>=4.0"]
+
+[project.scripts]
+memory-index = "hars_memory.cli:index_main"
+memory-mcp   = "hars_memory.mcp_server:main"
+hars-longterm-memory-mcp = "hars_memory.mcp_server:main"
+memory-eval-battle = "hars_memory.cli:eval_battle_main"
+memory = "hars_memory.cli:main"
+hars-longterm-memory-server = "hars_memory.service.server:main"
+hars-longterm-memory-mcp-https = "hars_memory.http_server:main"
+hars-longterm-memory-mcp-engine = "hars_memory.mcp_engine:main"
+memory-strategy-bench = "hars_memory.eval.strategy_bench:main"
+memory-extractor-bench = "hars_memory.eval.extractor_bench:main"
+memory-grpc = "hars_memory.cli:grpc_main"
+hars-longterm-memory-grpc = "hars_memory.grpc.server:main"
+
+[tool.hatch.build.targets.sdist]
+# local working notes and experiment data must never ship in the source archive
+# 0.7.1 sanitization: operator scripts, agent-instruction files and internal-ops
+# docs never belonged in the published source archive (they carried internal
+# hosts, index directory names and deployment paths).
+#  - cortex-scripts/: host-local operational scripts (consolidation, KB refresh)
+#  - AGENTS.md / CLAUDE.md / .claude/ / .junie/: coding-agent instructions
+#  - docs/OPERATIONS_HANDOFF.md / SWAP_CHECKLIST.md / VERSION_PIN.md: internal ops
+#  - verification_*: one-off local verification notes
+exclude = [
+  ".session", ".plans", "experiments", "docs/research",
+  "cortex-scripts",
+  ".claude", ".junie",
+  "AGENTS.md", "CLAUDE.md",
+  "docs/OPERATIONS_HANDOFF.md", "docs/SWAP_CHECKLIST.md", "docs/VERSION_PIN.md",
+  # internal research data / operator paths / fine-tune runbook: never ship
+  "eval_agentic-data", "training", "visualizer",
+  "docs/FINETUNE.md", "docs/LOCAL_CONTINUE.md", "docs/EVAL_NEW_VS_BASELINE.md",
+  "docs/RETRIEVAL_TUNING_V2.md",
+  "verification_results.md", "verification_summary_short.txt",
+]
+
+[tool.hatch.build.targets.wheel]
+# This is an application, not a library.  Packages are declared explicitly to
+# prevent hatchling from scanning for a matching package name.
+packages = ["hars_memory"]
+
+# ---------------------------------------------------------------------------
+# UV configuration — CPU-only torch via an EXPLICIT named index
+# ---------------------------------------------------------------------------
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true          # only used when a package explicitly requests this index
+
+[tool.uv.sources]
+# Pin torch to the CPU-only wheel index; no CUDA/ROCm wheels will be fetched.
+torch = { index = "pytorch-cpu" }
+
+# ---------------------------------------------------------------------------
+# Ruff / linting (mirrors repo convention)
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint.per-file-ignores]
+"hars_memory/grpc/hars_memory_pb2.py" = ["E402", "F401"]
+"hars_memory/grpc/hars_memory_pb2.pyi" = ["F401"]
+"hars_memory/grpc/hars_memory_pb2_grpc.py" = ["F401"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+  "live_llm: opt-in E2E that contacts configured real extractor/query models",
+]

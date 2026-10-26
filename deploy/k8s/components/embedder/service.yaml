@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: embedder
+  labels:
+    app.kubernetes.io/name: hars-embedder
+    app.kubernetes.io/component: embedder
+    app.kubernetes.io/part-of: hars
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hars-embedder
+    app.kubernetes.io/component: embedder
+  ports:
+    - name: http
+      port: 8791
+      targetPort: http
+      protocol: TCP

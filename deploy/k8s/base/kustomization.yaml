@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Base: one engine, one PVC, one Service, NO Ingress and OAuth DISABLED.
+# That is enough for the local/home profile and is the safe default: nothing
+# is exposed outside the cluster and no Secret is required.
+#
+# Do not apply this directory directly -- use an overlay:
+#   kubectl apply -k deploy/k8s/overlays/local
+#   kubectl apply -k deploy/k8s/overlays/work
+#
+# Every profile-specific value lives in an overlay (see README.md, "Knobs").
+
+namespace: hars-memory
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml

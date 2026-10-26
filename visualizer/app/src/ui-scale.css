@@ -1,0 +1,144 @@
+/* UI scale for large displays — owned by the ui-scale agent.
+ *
+ * Imported LAST in main.tsx (after index.css and query-steps.css); the rules
+ * here introduce only new properties/classes, so nothing else competes.
+ *
+ *  #root            — the single scaling knob. `zoom` (not font-size: index.css
+ *                     is px-only, 347 px values and no rem/em type) scales the
+ *                     px layout AND its text, and scales every containing
+ *                     block with it, so topbar / query bar / panels / the
+ *                     presentation chrome stay anchored to the visual viewport.
+ *                     The value comes from lib/uiScale.ts via --mt-ui-scale.
+ *
+ *  .canvaswrap      — counter-zoom (1 / scale). The WebGL2 and Canvas2D
+ *                     renderers size their backing store from
+ *                     `canvas.clientWidth/clientHeight`; under an ancestor
+ *                     `zoom: Z` that reports the layout size (visual / Z), so
+ *                     the canvas buffer is Z× smaller than the area it is
+ *                     stretched over and looks blurred at Z > 1. Multiplying
+ *                     by the reciprocal makes each canvas's CUMULATIVE zoom
+ *                     exactly 1: it keeps its full-viewport layout box, its
+ *                     clientWidth stays the true viewport width and the
+ *                     backing store is pixel-exact — crisp — at every scale.
+ *                     Only these full-bleed canvas layers opt out; all DOM
+ *                     overlays above them scale uniformly with #root.
+ *
+ *  Everything is inside @supports (zoom: 1) so an engine without element zoom
+ *  gets the plain unscaled app rather than a mis-sized canvas (a counter-zoom
+ *  without the matching zoom would halve the canvas).
+ */
+
+@supports (zoom: 1) {
+  #root {
+    zoom: var(--mt-ui-scale, 1);
+  }
+
+  .canvaswrap {
+    zoom: var(--mt-ui-scale-inv, 1);
+  }
+}
+
+/* ---- scaled layout budget: keep the edge chrome out of the query column --
+ *
+ * The query bar is NOT zoomed-with-the-rest in the same way: it is
+ * `left:0; right:0; width:50%; margin:auto` (query-steps.css) inside `.app`,
+ * so it always occupies the middle 50% of the *visual* viewport — its left
+ * edge sits on the 25% column at every scale. Every other piece of chrome is
+ * px-sized (index.css: .panel 348px, .travel .panel 380px, .jlog 250px,
+ * .inspector 400px, .hud content-sized, all inset 12–16px), so under
+ * `zoom: Z` those boxes grow Z× while the query bar's column does not. Past
+ * Z > (25vw - inset) / panel-width they would slide under the query bar
+ * (measured at 1440x900, Z=1.6: .panel.left reached x=531 while the query bar
+ * starts at x=360 — its title and first paragraph were covered; the .hud was
+ * half-hidden behind the same edge).
+ *
+ * The clamp below bounds each edge box's VISUAL width to the 25% column minus
+ * its own scaled inset and a constant 8px visual gutter, so nothing can ever
+ * reach the query bar at any scale. `vw` lengths compute against the visual
+ * viewport and are then magnified by the zoom, hence the inverse factor:
+ *   visual width <= 25vw - inset*Z - 8px  ==  25% of the viewport - inset - 8px
+ *
+ * It is a no-op wherever the box already fits — every 2K/4K tier keeps the
+ * panel growing proportionally, which is the point of the feature — and it is
+ * gated on `data-ui-scale` != 1 so the untouched 100% layout (including the
+ * exactly-adjacent panel/query bar on a 1440 viewport) is bit-for-bit the same.
+ * Only widths change here: no panel is moved, no query-bar rule is touched.
+ * `max-width` (rather than `width`) is deliberate: each box keeps the width
+ * index.css gives it and is only capped when that would cross the column, so
+ * this sheet can never accidentally resize a panel whose base width differs
+ * from the one written next to it.
+ */
+@media (min-width: 560px) { /* the 50% column only exists above 560px (query-steps.css) */
+  html:not([data-ui-scale="1"]) {
+    --mt-col: calc(25vw * var(--mt-ui-scale-inv, 1));
+    --mt-gutter: calc(8px * var(--mt-ui-scale-inv, 1));
+  }
+  html:not([data-ui-scale="1"]) :is(.panel, .jlog, .inspector) {
+    max-width: calc(var(--mt-col) - 12px - var(--mt-gutter));
+  }
+  /* the HUD is content-sized: cap it and let the chips wrap instead of
+     spilling out to the right of its (right-anchored) box */
+  html:not([data-ui-scale="1"]) .hud {
+    max-width: calc(var(--mt-col) - 14px - var(--mt-gutter));
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  /* the transport row (play/pause · scrubber · four speed buttons) has px-fixed
+     min-widths, so on a narrow-but-scaled viewport it can be wider than the
+     .timeline box that holds it — whose `overflow: hidden` would silently cut
+     the last buttons (measured at 1440x900, Z=1.6: the two rightmost speed
+     buttons sat at x=1392..1546, past the viewport edge). Let the row wrap onto
+     a second line instead; at scale 1 it already fits, so this is invisible. */
+  html:not([data-ui-scale="1"]) .scrub { flex-wrap: wrap; }
+}
+
+/* ---- the top-bar control (compact: it shares the row with the tabs) ------ */
+.uiscale {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+}
+.uiscale-key {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.uiscale-range {
+  width: 92px;
+  height: 14px;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.uiscale-range:focus-visible {
+  outline: 2px solid rgba(125, 243, 255, 0.55);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+.uiscale-pct {
+  min-width: 36px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  cursor: pointer; /* double-click resets to auto */
+}
+.uiscale-pct.is-auto { color: var(--dim); }
+.uiscale-reset {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 20px;
+  color: var(--dim);
+  background: rgba(20, 28, 60, 0.85);
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+.uiscale-reset:hover { border-color: var(--accent); color: var(--accent); }
+.uiscale-reset.is-auto { opacity: 0.55; cursor: default; }

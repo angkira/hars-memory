@@ -1,0 +1,87 @@
+{
+  "index_dir": "/home/demo/.local/share/hars-graphrag/index_compact",
+  "model_path": "hars_memory/ranking/artifacts/ranker.json",
+  "ranker_loaded": true,
+  "top_k": 10,
+  "alpha": 0.5,
+  "sets": {
+    "retrieval_queries_current_gcfixed.yaml": {
+      "n_queries": 48,
+      "variants": {
+        "fusion": {
+          "n_queries": 48,
+          "recall@1": 0.7083,
+          "recall@10": 0.9792,
+          "ndcg@10": 0.8563,
+          "mrr": 0.8149
+        },
+        "fusion_rog": {
+          "n_queries": 48,
+          "recall@1": 0.7083,
+          "recall@10": 0.9792,
+          "ndcg@10": 0.8563,
+          "mrr": 0.8149
+        },
+        "ltr_full": {
+          "n_queries": 48,
+          "recall@1": 0.7708,
+          "recall@10": 1.0,
+          "ndcg@10": 0.8848,
+          "mrr": 0.8479,
+          "latency_ms_mean": 29.0764,
+          "latency_ms_p95": 52.0173,
+          "latency_ms_per_candidate": 0.56368
+        },
+        "ltr_gated": {
+          "n_queries": 48,
+          "recall@1": 0.7708,
+          "recall@10": 0.9792,
+          "ndcg@10": 0.878,
+          "mrr": 0.845,
+          "latency_ms_mean": 33.544,
+          "latency_ms_p95": 79.7983,
+          "latency_ms_per_candidate": 3.3544
+        }
+      }
+    },
+    "relational_gold.yaml": {
+      "n_queries": 28,
+      "variants": {
+        "fusion": {
+          "n_queries": 28,
+          "recall@1": 0.2857,
+          "recall@10": 0.6964,
+          "ndcg@10": 0.6144,
+          "mrr": 0.6845
+        },
+        "fusion_rog": {
+          "n_queries": 28,
+          "recall@1": 0.2857,
+          "recall@10": 0.6964,
+          "ndcg@10": 0.6144,
+          "mrr": 0.6845
+        },
+        "ltr_full": {
+          "n_queries": 28,
+          "recall@1": 0.3214,
+          "recall@10": 0.7321,
+          "ndcg@10": 0.6288,
+          "mrr": 0.7055,
+          "latency_ms_mean": 42.4389,
+          "latency_ms_p95": 82.4121,
+          "latency_ms_per_candidate": 0.78539
+        },
+        "ltr_gated": {
+          "n_queries": 28,
+          "recall@1": 0.3214,
+          "recall@10": 0.6964,
+          "ndcg@10": 0.6223,
+          "mrr": 0.7113,
+          "latency_ms_mean": 27.9522,
+          "latency_ms_p95": 65.5267,
+          "latency_ms_per_candidate": 2.79522
+        }
+      }
+    }
+  }
+}

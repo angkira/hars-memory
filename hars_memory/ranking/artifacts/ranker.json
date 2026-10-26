@@ -1,0 +1,147 @@
+{
+  "dataset": {
+    "feature_names": [
+      "dense_norm",
+      "sparse_norm",
+      "ripgrep_norm",
+      "dense_score",
+      "sparse_score",
+      "ripgrep_score",
+      "fused_score",
+      "fused_gap_to_top",
+      "base_rank_reciprocal",
+      "dense_rank_reciprocal",
+      "sparse_rank_reciprocal",
+      "ripgrep_rank_reciprocal",
+      "channel_count",
+      "exact_identifier_match",
+      "content_term_overlap",
+      "chunk_len_log",
+      "doc_len_log",
+      "doc_age_days_log",
+      "section_depth",
+      "is_code_heavy",
+      "self_declared_deprecated",
+      "graph_entity_fanin_log",
+      "graph_entity_match"
+    ],
+    "features_file": "eval_agentic-data/ltr_train_300.jsonl",
+    "train": {
+      "positives": 341.0,
+      "queries": 223.0,
+      "rows": 11530.0
+    },
+    "valid": {
+      "positives": 112.0,
+      "queries": 74.0,
+      "rows": 3804.0
+    }
+  },
+  "feature_docs": [
+    "min-max normalized dense (vector) score within the candidate pool [0,1]; 0.0 if the chunk had no dense hit",
+    "min-max normalized BM25 score within the candidate pool [0,1]; 0.0 if the chunk had no BM25 hit",
+    "min-max normalized raw ripgrep ranked score within the pool [0,1]; 0.0 if no literal hit",
+    "raw dense cosine similarity (un-normalized magnitude; confidence, not rank)",
+    "raw BM25 score (unbounded; confidence, not rank)",
+    "raw ripgrep score for this chunk's file (unbounded; 0.0 if no hit)",
+    "the hand-tuned blend alpha*dense_norm+(1-alpha)*sparse_norm (+agreement bonus - supersession penalties) that currently decides rank",
+    "max(pool fused_score) - this candidate's fused_score (0.0 for the top candidate)",
+    "1/(rank in the hand-tuned fused order), 1-indexed",
+    "1/(rank by dense score among pool chunks with a dense hit); 0.0 if the chunk had no dense hit",
+    "1/(rank by BM25 score among pool chunks with a BM25 hit); 0.0 if the chunk had no BM25 hit",
+    "1/(rank by ripgrep score among pool chunks with a ripgrep hit); 0.0 if no literal hit",
+    "how many of {dense, BM25, ripgrep, flat-dense} returned this chunk (0..4)",
+    "1.0 if any query identifier-shaped term appears verbatim (casefolded) in the chunk content",
+    "fraction of the query's content words (len>=4, non-stopword) present in the chunk content",
+    "log1p(len(chunk content))",
+    "log1p(total characters of the whole source document); 0.0 when the corpus context is absent",
+    "log1p(days since the document date, vs a fixed reference); -1.0 when the document is undated",
+    "markdown heading depth of the chunk (# count in its heading path)",
+    "1.0 when the chunk is dominated by fenced/inline code, else 0.0",
+    "1.0 when the chunk declares ITSELF stale (supersession flag), else 0.0",
+    "log1p(max entity fan-in over entities mentioned in the chunk); 0.0 without a graph context",
+    "fraction of query identifier terms that are entity names attached to the chunk; 0.0 without a graph context"
+  ],
+  "feature_names": [
+    "dense_norm",
+    "sparse_norm",
+    "ripgrep_norm",
+    "dense_score",
+    "sparse_score",
+    "ripgrep_score",
+    "fused_score",
+    "fused_gap_to_top",
+    "base_rank_reciprocal",
+    "dense_rank_reciprocal",
+    "sparse_rank_reciprocal",
+    "ripgrep_rank_reciprocal",
+    "channel_count",
+    "exact_identifier_match",
+    "content_term_overlap",
+    "chunk_len_log",
+    "doc_len_log",
+    "doc_age_days_log",
+    "section_depth",
+    "is_code_heavy",
+    "self_declared_deprecated",
+    "graph_entity_fanin_log",
+    "graph_entity_match"
+  ],
+  "format": "lightgbm_txt",
+  "hyperparams": {
+    "best_iteration": 114,
+    "early_stopping_rounds": 40,
+    "k": 10,
+    "learning_rate": 0.05,
+    "num_boost_round": 400,
+    "num_leaves": 15,
+    "objective": "lambdarank",
+    "seed": 42,
+    "valid_fraction": 0.25,
+    "winner": "lightgbm"
+  },
+  "manifest_version": 1,
+  "metrics": {
+    "lightgbm": {
+      "train": {
+        "base_hit@10": 0.9820627802690582,
+        "base_mrr": 0.8799713676955829,
+        "base_ndcg@10": 0.8705640467393246,
+        "hit@10": 1.0,
+        "mrr": 1.0,
+        "ndcg@10": 0.9933613131404911,
+        "queries": 223.0
+      },
+      "valid": {
+        "base_hit@10": 1.0,
+        "base_mrr": 0.8810810810810811,
+        "base_ndcg@10": 0.8813155517412763,
+        "hit@10": 1.0,
+        "mrr": 0.9245495495495496,
+        "ndcg@10": 0.9128029778661576,
+        "queries": 74.0
+      }
+    },
+    "mlp": {
+      "train": {
+        "base_hit@10": 0.9820627802690582,
+        "base_mrr": 0.8799713676955829,
+        "base_ndcg@10": 0.8705640467393246,
+        "hit@10": 1.0,
+        "mrr": 0.9156310057655349,
+        "ndcg@10": 0.904387881305276,
+        "queries": 223.0
+      },
+      "valid": {
+        "base_hit@10": 1.0,
+        "base_mrr": 0.8810810810810811,
+        "base_ndcg@10": 0.8813155517412763,
+        "hit@10": 0.9864864864864865,
+        "mrr": 0.9048321048321047,
+        "ndcg@10": 0.8906291811244742,
+        "queries": 74.0
+      }
+    }
+  },
+  "model_file": "ranker.lgb.txt"
+}

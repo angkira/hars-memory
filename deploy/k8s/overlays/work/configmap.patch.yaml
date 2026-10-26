@@ -1,0 +1,15 @@
+# Knob 1: ISSUER HOST + OAuth.
+# The issuer is the public origin clients use. It must be https, must match
+# /spec/rules[0].host in ingress-host.patch.yaml, and must be byte-identical to
+# what clients type (no trailing slash, no default port).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hars-memory-config
+data:
+  HARS_MEMORY_MCP_OAUTH_ENABLED: "1"
+  HARS_MEMORY_MCP_OAUTH_ISSUER: "https://memory.work.example"
+  HARS_MEMORY_MCP_OAUTH_RESOURCE: "https://memory.work.example/mcp"
+  HARS_MEMORY_MCP_CORS_ORIGINS: "https://memory.work.example"
+  # Dynamic registration may only redirect back to these hosts.
+  HARS_MEMORY_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS: "memory.work.example"

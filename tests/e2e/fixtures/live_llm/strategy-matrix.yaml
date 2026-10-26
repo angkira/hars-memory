@@ -1,0 +1,47 @@
+version: 1
+name: live-llm-small-corpus
+corpus_paths: [corpus]
+queries_path: queries.yaml
+output_dir: ../../../../.reports/live-llm-strategies
+repetitions: 1
+warmups: 0
+k_values: [1, 3]
+primary_metric: ndcg@3
+primary_metric_direction: higher
+
+index_strategies:
+  - name: corpus-small-chunks
+    engine: corpus
+    options: {chunk_size: 180, chunk_overlap: 30}
+  - name: corpus-large-chunks
+    engine: corpus
+    options: {chunk_size: 600, chunk_overlap: 80}
+  - name: lightrag-live-smoke
+    engine: lightrag
+    options:
+      # 512 ensures the 61-token rollback.md extension fits in a single chunk
+      # even with the document-header prefix, so the test assertion on the
+      # GREEN-COMET-52 verdict is deterministic rather than embedding-model luck.
+      chunk_token_size: 512
+      chunk_overlap_tokens: 32
+      max_parallel_insert: 1
+      llm_max_async: 1
+      max_gleaning: 0
+      vector_storage: NanoVectorDBStorage
+      graph_storage: NetworkXStorage
+
+search_strategies:
+  - name: sparse-k3
+    backend: corpus
+    mode: sparse
+    top_k: 3
+  - name: lightrag-naive-k3
+    backend: lightrag
+    mode: naive
+    top_k: 3
+  - name: lightrag-hybrid-k3
+    backend: lightrag
+    mode: hybrid
+    top_k: 3
+    max_entity_tokens: 800
+    max_relation_tokens: 1200

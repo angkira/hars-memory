@@ -1,0 +1,21 @@
+[Unit]
+Description=Timer for HARS long-term memory staged-note consolidation
+Documentation=https://knotgate.com/docs
+
+[Timer]
+# DISABLED BY DEFAULT. Enable only after the owner approves running the
+# GPU-exclusive consolidation on this cadence (the extractor is a 12B model
+# that must not compete with training). Until then the service, if triggered
+# by hand, is a safe dry-run (see the .service file).
+#
+# Cadence: daily at 04:30 local, plus a randomised delay so it does not collide
+# with other fixed jobs. Persistent=true catches up a missed run after the
+# machine was off. Change OnCalendar to taste before enabling.
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=900
+AccuracySec=1min
+Persistent=true
+Unit=hars-longterm-memory-consolidate.service
+
+[Install]
+WantedBy=timers.target

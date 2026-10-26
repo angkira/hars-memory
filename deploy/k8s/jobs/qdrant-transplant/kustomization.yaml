@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# One-off NanoVectorDB -> Qdrant transplant:
+#   kubectl -n hars-memory apply -k deploy/k8s/jobs/qdrant-transplant
+#
+# The job runs the SAME image as the app. Change the registry/tag here if the
+# overlay uses a different one (local profile: registry.local/...).
+resources:
+  - job.yaml
+
+images:
+  - name: hars-longterm-memory
+    newName: registry.work.example/hars/hars-longterm-memory
+    newTag: "0.8.1"

@@ -1,0 +1,29 @@
+[Unit]
+Description=HARS long-term memory staged-note consolidation (dry-run safe, GPU-guarded)
+Documentation=https://knotgate.com/docs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Symlink to hars-longterm-memory/cortex-scripts/consolidate_staging.sh,
+# matching the %h/.local/bin convention hars-longterm-memory-mcp.service uses.
+#
+# DRY-RUN BY DEFAULT. With no arguments this walks + counts the staged notes
+# under $HARS_MEMORY_STAGING_DIR, starts no extractor and takes no GPU. To do
+# a real, GPU-exclusive consolidation, uncomment the Environment line below
+# (the wrapper then loads the live index/vector config from cortex/.mcp.json,
+# runs the GPU guard, starts gemma-4-12b on :8083 and indexes).
+#
+# Environment=HARS_MEMORY_CONSOLIDATE_APPLY=1
+ExecStart=%h/.local/bin/hars-longterm-memory-consolidate
+# A real run starts a 12B extractor + indexes a backlog; allow it to finish.
+TimeoutStartSec=10800
+Environment=HOME=%h
+Environment=XDG_RUNTIME_DIR=%t
+StandardOutput=append:%h/.local/state/hars-longterm-memory/consolidate.log
+StandardError=append:%h/.local/state/hars-longterm-memory/consolidate.log
+SyslogIdentifier=hars-longterm-memory-consolidate
+
+[Install]
+WantedBy=default.target

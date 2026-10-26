@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Mounts the OAuth signing key from a Secret instead of letting the server
+# generate one on the PVC. Used by overlays/work so the key is backed up with
+# the Secret and can be shared by future read replicas.
+#
+# Requires Secret hars-memory-oauth with key signing-key.pem (see
+# secret.example.yaml and README, "Work profile").
+patches:
+  - path: patch-deployment.yaml

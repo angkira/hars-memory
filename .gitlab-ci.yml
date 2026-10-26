@@ -1,0 +1,159 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+stages:
+  - lint
+  - test
+  - package
+  - publish
+
+default:
+  interruptible: true
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - scheduler_failure
+
+variables:
+  PYTHONDONTWRITEBYTECODE: "1"
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.cache/uv"
+  UV_LINK_MODE: copy
+
+.python-job:
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  tags:
+    - sh
+  cache:
+    key:
+      files:
+        - uv.lock
+      prefix: uv-python313
+    paths:
+      - .cache/uv/
+    policy: pull-push
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends ripgrep
+    - uv sync --frozen --extra dev
+
+lint:
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  tags:
+    - sh
+  stage: lint
+  script:
+    - uvx --from ruff==0.14.13 ruff check .
+  timeout: 15 minutes
+
+test:
+  extends: .python-job
+  stage: test
+  script:
+    - mkdir -p reports
+    - uv run pytest -q --junitxml=reports/pytest.xml
+  artifacts:
+    when: always
+    expire_in: 14 days
+    reports:
+      junit: reports/pytest.xml
+    paths:
+      - reports/pytest.xml
+  timeout: 30 minutes
+
+package:
+  image: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+  tags:
+    - sh
+  stage: package
+  cache:
+    key:
+      files:
+        - uv.lock
+      prefix: uv-python313
+    paths:
+      - .cache/uv/
+    policy: pull-push
+  script:
+    - uv build
+  artifacts:
+    expire_in: 30 days
+    paths:
+      - dist/*.whl
+      - dist/*.tar.gz
+  timeout: 15 minutes
+
+publish-pypi:
+  extends: .python-job
+  stage: publish
+  needs:
+    - job: lint
+    - job: test
+    - job: package
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - uv publish --publish-url "$CI_PYPI_PUBLISH_URL" \
+        --username "__token__" \
+        --password "$CI_PYPI_PUBLISH_TOKEN"
+  timeout: 10 minutes
+
+publish-container:
+  image: docker:28-cli
+  tags:
+    - sh
+  stage: publish
+  needs:
+    - job: lint
+    - job: test
+    - job: package
+      artifacts: false
+  resource_group: hars-longterm-memory-container-publish
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+    DOCKER_BUILDKIT: "1"
+    BUILDKIT_PROGRESS: plain
+  before_script:
+    - |
+      if [ ! -S /var/run/docker.sock ]; then
+        echo "The sh runner must mount its Docker socket at /var/run/docker.sock." >&2
+        exit 1
+      fi
+    - docker version
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" --username "$CI_REGISTRY_USER" --password-stdin
+  script:
+    - |
+      image_sha="$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+      image_short="$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+
+      set -- \
+        --pull \
+        --push \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --file Dockerfile.service \
+        --tag "$image_sha" \
+        --tag "$image_short"
+
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        image_tag="$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+        set -- "$@" --tag "$image_tag"
+      fi
+
+      if [ "${CI_COMMIT_BRANCH:-}" = "$CI_DEFAULT_BRANCH" ]; then
+        image_latest="$CI_REGISTRY_IMAGE:latest"
+        set -- "$@" --tag "$image_latest"
+      fi
+
+      docker buildx build "$@" .
+  after_script:
+    - docker logout "$CI_REGISTRY" || true
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  timeout: 30 minutes

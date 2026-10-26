@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memory-travel-config
+  labels:
+    app.kubernetes.io/name: memory-travel
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/part-of: hars-memory
+data:
+  BACKEND_HOST: "trace-server"
+  BACKEND_MEMORY_PORT: "8096"
+  BACKEND_MEMORY_PATH: "/mcp"
+  BACKEND_TRACE_HOST: "trace-server"
+  BACKEND_TRACE_PORT: "8098"

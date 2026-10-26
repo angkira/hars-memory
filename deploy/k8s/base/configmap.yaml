@@ -1,0 +1,159 @@
+# Non-secret configuration only.
+#
+# Everything here is an environment variable the server reads (see
+# docs/http-mcp.md and docs/configuration.md). Secrets (OAuth signing key,
+# approval token, Qdrant API key) are NOT in this file -- see
+# secret.example.yaml and the "Secrets" section of README.md.
+#
+# Placeholders that MUST be replaced for a real deployment:
+#   * HARS_MEMORY_MCP_OAUTH_ISSUER / _RESOURCE  (public origin)
+#   * HARS_MEMORY_QDRANT_URL                    (external Qdrant endpoint)
+#   * HARS_MEMORY_EMBED_BASE_URL / _HTTP_MODEL  (embedding service)
+#   * HARS_MEMORY_EXTRACTOR_BASE_URL / _MODEL   (write path only)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hars-memory-config
+  labels:
+    app.kubernetes.io/name: hars-longterm-memory
+    app.kubernetes.io/component: mcp-server
+    app.kubernetes.io/part-of: hars
+data:
+  # ---------------------------------------------------------------------
+  # Listener (uvicorn; ONE worker, intentionally)
+  # ---------------------------------------------------------------------
+  HARS_MEMORY_MCP_HTTP_HOST: "0.0.0.0"
+  HARS_MEMORY_MCP_HTTP_PORT: "8099"
+  HARS_MEMORY_MCP_HTTP_PATH: "/mcp"
+  # Stateless Streamable HTTP: no Mcp-Session-Id, one process-wide index.
+  HARS_MEMORY_MCP_HTTP_STATELESS: "1"
+  HARS_MEMORY_MCP_HTTP_JSON_RESPONSE: "1"
+  # Pay the ~20 s index load at startup instead of on the first tool call.
+  HARS_MEMORY_MCP_HTTP_WARMUP: "1"
+  HARS_MEMORY_MCP_HTTP_WARMUP_PROJECT: "default"
+  # Non-browser MCP clients do not send Origin. Set to the exact browser
+  # origin (e.g. "https://app.example.com") if a web client is used.
+  HARS_MEMORY_MCP_CORS_ORIGINS: "none"
+  # uvicorn only trusts X-Forwarded-* from these peers. Keep this as narrow as
+  # the ingress controller's pod CIDR allows; "*" is safe only when the pod is
+  # not reachable except through the ingress.
+  FORWARDED_ALLOW_IPS: "*"
+
+  # ---------------------------------------------------------------------
+  # Index + caches (persistent volume hars-memory-data)
+  # ---------------------------------------------------------------------
+  HARS_MEMORY_INDEX_DIR: "/data/index"
+  HARS_MEMORY_STAGING_DIR: "/data/staging"
+  HARS_MEMORY_BM25_CACHE_DIR: "/data/cache/bm25"
+  HARS_MEMORY_FLAT_DENSE_CACHE_DIR: "/data/cache/flat"
+  HARS_MEMORY_FINGERPRINT_STORE: "/data/index/doc_fingerprints.json"
+  TIKTOKEN_CACHE_DIR: "/data/cache/tiktoken"
+  HF_HOME: "/data/cache/hf"
+  TRANSFORMERS_CACHE: "/data/cache/hf"
+
+  # ---------------------------------------------------------------------
+  # Vector storage -- external Qdrant (recommended for production)
+  # ---------------------------------------------------------------------
+  HARS_MEMORY_VECTOR_STORAGE: "QdrantVectorDBStorage"
+  HARS_MEMORY_QDRANT_URL: "http://qdrant.qdrant.svc.cluster.local:6333"
+  # LightRAG uses this as the workspace/tenant id, not as a collection name.
+  HARS_MEMORY_QDRANT_COLLECTION: "hars_longterm_memory"
+  # Required only when several tenants share one Qdrant instance.
+  # HARS_MEMORY_QDRANT_COLLECTION_PREFIX: "hars_longterm_memory"
+
+  # ---------------------------------------------------------------------
+  # Embedder -- must produce vectors of the SAME dimension as the index
+  # (768 for the embeddinggemma-300m / e5-large-v2 generation). A mismatch
+  # fails loudly at warm-up, not silently.
+  # ---------------------------------------------------------------------
+  HARS_MEMORY_EMBED_PROVIDER: "http"
+  HARS_MEMORY_EMBED_BASE_URL: "http://embedding.embedding.svc.cluster.local:8080/v1"
+  HARS_MEMORY_EMBED_HTTP_MODEL: "embeddinggemma-300m"
+  HARS_MEMORY_EMBED_MODEL: "embeddinggemma-300m"
+
+  # ---------------------------------------------------------------------
+  # Retrieval channels
+  # ---------------------------------------------------------------------
+  # No live repository is mounted in this pod, so the ripgrep channel is
+  # disabled. Enable it (and mount the corpus) if memories reference files.
+  HARS_MEMORY_RIPGREP_CHANNEL: "0"
+  HARS_MEMORY_FLAT_CHANNEL: "0"
+  HARS_MEMORY_RERANK_BACKEND: "off"
+
+  # ---------------------------------------------------------------------
+  # Write path (memory_remember / memory_upsert_document)
+  # Read-only recall works without a working extractor; writes do not.
+  # ---------------------------------------------------------------------
+  HARS_MEMORY_EXTRACTOR_PROVIDER: "local"
+  HARS_MEMORY_EXTRACTOR_BASE_URL: "http://llm.llm.svc.cluster.local:8080/v1"
+  HARS_MEMORY_EXTRACTOR_MODEL: "REPLACE_ME-extractor-model"
+  HARS_MEMORY_QUERY_BASE_URL: "http://llm.llm.svc.cluster.local:8080/v1"
+  HARS_MEMORY_QUERY_MODEL: "REPLACE_ME-query-model"
+
+  # ---------------------------------------------------------------------
+  # OAuth 2.1 (authorization server + bearer gate)
+  #
+  # BASE DEFAULT: DISABLED. That is the local/home profile. The work overlay
+  # flips HARS_MEMORY_MCP_OAUTH_ENABLED to "1" and sets the issuer/resource to
+  # the public host -- never enable it without also setting the issuer, and
+  # never expose the Service outside the cluster while it is disabled.
+  #
+  # The issuer MUST be byte-identical to the URL clients use; a mismatch
+  # breaks discovery and audience validation.
+  # ---------------------------------------------------------------------
+  HARS_MEMORY_MCP_OAUTH_ENABLED: "0"
+  # Work overlay replaces BOTH values. Kept here so the key exists for the
+  # JSON6902 patch and so an accidental enable still points at a placeholder.
+  HARS_MEMORY_MCP_OAUTH_ISSUER: "https://memory.example.com"
+  HARS_MEMORY_MCP_OAUTH_RESOURCE: "https://memory.example.com/mcp"
+  HARS_MEMORY_MCP_OAUTH_SCOPES: "memory:read memory:write memory:admin"
+  # Cap what ANY client can be granted. Destructive tools stay unreachable
+  # over HTTP until an operator adds memory:admin here deliberately.
+  HARS_MEMORY_MCP_OAUTH_MAX_SCOPES: "memory:read memory:write"
+  HARS_MEMORY_MCP_OAUTH_ACCESS_TTL: "3600"
+  HARS_MEMORY_MCP_OAUTH_REFRESH_TTL: "2592000"
+  HARS_MEMORY_MCP_OAUTH_CODE_TTL: "300"
+  # OAuth mutable state: dynamic clients, hashed refresh tokens, revoked jtis.
+  #
+  # The committed HTTP server stores this as ONE JSON file (single writer,
+  # which is exactly the replicas: 1 contract). The SQLite/Redis store
+  # (`HARS_MEMORY_MCP_OAUTH_STORE`) exists on the feature branch but is not in
+  # the committed server at the time of writing -- do not enable it here until
+  # it is merged:
+  # HARS_MEMORY_MCP_OAUTH_STORE: "sqlite"
+  # HARS_MEMORY_MCP_OAUTH_STORE_PATH: "/data/oauth/state.sqlite3"
+  HARS_MEMORY_MCP_OAUTH_STATE_FILE: "/data/oauth/state.json"
+  # Base path is on the PVC so an OAuth-enabled local run works with no
+  # Secret. The work overlay mounts a Secret and patches this to
+  # /etc/hars-memory/oauth/signing.key (component oauth-signing-key).
+  HARS_MEMORY_MCP_OAUTH_SIGNING_KEY_FILE: "/data/oauth/signing.key"
+  HARS_MEMORY_MCP_OAUTH_AUTHORIZE_USER: "operator"
+  HARS_MEMORY_MCP_OAUTH_REGISTRATION_ENABLED: "1"
+  HARS_MEMORY_MCP_OAUTH_ALLOWED_REDIRECT_HOSTS: "localhost 127.0.0.1"
+
+  # ---------------------------------------------------------------------
+  # Trace SSE listener (sibling port). Off by default: it is unauthenticated
+  # and exposes query/answer pairs. Set to 8098 AND publish the port in
+  # service.yaml only for trusted in-cluster consumers.
+  # ---------------------------------------------------------------------
+  HARS_MEMORY_TRACE_HTTP_PORT: "0"
+
+  # ---------------------------------------------------------------------
+  # Runtime / logging
+  # ---------------------------------------------------------------------
+  # Bounded in-process engine pool (hars_memory/mcp_runtime.py). Bounds the
+  # blocking retrieval stages per process; overflow returns a retryable 503.
+  # 0 = inline (pre-scaling behaviour). See docs/http-mcp-scaling.md.
+  HARS_MEMORY_MCP_ENGINE_THREADS: "4"
+  HARS_MEMORY_MCP_ENGINE_QUEUE: "16"
+  HARS_MEMORY_MCP_ENGINE_QUEUE_TIMEOUT_MS: "10000"
+  HARS_MEMORY_MCP_ENGINE_STATS: "1"
+  HARS_MEMORY_LOG_LEVEL: "INFO"
+  # Documented in docs/configuration.md but not read by the committed server
+  # at the time of writing; harmless when set, enable once implemented.
+  # HARS_MEMORY_LOG_QUERY_EVENTS: "1"
+  # HARS_MEMORY_LOG_QUERY_EVENTS_DIR: "/data/cache/query-events"
+  # Fail closed if a legacy GRAPHRAG_* variable leaks in from the environment.
+  HARS_MEMORY_LEGACY_ENV_PREFIXES: "GRAPHRAG_"
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"

@@ -1,0 +1,37 @@
+# Memory Travel visualizer — self-contained container definition.
+#
+#   export BACKEND_MEMORY_URL=http://<mcp-host>:8099
+#   export BACKEND_TRACE_URL=http://<trace-host>:8098
+#   export BACKEND_COSMOS_URL=http://<cosmos-host>:8097
+#   docker compose up -d --build
+#
+# No defaults are baked in: every upstream must be provided explicitly.
+# Host networking is required because the memory services bind to loopback and
+# to the host VPN address, neither of which a bridged container can reach.
+# nginx listens on :8080. Read-only: the UI only calls memory_recall and the
+# read-only trace/cosmos exports.
+
+services:
+  memory-travel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Built for same-origin hosting under /memory/ (the HARS GUI embeds it over
+        # HTTPS). The nginx config also keeps location / working, so a direct
+        # http://host:4400/ still renders.
+        VITE_BASE: /memory/
+    image: memory-travel:local
+    container_name: hars-memory-travel
+    network_mode: host
+    environment:
+      BACKEND_MEMORY_URL: ${BACKEND_MEMORY_URL:?BACKEND_MEMORY_URL is required}
+      BACKEND_TRACE_URL: ${BACKEND_TRACE_URL:?BACKEND_TRACE_URL is required}
+      BACKEND_COSMOS_URL: ${BACKEND_COSMOS_URL:?BACKEND_COSMOS_URL is required}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

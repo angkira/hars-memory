@@ -1,0 +1,28 @@
+# Single persistent volume for the LightRAG working directory, the staging
+# area, the OAuth state file and the rebuildable caches.
+#
+# Measured production index: ~1.8 GB (GraphML + KV + NanoVectorDB/Qdrant
+# workspace config). 10 GiB leaves room for graph/BM25 sidecars, staged notes
+# and a second copy during a snapshot restore.
+#
+# Access mode is ReadWriteOnce on purpose: the engine is a single writer and
+# the Deployment uses strategy: Recreate, so a RWO volume is sufficient and
+# avoids accidental multi-pod writers.
+#
+# storageClassName is intentionally not set (cluster default). Pin it here
+# when the default class is not the one that should hold this data.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hars-memory-data
+  labels:
+    app.kubernetes.io/name: hars-longterm-memory
+    app.kubernetes.io/component: index
+    app.kubernetes.io/part-of: hars
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName: REPLACE_ME_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 10Gi

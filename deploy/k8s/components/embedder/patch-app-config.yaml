@@ -1,0 +1,12 @@
+# Point the app at the in-cluster embedder instead of the external URL in
+# base/configmap.yaml. The model name must match EMBED_MODEL_ALIAS and the
+# index's embedding dimension (768 for embeddinggemma-300m / e5-large-v2).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hars-memory-config
+data:
+  HARS_MEMORY_EMBED_PROVIDER: "http"
+  HARS_MEMORY_EMBED_BASE_URL: "http://embedder:8791/v1"
+  HARS_MEMORY_EMBED_HTTP_MODEL: "embeddinggemma-300m"
+  HARS_MEMORY_EMBED_MODEL: "embeddinggemma-300m"

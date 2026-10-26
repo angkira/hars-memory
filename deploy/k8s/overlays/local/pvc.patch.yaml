@@ -1,0 +1,9 @@
+# Knob: STORAGE CLASS.
+# `local-path` is the default provisioner on k3s/kind/Rancher Desktop. Change
+# this single value for any other local provisioner (e.g. `standard`, `hostpath`).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hars-memory-data
+spec:
+  storageClassName: local-path

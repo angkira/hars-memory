@@ -1,0 +1,56 @@
+version: 1
+name: example-strategy-matrix
+corpus_paths:
+  - ../tests/e2e/fixtures/live_llm/corpus
+queries_path: ../tests/e2e/fixtures/live_llm/queries.yaml
+output_dir: ../.reports/strategy-bench
+repetitions: 3
+warmups: 1
+k_values: [1, 3, 5, 10]
+primary_metric: ndcg@10
+primary_metric_direction: higher
+
+index_strategies:
+  - name: corpus-1200-200
+    engine: corpus
+    options:
+      chunk_size: 1200
+      chunk_overlap: 200
+
+  - name: lightrag-256-no-glean
+    engine: lightrag
+    options:
+      chunk_token_size: 256
+      chunk_overlap_tokens: 32
+      max_parallel_insert: 1
+      llm_max_async: 1
+      max_gleaning: 0
+      vector_storage: NanoVectorDBStorage
+      graph_storage: NetworkXStorage
+
+search_strategies:
+  - name: sparse-k10
+    backend: corpus
+    mode: sparse
+    top_k: 10
+
+  - name: fusion-balanced-k10
+    backend: corpus
+    mode: fusion
+    top_k: 10
+    alpha: 0.5
+    embed_model: unsloth/embeddinggemma-300m
+
+  - name: lightrag-naive-k10
+    backend: lightrag
+    mode: naive
+    top_k: 10
+
+  - name: lightrag-hybrid-budgeted
+    backend: lightrag
+    mode: hybrid
+    top_k: 10
+    chunk_top_k: 20
+    max_entity_tokens: 1000
+    max_relation_tokens: 2000
+    max_total_tokens: 6000

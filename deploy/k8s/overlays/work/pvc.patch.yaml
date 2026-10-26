@@ -1,0 +1,9 @@
+# Knob 3: STORAGE CLASS.
+# `fast-ssd` is a placeholder. Replace with the StorageClass that backs the
+# PVC on this cluster (e.g. gp3, premium-rwo, managed-csi, longhorn).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hars-memory-data
+spec:
+  storageClassName: fast-ssd

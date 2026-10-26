@@ -1,0 +1,17 @@
+# OPTIONAL (inactive): reach the unauthenticated local endpoint from a home
+# LAN or a WireGuard/tailnet address without port-forwarding.
+#
+# Enable it by uncommenting the patch in kustomization.yaml. A NodePort is
+# cluster-wide, so only do this on a single-user / trusted cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hars-memory-mcp
+spec:
+  type: NodePort
+  ports:
+    - name: mcp
+      port: 8099
+      targetPort: mcp
+      protocol: TCP
+      nodePort: 30099

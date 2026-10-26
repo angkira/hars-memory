@@ -1,0 +1,113 @@
+# =============================================================================
+# Memory Travel - Kubernetes / Helm Values Reference
+# =============================================================================
+
+global:
+  namespace: memory-travel
+
+frontend:
+  name: memory-travel
+  replicaCount: 2
+  image:
+    repository: memory-travel
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 80
+    targetPort: 8080
+
+  # Configurable environment variables for Nginx reverse proxy
+  config:
+    backendHost: "trace-server"
+    backendMemoryPort: "8096"
+    backendMemoryPath: "/mcp"
+    backendTraceHost: "trace-server"
+    backendTracePort: "8098"
+
+  # Optional default Bearer token passed upstream to the MCP memory bridge
+  # If empty, client-provided Authorization headers are passed through.
+  auth:
+    token: ""
+
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1001
+    runAsGroup: 1001
+    fsGroup: 1001
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop:
+        - ALL
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+  probes:
+    liveness:
+      path: /healthz
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    readiness:
+      path: /healthz
+      initialDelaySeconds: 2
+      periodSeconds: 5
+
+ingress:
+  enabled: true
+  className: nginx
+  host: memory-travel.example.com
+  # Choose base path: "/travel" for subpath or "/" for domain root
+  path: /travel
+  pathType: Prefix
+  tls:
+    enabled: false
+    secretName: memory-travel-tls
+    clusterIssuer: letsencrypt-prod
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # SSO / OAuth2 Proxy annotations (optional):
+    # nginx.ingress.kubernetes.io/auth-url: "https://auth.example.com/oauth2/auth"
+    # nginx.ingress.kubernetes.io/auth-signin: "https://auth.example.com/oauth2/start?rd=$escaped_request_uri"
+
+traceServer:
+  enabled: true
+  name: trace-server
+  image:
+    repository: hars-longterm-memory
+    tag: latest
+    pullPolicy: IfNotPresent
+  command:
+    - python3
+    - -m
+    - hars_memory.trace
+  port: 8098
+  env:
+    indexDir: /data/index
+    httpHost: "0.0.0.0"
+    httpPort: "8098"
+    keepaliveS: "10"
+    hitsCap: "30"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  persistence:
+    enabled: true
+    claimName: hars-memory-index-pvc
+    mountPath: /data/index
+    accessMode: ReadOnlyMany
+    size: 10Gi

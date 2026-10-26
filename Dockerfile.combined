@@ -1,0 +1,65 @@
+# Unified HARS Long-term Memory container:
+# Hosts both the Native MCP HTTP(S) endpoint (:8096, :8098) AND the legacy gRPC endpoint (:8788)
+# Sharing the exact same LightRAG index, memory cache, and Qdrant storage.
+#
+# BUILD ARCH: the production cluster nodes are linux/amd64. Building this image
+# on an Apple-silicon host without --platform produces an arm64 image that fails
+# with "exec /app/entrypoint.sh: exec format error" (CrashLoopBackOff). Always:
+#   docker build --platform linux/amd64 -f Dockerfile.combined -t <tag> .
+FROM ghcr.io/astral-sh/uv:0.5.9 AS uv
+
+FROM python:3.13-slim
+
+COPY --from=uv /uv /uvx /bin/
+
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md ./
+COPY hars_memory ./hars_memory
+COPY proto ./proto
+
+RUN uv sync --frozen --no-dev \
+    && useradd --create-home --uid 10001 hars-memory \
+    && mkdir -p /data/index /data/staging /data/hf /data/bm25_cache /data/flat_dense_cache /data/oauth \
+    && chown -R hars-memory:hars-memory /data
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    HARS_MEMORY_GRPC_HOST="0.0.0.0" \
+    HARS_MEMORY_GRPC_PORT="8788" \
+    HARS_MEMORY_MCP_HTTP_HOST="0.0.0.0" \
+    HARS_MEMORY_MCP_HTTP_PORT="8096" \
+    HARS_MEMORY_MCP_HTTP_PATH="/mcp" \
+    HARS_MEMORY_INDEX_DIR="/data/index" \
+    HARS_MEMORY_STAGING_DIR="/data/staging" \
+    HARS_MEMORY_OAUTH_STATE_FILE="/data/oauth/state.json" \
+    HARS_MEMORY_OAUTH_SIGNING_KEY_FILE="/data/oauth/signing.key" \
+    HF_HOME="/data/hf" \
+    TRANSFORMERS_CACHE="/data/hf"
+
+# Create start script to run both native MCP HTTP server and gRPC server concurrently
+RUN cat << 'SCRIPT' > /app/entrypoint.sh
+#!/bin/bash
+set -e
+
+echo "[hars-memory] Starting gRPC server on ${HARS_MEMORY_GRPC_HOST}:${HARS_MEMORY_GRPC_PORT} in background..."
+hars-longterm-memory-grpc &
+GRPC_PID=$!
+
+echo "[hars-memory] Starting Native MCP HTTP server on ${HARS_MEMORY_MCP_HTTP_HOST}:${HARS_MEMORY_MCP_HTTP_PORT}..."
+hars-longterm-memory-mcp-https &
+HTTP_PID=$!
+
+trap 'kill -TERM $GRPC_PID $HTTP_PID' SIGTERM SIGINT
+
+wait -n $GRPC_PID $HTTP_PID
+SCRIPT
+RUN chmod +x /app/entrypoint.sh
+
+USER hars-memory
+EXPOSE 8096 8098 8788
+VOLUME ["/data"]
+
+CMD ["/app/entrypoint.sh"]

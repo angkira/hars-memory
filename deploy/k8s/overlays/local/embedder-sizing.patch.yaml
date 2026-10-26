@@ -1,0 +1,18 @@
+# Embedder sizing for the LOCAL profile. Only valid together with
+# `components/embedder` (uncomment it in kustomization.yaml).
+#
+# One user, one or two parallel agent sessions: two slots are enough and leave
+# the rest of the laptop/desktop cores for the engine. Batch 2048 is still
+# worth it — it cut single-call latency from 76.5 ms to 26.8 ms on the
+# reference host (docs/http-mcp-scaling.md §2).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: embedder-config
+data:
+  EMBED_SLOTS: "2"
+  EMBED_THREADS: "4"
+  # 2 slots x 2048 ctx each.
+  EMBED_CTX: "4096"
+  EMBED_BATCH: "2048"
+  EMBED_UBATCH: "2048"

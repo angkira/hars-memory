@@ -1,0 +1,21 @@
+# Embedder sizing for the WORK profile. Only valid together with
+# `components/embedder` (uncomment it in kustomization.yaml).
+#
+# Measured guidance (docs/http-mcp-scaling.md §2, CPU-only 16-core host):
+#   * slots >= simultaneous recalls, but slots beyond ~4 only help when this pod
+#     has DEDICATED cores — it competes with the app's retrieval threads;
+#   * threads must stay <= the CPU limit and <= half the node's cores
+#     (-t 16 with 4 slots measured ~1 req/s vs 46 req/s at -t 4);
+#   * batch size is nearly free throughput: 512 -> 2048 cut single-call latency
+#     from 76.5 ms to 26.8 ms. Keep UBATCH <= CTX / SLOTS.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: embedder-config
+data:
+  EMBED_SLOTS: "4"
+  EMBED_THREADS: "4"
+  # 4 slots x 2048 ctx each: room for a 2048 physical batch in one slot.
+  EMBED_CTX: "8192"
+  EMBED_BATCH: "2048"
+  EMBED_UBATCH: "2048"

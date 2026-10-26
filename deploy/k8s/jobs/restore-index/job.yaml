@@ -1,0 +1,150 @@
+# Optional first-run Job: restore the LightRAG index snapshot into the PVC.
+#
+# Apply ONLY when the PVC is empty (fresh cluster / disaster recovery):
+#   kubectl -n hars-memory apply -k deploy/k8s/jobs/restore-index
+#   kubectl -n hars-memory wait --for=condition=complete job/hars-memory-restore-index --timeout=1h
+#   kubectl -n hars-memory logs job/hars-memory-restore-index
+#
+# The Job is idempotent: it writes /data/index/.restore-complete and exits 0
+# if that marker exists. Set FORCE_RESTORE=1 to overwrite an existing index
+# (stop the Deployment first -- the engine must not run during the restore).
+#
+# If the index uses Qdrant for vectors, restore the JSON side only here and
+# run the qdrant-transplant job next (or restore a Qdrant snapshot directly).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hars-memory-restore-index
+  namespace: hars-memory
+  labels:
+    app.kubernetes.io/name: hars-longterm-memory
+    app.kubernetes.io/component: restore-job
+    app.kubernetes.io/part-of: hars
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hars-longterm-memory
+        app.kubernetes.io/component: restore-job
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore
+          # Small, always-available image: only Python stdlib is needed.
+          image: python:3.13-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -c
+            - |
+              import hashlib
+              import os
+              import pathlib
+              import tarfile
+              import urllib.request
+
+              url = os.environ["SNAPSHOT_URL"]
+              dest = pathlib.Path("/data/index")
+              marker = dest / ".restore-complete"
+              if marker.exists() and os.environ.get("FORCE_RESTORE") != "1":
+                  print("index already restored; set FORCE_RESTORE=1 to overwrite")
+                  raise SystemExit(0)
+
+              dest.mkdir(parents=True, exist_ok=True)
+              if os.environ.get("CLEAN_TARGET", "1") == "1":
+                  # Default on: a first-run pod may already have created an
+                  # empty LightRAG store in this directory. Extracting over it
+                  # could leave stale sidecars, so clear the target first.
+                  for child in dest.iterdir():
+                      if child == marker:
+                          continue
+                      if child.is_dir():
+                          import shutil
+                          shutil.rmtree(child)
+                      else:
+                          child.unlink()
+                  print("cleared existing index contents", flush=True)
+
+              archive = pathlib.Path("/tmp/index-snapshot.tar.gz")
+              print(f"downloading {url}", flush=True)
+              with urllib.request.urlopen(url, timeout=600) as response, archive.open("wb") as out:
+                  while True:
+                      chunk = response.read(1 << 20)
+                      if not chunk:
+                          break
+                      out.write(chunk)
+
+              expected = os.environ.get("SNAPSHOT_SHA256", "").strip().lower()
+              if expected:
+                  digest = hashlib.sha256()
+                  with archive.open("rb") as handle:
+                      for chunk in iter(lambda: handle.read(1 << 20), b""):
+                          digest.update(chunk)
+                  actual = digest.hexdigest()
+                  if actual != expected:
+                      raise SystemExit(f"sha256 mismatch: got {actual}, expected {expected}")
+                  print("sha256 ok", flush=True)
+
+              print(f"extracting into {dest}", flush=True)
+              with tarfile.open(archive, "r:gz") as tar:
+                  tar.extractall(dest, filter="data")
+              marker.write_text("ok\n", encoding="utf-8")
+              print("restore complete", flush=True)
+          env:
+            - name: HOME
+              value: /tmp
+            - name: SNAPSHOT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hars-memory-restore
+                  key: snapshot-url
+            - name: SNAPSHOT_SHA256
+              valueFrom:
+                secretKeyRef:
+                  name: hars-memory-restore
+                  key: snapshot-sha256
+                  optional: true
+            - name: FORCE_RESTORE
+              value: "0"
+            # Clear /data/index before extracting. Keep "1" for a first-run
+            # restore into a PVC that a briefly-started engine already touched.
+            - name: CLEAN_TARGET
+              value: "1"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hars-memory-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 8Gi

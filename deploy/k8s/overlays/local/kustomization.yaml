@@ -1,0 +1,46 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# LOCAL / HOME PROFILE
+#
+#   kubectl apply -k deploy/k8s/overlays/local
+#
+# * no OAuth (the endpoint is unauthenticated -- keep it on the cluster
+#   network, a WireGuard/tailnet address, or a `kubectl port-forward`)
+# * no Ingress, no TLS: the Service is ClusterIP-only and the app speaks
+#   plain HTTP
+# * storage class: local-path (k3s/kind/Rancher default; override below)
+# * image from a local registry, imagePullPolicy IfNotPresent (base)
+# * single replica, smaller resource requests
+#
+# Expose it to your laptop or tailnet with:
+#   kubectl -n hars-memory port-forward svc/hars-memory-mcp 8099:8099
+#   # or apply the optional NodePort patch below
+#
+# The four knobs: REGISTRY (images below), STORAGE CLASS (pvc patch),
+# OAuth (configmap patch, permanently off here), TLS/Ingress (absent).
+
+namespace: hars-memory
+resources:
+  - ../../base
+
+images:
+  - name: hars-longterm-memory
+    newName: registry.local/hars-longterm-memory
+    newTag: "0.8.1"
+
+# OPTIONAL in-cluster embedder. With one user, an external embedder is often
+# simpler; enable this to run llama-server next to the app (see README,
+# "Embedder sizing").
+# components:
+#   - ../../components/embedder
+
+patches:
+  - path: configmap.patch.yaml
+  - path: pvc.patch.yaml
+  - path: deployment-resources.patch.yaml
+  # Optional: publish on a node port for a home LAN / WireGuard interface.
+  # - path: service-nodeport.patch.yaml
+  # Embedder component only (uncomment the component below, then these):
+  # - path: embedder-sizing.patch.yaml
+  # - path: embedder-storageclass.patch.yaml

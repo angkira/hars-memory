@@ -1,0 +1,16 @@
+[Unit]
+Description=HARS memory — read-only cosmos index export (/stats /graph /coords)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/angkira/Project/software/hars-longterm-memory
+Environment=HARS_MEMORY_INDEX_DIR=/home/angkira/.local/share/hars-graphrag/index_compact_20260903_imported
+Environment=HARS_TRACE_HOST=127.0.0.1
+Environment=HARS_TRACE_PORT=8097
+ExecStart=/home/angkira/Project/software/hars-longterm-memory/.venv/bin/python /home/angkira/.local/bin/hars-trace-cosmos
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

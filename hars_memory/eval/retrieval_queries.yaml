@@ -1,0 +1,77 @@
+# Retrieval-metrics gold query set for tools/memory/eval/ab_bench.py.
+#
+# SYNTHETIC SAMPLE (since 0.7.1): the 46-query gold set that previously lived
+# here contained real research questions and internal experiment identifiers,
+# so it no longer ships with the package. It is archived operator-locally in
+# the gitignored eval data dir (eval_agentic-data/gold_sets/) — point
+# ab_bench.py / corpus_eval.py at that file via their queries-file argument
+# when evaluating the local index. The queries below are PLACEHOLDERS that
+# demonstrate the schema only; their gold_docs reference synthetic basenames
+# that will not exist in any real index (the eval harness's zero-match guard
+# will flag that, by design).
+#
+# NOT the same thing as gold_questions.yaml (answer-synthesis multi-hop
+# questions, graded by keyword-presence in an LLM-generated answer) or
+# battle.py's auto-generated "does this source text turn up somewhere in the
+# response" cases. Neither of those can answer "did retrieval rank the right
+# DOCUMENT highly" independent of the LLM that synthesises the final answer.
+#
+# This file grades RETRIEVAL ONLY: for each question, the gold answer is a
+# set of documents (by `file_path`, the identifier LightRAG/BM25/reranker all
+# already return per-hit). `gold_chunks` records the exact chunk `_id` the
+# claim was read from, for human traceability only — scoring is doc-level
+# (see ab_bench.py / metrics.py docstrings for why: chunk boundaries are a
+# chunking-parameter artifact, robustness to re-chunking matters more than
+# chunk-exactness for "did we find the right document" grading, which is the
+# question this MCP server's callers actually have).
+
+meta:
+  index_working_dir: <set HARS_MEMORY_INDEX_DIR to the live index>
+  index_snapshot_note: >
+    Synthetic sample — no real index snapshot. Replace with a real gold set
+    before measuring anything.
+  scoring_unit: document (file_path) — see module docstring above
+  query_types:
+    identifier: "Exact-code/ID lookup (EXAMPLE-ID-1, example_config_key, hyp:<uuid>, ...)."
+    conceptual: "Thematic/summary question, no single verbatim identifier required."
+    supersession: >
+      Both an outdated and a superseding document match topically; the
+      correct answer requires the newer/correcting document. `correct_docs`
+      must not be outranked by `superseded_docs` — see metrics.py
+      supersession_violated().
+    multihop: "Requires synthesizing >=2 distinct documents to fully answer."
+    no_answer: >
+      No document in the target corpus answers the question (verified
+      absent by direct search, not merely 'I didn't happen to notice it').
+      gold_docs is intentionally empty; see the no_answer_hit_rate metric.
+
+queries:
+  - id: sq1
+    type: identifier
+    question: "What is the final status of the EXAMPLE-ID-1 rollout?"
+    ll_keywords: ["EXAMPLE-ID-1"]
+    gold_docs: ["demo_rollout_report.md"]
+    gold_chunks: ["demo_rollout_report:chunk-01"]
+
+  - id: sq2
+    type: conceptual
+    question: "How is the retry/backoff policy for the demo ingestion pipeline configured?"
+    hl_keywords: ["retry policy", "backoff"]
+    gold_docs: ["demo_ingestion_design.md"]
+
+  - id: sq3
+    type: supersession
+    question: "What is the current location of the demo dataset cache?"
+    correct_docs: ["demo_cache_layout_v2.md"]
+    superseded_docs: ["demo_cache_layout_v1.md"]
+    gold_docs: ["demo_cache_layout_v2.md"]
+
+  - id: sq4
+    type: multihop
+    question: "Which component consumes the demo queue, and where is that component's failure playbook?"
+    gold_docs: ["demo_queue_design.md", "demo_failure_playbook.md"]
+
+  - id: sq5
+    type: no_answer
+    question: "What was the outcome of the EXAMPLE-ID-2 hardware recall program?"
+    gold_docs: []

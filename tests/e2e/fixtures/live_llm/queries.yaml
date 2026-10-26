@@ -1,0 +1,13 @@
+queries:
+  - id: owner
+    type: conceptual
+    question: Who owns Aurora Relay and what is its routing code?
+    gold_docs: [aurora.md]
+  - id: migration
+    type: multihop
+    question: Which decision moved Aurora Relay telemetry to Borealis Store and why?
+    gold_docs: [borealis.md]
+  - id: checksum
+    type: identifier
+    question: Where is ZEPHYR-17 documented?
+    gold_docs: [aurora.md]

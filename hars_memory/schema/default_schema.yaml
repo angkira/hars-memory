@@ -1,0 +1,19 @@
+entity_types:
+  - Concept
+  - Document
+  - Decision
+  - Event
+  - Person
+  - Tool
+  - Task
+relation_types:
+  - relates_to
+  - produces
+  - depends_on
+  - supersedes
+  - documented_in
+guidance: |
+  Extract entities and relations from the text using only the types listed
+  above. Prefer the most specific applicable type. Use exact names as they
+  appear in the source text — do not invent abbreviations or paraphrase
+  proper nouns.

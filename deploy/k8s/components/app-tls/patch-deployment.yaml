@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hars-memory-mcp
+spec:
+  template:
+    spec:
+      containers:
+        - name: mcp
+          env:
+            - name: HARS_MEMORY_MCP_TLS_CERTFILE
+              value: /etc/hars-memory/tls/tls.crt
+            - name: HARS_MEMORY_MCP_TLS_KEYFILE
+              value: /etc/hars-memory/tls/tls.key
+            - name: HARS_MEMORY_MCP_TLS_MIN_VERSION
+              value: TLSv1.2
+          # Probes must speak HTTPS once the listener is TLS.
+          startupProbe:
+            httpGet:
+              scheme: HTTPS
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+          volumeMounts:
+            - name: app-tls
+              mountPath: /etc/hars-memory/tls
+              readOnly: true
+      volumes:
+        - name: app-tls
+          secret:
+            secretName: hars-memory-mcp-tls
+            defaultMode: 0440

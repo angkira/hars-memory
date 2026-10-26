@@ -1,0 +1,99 @@
+# Gold multi-hop evaluation questions for HARS long-term memory.
+# Each question requires traversing >=2 hops across DB + prose sources.
+# Run check.py after indexing to assert correct source-node retrieval.
+#
+# SYNTHETIC SAMPLE (since 0.7.1): the previous set contained real research
+# questions and internal experiment identifiers, so it no longer ships. The
+# original is archived operator-locally in the gitignored eval data dir
+# (eval_agentic-data/gold_sets/). The questions below are placeholders that
+# demonstrate the schema; adapt them (or restore the archive) before grading
+# a real index.
+
+questions:
+  - id: gq1
+    question: >
+      Which design decisions were superseded by the demo platform rewrite, and
+      which component inherited the deprecated queue?
+    hops: 3
+    hop_chain: "Decision -> Report/Finding -> Component -> Metric"
+    expected_entities:
+      - type: Decision
+        id_prefix: "dec:"
+      - type: Component
+      - type: Metric
+    expected_relations:
+      - supersedes
+      - produces
+      - deprecated_by
+    notes: >
+      Placeholder question: expects a Decision -> Component -> Metric chain in
+      the target corpus.
+
+  - id: gq2
+    question: >
+      What did we conclude about the demo ingest backpressure incidents, and
+      what was the fix?
+    hops: 2
+    hop_chain: "Finding -> Report -> Component"
+    expected_entities:
+      - type: Finding
+        keywords: ["backpressure", "queue depth"]
+      - type: Component
+        keywords: ["ingest", "queue"]
+    expected_relations:
+      - documented_in
+      - depends_on
+    notes: >
+      Placeholder: expects a Finding -> Report -> Component chain.
+
+  - id: gq3
+    question: >
+      Which encoder or embedding-model choices outperformed others and in
+      which experiment?
+    hops: 2
+    hop_chain: "Model/Backbone -> Experiment -> Metric"
+    expected_entities:
+      - type: Model/Backbone
+        keywords: ["embedder-a", "embedder-b"]
+      - type: Experiment
+      - type: Metric
+    expected_relations:
+      - outperforms
+      - evaluated_on
+    notes: >
+      Placeholder: generic model-comparison chain.
+
+  - id: gq4
+    question: >
+      What is the demo pipeline's phase A to C structure and how does each
+      phase relate to the next?
+    hops: 3
+    hop_chain: "Pipeline/Phase A -> Pipeline/Phase B -> Pipeline/Phase C -> Checkpoint"
+    expected_entities:
+      - type: Pipeline/Phase
+        keywords: ["Phase A", "Phase B", "Phase C"]
+    expected_relations:
+      - derived_from
+      - produces
+      - supersedes
+    notes: >
+      Placeholder: generic phased-pipeline chain.
+
+  - id: gq5
+    question: >
+      Which eval templates were used for the demo benchmark and what scores
+      did the top hypotheses achieve?
+    hops: 2
+    hop_chain: "Experiment -> Hypothesis -> Metric/Score"
+    expected_entities:
+      - type: Experiment
+        keywords: ["eval", "benchmark"]
+      - type: Hypothesis
+      - type: Metric
+        keywords: ["F1", "BERTScore"]
+    expected_relations:
+      - evaluated_on
+      - confirms
+      - tests
+    notes: >
+      Placeholder: generic experiment -> hypothesis -> metric chain.

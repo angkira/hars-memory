@@ -1,0 +1,13 @@
+# Training artifacts are never committed: adapters, checkpoints, prepared data
+# and logs all derive from confidential research material.
+outputs/
+.venv/
+__pycache__/
+*.gguf
+*.safetensors
+*.pt
+*.log
+
+# confidential SFT splits: never commit
+training/extract_4b/data/
+training/outputs/

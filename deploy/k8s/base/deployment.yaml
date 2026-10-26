@@ -1,0 +1,202 @@
+# Single-writer MCP engine.
+#
+# Why replicas: 1 + strategy: Recreate
+#   * the LightRAG index is one directory (GraphML + KV + vector workspace)
+#     that the process opens read/write and caches in memory; two processes
+#     sharing it over a RWO volume would corrupt it;
+#   * OAuth state (clients, refresh tokens, revocations) is also single-writer
+#     (one JSON state file: clients, refresh tokens, revocations);
+#   * the deployment owns the PVC, so Recreate guarantees the old pod has
+#     released the volume before the new one starts.
+# Horizontal scale-out is NOT `replicas: 2`. See README.md ("Scaling"): it
+# requires shared Qdrant for vectors plus a shared OAuth store and an external
+# scheduler that keeps exactly one writer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hars-memory-mcp
+  labels:
+    app.kubernetes.io/name: hars-longterm-memory
+    app.kubernetes.io/instance: hars-memory
+    app.kubernetes.io/component: mcp-server
+    app.kubernetes.io/part-of: hars
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hars-longterm-memory
+      app.kubernetes.io/instance: hars-memory
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hars-longterm-memory
+        app.kubernetes.io/instance: hars-memory
+        app.kubernetes.io/component: mcp-server
+        app.kubernetes.io/part-of: hars
+      annotations:
+        # Bump to force a rollout when only the ConfigMap changed and the
+        # deployment envFrom does not pick it up automatically.
+        configmap.reloader.stakater.com/reload: "hars-memory-config"
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # The PVC root is provisioned empty. Create the writable layout once
+        # (the app also creates missing dirs, but doing it here keeps a
+        # read-only root filesystem viable and surfaces volume problems early).
+        - name: prepare-data
+          image: hars-longterm-memory:0.8.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - >-
+              mkdir -p /data/index /data/staging /data/oauth
+              /data/cache/bm25 /data/cache/flat /data/cache/tiktoken
+              /data/cache/hf /data/cache/query-events
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: mcp
+          image: hars-longterm-memory:0.8.1
+          imagePullPolicy: IfNotPresent
+          command:
+            - hars-longterm-memory-mcp-https
+          ports:
+            - name: mcp
+              containerPort: 8099
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: hars-memory-config
+          env:
+            - name: HOME
+              value: /tmp
+            - name: XDG_CACHE_HOME
+              value: /tmp/.cache
+            - name: TMPDIR
+              value: /tmp
+            # Browser consent credential (optional if approval-token is set).
+            - name: HARS_MEMORY_MCP_OAUTH_AUTHORIZE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: hars-memory-oauth
+                  key: authorize-password
+                  optional: true
+            # Headless consent credential (optional if the password is set).
+            - name: HARS_MEMORY_MCP_OAUTH_APPROVAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hars-memory-oauth
+                  key: approval-token
+                  optional: true
+            # Optional: only when the external Qdrant requires auth.
+            - name: HARS_MEMORY_QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hars-memory-qdrant
+                  key: api-key
+                  optional: true
+          # /healthz answers as soon as the socket is bound, so the STARTUP
+          # probe only proves the process is alive. It is deliberately
+          # generous: the first index load takes 17-21 s and blocks the loop,
+          # which makes probe requests time out while warming.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36 # up to 3 minutes before the pod is killed
+            successThreshold: 1
+          # Readiness on /healthz after a delay that covers the measured
+          # warm-up. While the index loads, the event loop is busy and the
+          # probe times out, so the pod stays out of the Service until it can
+          # actually answer tool calls.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: mcp
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          lifecycle:
+            preStop:
+              # Give kube-proxy/ingress time to remove the endpoint before the
+              # process closes its listener; keeps SSE/streamable clients from
+              # seeing a reset.
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep 5
+          resources:
+            # Measured steady state: ~1.5 GB RSS for the 1.8 GB index plus
+            # runtimes; 6 GiB leaves headroom for a warm-up spike and a
+            # concurrent write path.
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 6Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hars-memory-data
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi

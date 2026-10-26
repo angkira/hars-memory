@@ -1,0 +1,104 @@
+# Optional migration Job: copy LightRAG's NanoVectorDB JSON vectors into
+# Qdrant (zero re-embedding). Run it once when moving an existing file-based
+# index onto the external Qdrant configured in configmap.yaml.
+#
+#   1. Stop the Deployment (single writer!):
+#        kubectl -n hars-memory scale deploy/hars-memory-mcp --replicas=0
+#   2. Make sure the PVC already holds the index (the restore-index job).
+#   3. Run this Job, then scale back to 1.
+#
+#   kubectl -n hars-memory apply -k deploy/k8s/jobs/qdrant-transplant
+#   kubectl -n hars-memory logs job/hars-memory-qdrant-transplant
+#
+# Reverse (Qdrant -> JSON, the rollback path) is documented in README.md;
+# add `--reverse` to args and point --working-dir at a scratch subdirectory.
+#
+# --no-collection-prefix targets the plain lightrag_vdb_{chunks,entities,
+# relationships} names that lightrag 1.5.7 creates at runtime. Drop that flag
+# and use --collection-prefix only for a fresh multi-tenant layout.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hars-memory-qdrant-transplant
+  namespace: hars-memory
+  labels:
+    app.kubernetes.io/name: hars-longterm-memory
+    app.kubernetes.io/component: migration-job
+    app.kubernetes.io/part-of: hars
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hars-longterm-memory
+        app.kubernetes.io/component: migration-job
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: transplant
+          image: hars-longterm-memory:0.8.1
+          imagePullPolicy: IfNotPresent
+          # Replace the image ENTRYPOINT (the MCP server) with the migration
+          # module. The app image already contains hars_memory.
+          command:
+            - python
+            - -m
+            - hars_memory.scripts.qdrant_transplant
+          args:
+            - --working-dir
+            - /data/index
+            - --no-collection-prefix
+            - --namespace
+            - all
+            - --batch-size
+            - "500"
+            - --verify-samples
+            - "200"
+          envFrom:
+            - configMapRef:
+                name: hars-memory-config
+          env:
+            - name: HOME
+              value: /tmp
+            - name: HARS_MEMORY_QDRANT_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hars-memory-qdrant
+                  key: api-key
+                  optional: true
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hars-memory-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

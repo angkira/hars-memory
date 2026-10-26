@@ -1,0 +1,18 @@
+# Holds the GGUF model(s). ~320 MB for embeddinggemma-300M Q8_0; 5 GiB leaves
+# room for a second model or a reranker. ReadWriteOnce because the embedder is
+# a single replica; set storageClassName in the overlay alongside the other
+# PVCs if the default class is not the right one.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: embedder-models
+  labels:
+    app.kubernetes.io/name: hars-embedder
+    app.kubernetes.io/component: embedder
+    app.kubernetes.io/part-of: hars
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi

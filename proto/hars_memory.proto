@@ -1,0 +1,295 @@
+syntax = "proto3";
+
+package hars_memory;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/empty.proto";
+
+service LongTermMemory {
+  // Query the knowledge graph (equivalent to memory_recall MCP tool)
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Index health (equivalent to memory_status MCP tool)
+  rpc Status(google.protobuf.Empty) returns (StatusResponse);
+
+  // Save a note into staging (equivalent to memory_remember MCP tool)
+  rpc Remember(RememberRequest) returns (RememberResponse);
+
+  // Retrieve one catalogued memory by id or exact title.
+  rpc GetMemory(GetMemoryRequest) returns (GetMemoryResponse);
+
+  // List catalogued memories with optional filters.
+  rpc ListMemories(ListMemoriesRequest) returns (ListMemoriesResponse);
+
+  // Update one catalogued memory and reindex it when necessary.
+  rpc UpdateMemory(UpdateMemoryRequest) returns (UpdateMemoryResponse);
+
+  // Delete one catalogued memory, retaining a tombstone.
+  rpc DeleteMemory(DeleteMemoryRequest) returns (DeleteMemoryResponse);
+
+  // Search entities by name (equivalent to memory_entities MCP tool)
+  rpc SearchEntities(EntitiesRequest) returns (EntitiesResponse);
+
+  // N-hop subgraph traversal from an entity (equivalent to memory_related MCP tool)
+  rpc RelatedEntities(RelatedRequest) returns (RelatedResponse);
+
+  // Trigger incremental reindex (equivalent to memory_consolidate MCP tool)
+  rpc Consolidate(ConsolidateRequest) returns (ConsolidateResponse);
+
+  // Purge stale documents (equivalent to memory_forget MCP tool)
+  rpc Forget(ForgetRequest) returns (ForgetResponse);
+}
+
+// --------------------------------------------------------------------------
+// Query (memory_recall)
+// --------------------------------------------------------------------------
+
+message QueryRequest {
+  string question = 1;
+  string mode = 2;              // local|global|hybrid|naive (default: "hybrid")
+  int32 top_k = 3;              // default: 20, range 1-50
+  optional int32 fetch_top_k = 4; // fetch width, must be >= top_k
+  repeated string ll_keywords = 5;   // low-level keywords (entities, codes)
+  repeated string hl_keywords = 6;   // high-level keywords (themes, concepts)
+  optional bool context_only = 7;        // default: true — return context without LLM answer
+  string context_priority = 8;  // "merged" or "lightrag" (default: "merged")
+  optional bool debug = 9;               // default: false — include debug data
+}
+
+message QueryResponse {
+  bool ok = 1;
+  optional string context = 2;     // retrieved context when context_only=true
+  optional string answer = 3;      // LLM-generated answer when context_only=false
+  string mode = 4;                 // requested mode
+  string lightrag_mode = 5;        // actual LightRAG mode used
+  optional string mode_fallback = 6; // explanation if mode was overridden
+  int32 top_k = 7;
+  int32 fetch_top_k = 8;
+  string question = 9;
+  string context_priority_applied = 10;
+  optional string error = 11;
+  optional string last_ingest = 12;
+  optional int32 stale_days = 13;
+  optional string staleness_warning = 14;
+  google.protobuf.Struct hybrid = 15;        // hybrid fusion block
+  repeated string entities_used = 16;
+  repeated Citation citations = 17;
+  optional google.protobuf.Struct debug_info = 18; // only when debug=true
+}
+
+message Citation {
+  string node_id = 1;
+  string source_path = 2;
+  string snippet = 3;
+  double score = 4;
+  string section = 5;            // breadcrumb heading chain
+}
+
+// --------------------------------------------------------------------------
+// Status (memory_status)
+// --------------------------------------------------------------------------
+
+message StatusResponse {
+  bool ok = 1;
+  google.protobuf.Struct data = 2; // full _index_status() dict
+}
+
+// --------------------------------------------------------------------------
+// Remember (memory_remember)
+// --------------------------------------------------------------------------
+
+message RememberRequest {
+  string title = 1;
+  string content = 2;
+  string importance = 3;  // "critical"|"normal"|"low" (default: "normal")
+  repeated string tags = 4;
+}
+
+message RememberResponse {
+  bool ok = 1;
+  string saved = 2;          // path to saved file
+  int32 pending_notes = 3;   // count in staging directory
+  string note = 4;           // human-readable message
+  optional string error = 5;
+  string memory_id = 6;
+}
+
+message MemoryRecord {
+  string memory_id = 1;
+  string title = 2;
+  string content = 3;
+  string importance = 4;
+  repeated string tags = 5;
+  string source_path = 6;
+  string doc_id = 7;
+  string status = 8;
+  string created_at = 9;
+  string updated_at = 10;
+}
+
+message GetMemoryRequest {
+  optional string memory_id = 1;
+  optional string title = 2;
+}
+
+message GetMemoryResponse {
+  bool ok = 1;
+  MemoryRecord memory = 2;
+  optional string error = 3;
+}
+
+message ListMemoriesRequest {
+  int32 limit = 1;
+  optional string before = 2;
+  optional string importance = 3;
+  optional string tag = 4;
+  bool include_deleted = 5;
+}
+
+message ListMemoriesResponse {
+  bool ok = 1;
+  repeated MemoryRecord memories = 2;
+  int32 total = 3;
+  optional string error = 4;
+}
+
+message UpdateMemoryRequest {
+  optional string memory_id = 1;
+  optional string title = 2;
+  optional string content = 3;
+  optional string new_title = 4;
+  optional string importance = 5;
+  repeated string tags = 6;
+  bool has_tags = 7;
+}
+
+message UpdateMemoryResponse {
+  bool ok = 1;
+  MemoryRecord memory = 2;
+  bool reindexed = 3;
+  optional string error = 4;
+}
+
+message DeleteMemoryRequest {
+  optional string memory_id = 1;
+  optional string title = 2;
+  bool confirm = 3;
+}
+
+message DeleteMemoryResponse {
+  bool ok = 1;
+  bool deleted = 2;
+  string memory_id = 3;
+  optional string error = 4;
+}
+
+// --------------------------------------------------------------------------
+// SearchEntities (memory_entities)
+// --------------------------------------------------------------------------
+
+message EntitiesRequest {
+  string name = 1;
+  int32 limit = 2;  // default: 10, range 1-50
+}
+
+message EntitiesResponse {
+  bool ok = 1;
+  string query = 2;
+  repeated EntityResult results = 3;
+  int32 count = 4;
+  optional string error = 5;
+}
+
+message EntityResult {
+  string id = 1;
+  string description = 2;
+  string entity_type = 3;
+  string match_tier = 4;
+  repeated Neighbor neighbors = 5;
+}
+
+message Neighbor {
+  string id = 1;
+  string relation = 2;
+}
+
+// --------------------------------------------------------------------------
+// RelatedEntities (memory_related)
+// --------------------------------------------------------------------------
+
+message RelatedRequest {
+  string entity_id = 1;
+  int32 hops = 2;  // default: 1, max: 1
+}
+
+message RelatedResponse {
+  bool ok = 1;
+  repeated Node nodes = 2;
+  repeated Edge edges = 3;
+  bool truncated = 4;
+  int32 dropped_nodes = 5;
+  int32 dropped_edges = 6;
+  optional string error = 7;
+}
+
+message Node {
+  string id = 1;
+  string label = 2;
+  string type = 3;
+}
+
+message Edge {
+  string source = 1;
+  string target = 2;
+  string label = 3;
+}
+
+// --------------------------------------------------------------------------
+// Consolidate (memory_consolidate)
+// --------------------------------------------------------------------------
+
+message ConsolidateRequest {
+  repeated string paths = 1;  // default: [".plans", "docs"]
+  bool dry_run = 2;           // default: true
+}
+
+message ConsolidateResponse {
+  bool ok = 1;
+  int32 returncode = 2;
+  string stdout = 3;
+  string stderr = 4;
+  bool dry_run = 5;
+  optional string error = 6;
+}
+
+// --------------------------------------------------------------------------
+// Forget (memory_forget)
+// --------------------------------------------------------------------------
+
+message ForgetRequest {
+  optional string before = 1;           // ISO date (YYYY-MM-DD)
+  optional int32 older_than_days = 2;   // mutually exclusive with before
+  repeated string protect = 3;          // regex patterns to protect
+  repeated string sections = 4;         // section headers to consider
+  bool apply = 5;                       // default: false (dry-run only)
+  bool confirm_unprotected = 6;         // default: false
+}
+
+message ForgetResponse {
+  bool ok = 1;
+  bool applied = 2;
+  bool dry_run = 3;
+  repeated Candidate candidates = 4;
+  int32 total_candidates = 5;
+  int32 total_protected = 6;
+  int32 total_deleted = 7;
+  optional string error = 8;
+}
+
+message Candidate {
+  string doc_id = 1;
+  string date = 2;
+  string section = 3;
+  bool protected = 4;
+  bool deleted = 5;
+}

@@ -1,0 +1,2318 @@
+{
+ "calls": 1053,
+ "in": 1037619,
+ "out": 202846,
+ "usd": 0.205185,
+ "by_tag": {
+  "gen:kubernetes-packages.md:0": {
+   "calls": 1,
+   "in": 939,
+   "out": 668,
+   "usd": 0.000428
+  },
+  "gen:readme.md:0": {
+   "calls": 4,
+   "in": 4978,
+   "out": 2504,
+   "usd": 0.00175
+  },
+  "gen:pod-pid-limit-fork-rejected.md:0": {
+   "calls": 1,
+   "in": 2585,
+   "out": 823,
+   "usd": 0.00067
+  },
+  "gen:ksm-cronjob-timezone-outdated.md:0": {
+   "calls": 1,
+   "in": 1520,
+   "out": 928,
+   "usd": 0.000616
+  },
+  "gen:internal-ingress-custom-domain-cert-fails.md:0": {
+   "calls": 1,
+   "in": 1338,
+   "out": 1002,
+   "usd": 0.000635
+  },
+  "gen:python.md:0": {
+   "calls": 1,
+   "in": 1107,
+   "out": 572,
+   "usd": 0.000397
+  },
+  "gen:shared-postgres.md:0": {
+   "calls": 1,
+   "in": 2321,
+   "out": 1185,
+   "usd": 0.000825
+  },
+  "gen:verify-health.md:0": {
+   "calls": 1,
+   "in": 1886,
+   "out": 1023,
+   "usd": 0.0007
+  },
+  "gen:pod-pid-limit-fork-rejected.md:1": {
+   "calls": 1,
+   "in": 2585,
+   "out": 796,
+   "usd": 0.000656
+  },
+  "gen:rotate-gke-credentials.md:0": {
+   "calls": 1,
+   "in": 1365,
+   "out": 1042,
+   "usd": 0.000657
+  },
+  "gen:python.md:1": {
+   "calls": 1,
+   "in": 1107,
+   "out": 682,
+   "usd": 0.000452
+  },
+  "gen:namespace-quickstart.md:0": {
+   "calls": 1,
+   "in": 1562,
+   "out": 534,
+   "usd": 0.000423
+  },
+  "gen:index.md:0": {
+   "calls": 2,
+   "in": 1660,
+   "out": 1151,
+   "usd": 0.000741
+  },
+  "gen:build-base-image-automatically.md:0": {
+   "calls": 1,
+   "in": 1264,
+   "out": 693,
+   "usd": 0.000473
+  },
+  "gen:verify-health.md:1": {
+   "calls": 1,
+   "in": 1886,
+   "out": 659,
+   "usd": 0.000518
+  },
+  "gen:google-group-sync-fails.md:0": {
+   "calls": 1,
+   "in": 749,
+   "out": 564,
+   "usd": 0.000357
+  },
+  "gen:rotate-gke-credentials.md:1": {
+   "calls": 1,
+   "in": 1365,
+   "out": 1104,
+   "usd": 0.000688
+  },
+  "gen:build-base-image-automatically.md:1": {
+   "calls": 1,
+   "in": 1264,
+   "out": 867,
+   "usd": 0.00056
+  },
+  "gen:python.md:2": {
+   "calls": 1,
+   "in": 1107,
+   "out": 743,
+   "usd": 0.000482
+  },
+  "gen:githubconnection-reference.md:0": {
+   "calls": 1,
+   "in": 3293,
+   "out": 1235,
+   "usd": 0.000947
+  },
+  "gen:google-group-sync-fails.md:1": {
+   "calls": 1,
+   "in": 749,
+   "out": 827,
+   "usd": 0.000488
+  },
+  "gen:verify-health.md:2": {
+   "calls": 1,
+   "in": 1886,
+   "out": 789,
+   "usd": 0.000583
+  },
+  "gen:rotate-gke-credentials.md:2": {
+   "calls": 1,
+   "in": 1365,
+   "out": 769,
+   "usd": 0.000521
+  },
+  "gen:build-base-image-automatically.md:2": {
+   "calls": 1,
+   "in": 1264,
+   "out": 728,
+   "usd": 0.00049
+  },
+  "gen:force-reindex.md:0": {
+   "calls": 1,
+   "in": 918,
+   "out": 683,
+   "usd": 0.000433
+  },
+  "gen:teamcity-no-edit-permissions-generated-project.md:0": {
+   "calls": 1,
+   "in": 906,
+   "out": 613,
+   "usd": 0.000397
+  },
+  "gen:google-group-sync-fails.md:2": {
+   "calls": 1,
+   "in": 749,
+   "out": 627,
+   "usd": 0.000388
+  },
+  "gen:configuring-s3-bucket-policy.md:0": {
+   "calls": 1,
+   "in": 2241,
+   "out": 824,
+   "usd": 0.000636
+  },
+  "gen:githubconnection-reference.md:1": {
+   "calls": 1,
+   "in": 3293,
+   "out": 1603,
+   "usd": 0.001131
+  },
+  "gen:force-reindex.md:1": {
+   "calls": 1,
+   "in": 918,
+   "out": 771,
+   "usd": 0.000477
+  },
+  "gen:space-registry-unauthorized-push.md:0": {
+   "calls": 1,
+   "in": 1044,
+   "out": 1210,
+   "usd": 0.000709
+  },
+  "gen:sre-communication-guidelines.md:0": {
+   "calls": 1,
+   "in": 1944,
+   "out": 664,
+   "usd": 0.000526
+  },
+  "gen:kafkauser-credentials-not-working.md:0": {
+   "calls": 1,
+   "in": 2050,
+   "out": 779,
+   "usd": 0.000594
+  },
+  "gen:authoring-and-support.md:0": {
+   "calls": 1,
+   "in": 2072,
+   "out": 530,
+   "usd": 0.000472
+  },
+  "gen:force-reindex.md:2": {
+   "calls": 1,
+   "in": 918,
+   "out": 475,
+   "usd": 0.000329
+  },
+  "gen:configuring-s3-bucket-policy.md:1": {
+   "calls": 1,
+   "in": 2241,
+   "out": 942,
+   "usd": 0.000695
+  },
+  "gen:space-registry-unauthorized-push.md:1": {
+   "calls": 1,
+   "in": 1044,
+   "out": 715,
+   "usd": 0.000462
+  },
+  "gen:kafkauser-aws-sm-junk-secrets.md:0": {
+   "calls": 1,
+   "in": 1215,
+   "out": 882,
+   "usd": 0.000562
+  },
+  "gen:memcached-read-buffer-cache-exceeds-container-limit.md:0": {
+   "calls": 1,
+   "in": 2964,
+   "out": 1265,
+   "usd": 0.000929
+  },
+  "gen:kafkauser-credentials-not-working.md:1": {
+   "calls": 1,
+   "in": 2050,
+   "out": 827,
+   "usd": 0.000619
+  },
+  "gen:planning-v1-5.md:0": {
+   "calls": 1,
+   "in": 1786,
+   "out": 668,
+   "usd": 0.000513
+  },
+  "gen:configuring-cors-for-gcs-bucket.md:0": {
+   "calls": 1,
+   "in": 1208,
+   "out": 638,
+   "usd": 0.00044
+  },
+  "gen:kafkauser-aws-sm-junk-secrets.md:1": {
+   "calls": 1,
+   "in": 1215,
+   "out": 718,
+   "usd": 0.000481
+  },
+  "gen:how-to-remove-teamcity-integration.md:0": {
+   "calls": 1,
+   "in": 2124,
+   "out": 1247,
+   "usd": 0.000836
+  },
+  "gen:kafkauser-credentials-not-working.md:2": {
+   "calls": 1,
+   "in": 2050,
+   "out": 631,
+   "usd": 0.000521
+  },
+  "gen:configuring-s3-bucket-policy.md:2": {
+   "calls": 1,
+   "in": 2241,
+   "out": 1340,
+   "usd": 0.000894
+  },
+  "gen:request-timeouts-in-spring-boot-with-nginx-ingress.md:0": {
+   "calls": 1,
+   "in": 1334,
+   "out": 770,
+   "usd": 0.000518
+  },
+  "gen:gpg-import-fails-on-arc-runner.md:0": {
+   "calls": 1,
+   "in": 1251,
+   "out": 587,
+   "usd": 0.000419
+  },
+  "gen:add-iceberg-aws-glue-catalog.md:0": {
+   "calls": 1,
+   "in": 1249,
+   "out": 1090,
+   "usd": 0.00067
+  },
+  "gen:request-timeouts-in-spring-boot-with-nginx-ingress.md:1": {
+   "calls": 1,
+   "in": 1334,
+   "out": 591,
+   "usd": 0.000429
+  },
+  "gen:you-dont-have-access.md:0": {
+   "calls": 1,
+   "in": 1194,
+   "out": 796,
+   "usd": 0.000517
+  },
+  "gen:how-to-remove-teamcity-integration.md:1": {
+   "calls": 1,
+   "in": 2124,
+   "out": 1178,
+   "usd": 0.000801
+  },
+  "gen:autoscaler-max-size-gcp-quota.md:0": {
+   "calls": 1,
+   "in": 2203,
+   "out": 986,
+   "usd": 0.000713
+  },
+  "gen:repo-server-evicted-ephemeral-storage.md:0": {
+   "calls": 1,
+   "in": 2079,
+   "out": 814,
+   "usd": 0.000615
+  },
+  "gen:how-to-use-notebooks.md:0": {
+   "calls": 1,
+   "in": 1186,
+   "out": 611,
+   "usd": 0.000424
+  },
+  "gen:request-timeouts-in-spring-boot-with-nginx-ingress.md:2": {
+   "calls": 1,
+   "in": 1334,
+   "out": 595,
+   "usd": 0.000431
+  },
+  "gen:how-to-remove-teamcity-integration.md:2": {
+   "calls": 1,
+   "in": 2124,
+   "out": 746,
+   "usd": 0.000585
+  },
+  "gen:self-host-grafana-in-namespace.md:0": {
+   "calls": 1,
+   "in": 2697,
+   "out": 781,
+   "usd": 0.00066
+  },
+  "gen:you-dont-have-access.md:1": {
+   "calls": 1,
+   "in": 1194,
+   "out": 1234,
+   "usd": 0.000736
+  },
+  "gen:repo-server-evicted-ephemeral-storage.md:1": {
+   "calls": 1,
+   "in": 2079,
+   "out": 763,
+   "usd": 0.000589
+  },
+  "gen:migrate-ingress-across-clusters.md:0": {
+   "calls": 1,
+   "in": 1642,
+   "out": 1251,
+   "usd": 0.00079
+  },
+  "gen:github-deployment-setup-internal-sre-team-guide.md:0": {
+   "calls": 1,
+   "in": 2786,
+   "out": 855,
+   "usd": 0.000706
+  },
+  "gen:how-to-setup-new-macmini-codesign-agent.md:0": {
+   "calls": 1,
+   "in": 3024,
+   "out": 600,
+   "usd": 0.000602
+  },
+  "gen:self-host-grafana-in-namespace.md:1": {
+   "calls": 1,
+   "in": 2697,
+   "out": 890,
+   "usd": 0.000715
+  },
+  "gen:you-dont-have-access.md:2": {
+   "calls": 1,
+   "in": 1194,
+   "out": 734,
+   "usd": 0.000486
+  },
+  "gen:repo-server-evicted-ephemeral-storage.md:2": {
+   "calls": 1,
+   "in": 2079,
+   "out": 894,
+   "usd": 0.000655
+  },
+  "gen:postgresql-host-port-override-not-applied.md:0": {
+   "calls": 1,
+   "in": 1077,
+   "out": 864,
+   "usd": 0.00054
+  },
+  "gen:how-to-setup-new-macmini-codesign-agent.md:1": {
+   "calls": 1,
+   "in": 3024,
+   "out": 936,
+   "usd": 0.00077
+  },
+  "gen:migrate-ingress-across-clusters.md:1": {
+   "calls": 1,
+   "in": 1642,
+   "out": 1452,
+   "usd": 0.00089
+  },
+  "gen:self-host-grafana-in-namespace.md:2": {
+   "calls": 1,
+   "in": 2697,
+   "out": 778,
+   "usd": 0.000659
+  },
+  "gen:upgrading-dev-vault-in-shared-account.md:0": {
+   "calls": 1,
+   "in": 1740,
+   "out": 812,
+   "usd": 0.00058
+  },
+  "gen:skaffold-deployment-space-app-not-approved.md:0": {
+   "calls": 1,
+   "in": 814,
+   "out": 981,
+   "usd": 0.000572
+  },
+  "gen:clusters-list.md:0": {
+   "calls": 1,
+   "in": 2043,
+   "out": 954,
+   "usd": 0.000681
+  },
+  "gen:how-to-setup-new-macmini-codesign-agent.md:2": {
+   "calls": 1,
+   "in": 3024,
+   "out": 794,
+   "usd": 0.000699
+  },
+  "gen:new-employee-and-teamcity-build-agents.md:0": {
+   "calls": 1,
+   "in": 1363,
+   "out": 790,
+   "usd": 0.000531
+  },
+  "gen:upgrading-dev-vault-in-shared-account.md:1": {
+   "calls": 1,
+   "in": 1740,
+   "out": 679,
+   "usd": 0.000514
+  },
+  "gen:migrate-ingress-across-clusters.md:2": {
+   "calls": 1,
+   "in": 1642,
+   "out": 1172,
+   "usd": 0.00075
+  },
+  "gen:google-jib.md:0": {
+   "calls": 1,
+   "in": 1501,
+   "out": 760,
+   "usd": 0.00053
+  },
+  "gen:backup-restore.md:0": {
+   "calls": 1,
+   "in": 1938,
+   "out": 1202,
+   "usd": 0.000795
+  },
+  "gen:account-id-map.md:0": {
+   "calls": 1,
+   "in": 1363,
+   "out": 630,
+   "usd": 0.000451
+  },
+  "gen:feature-set.md:0": {
+   "calls": 1,
+   "in": 2808,
+   "out": 853,
+   "usd": 0.000707
+  },
+  "gen:entrypoint.md:0": {
+   "calls": 1,
+   "in": 3018,
+   "out": 622,
+   "usd": 0.000613
+  },
+  "gen:upgrading-dev-vault-in-shared-account.md:2": {
+   "calls": 1,
+   "in": 1740,
+   "out": 768,
+   "usd": 0.000558
+  },
+  "gen:q-a-community-meetup-22nd-november.md:0": {
+   "calls": 1,
+   "in": 1480,
+   "out": 718,
+   "usd": 0.000507
+  },
+  "gen:backup-clickhouse.md:0": {
+   "calls": 1,
+   "in": 969,
+   "out": 952,
+   "usd": 0.000573
+  },
+  "gen:google-jib.md:1": {
+   "calls": 1,
+   "in": 1501,
+   "out": 944,
+   "usd": 0.000622
+  },
+  "gen:index.md:1": {
+   "calls": 1,
+   "in": 810,
+   "out": 725,
+   "usd": 0.000443
+  },
+  "gen:how-get-external-secrets-in-your-namespace-using-iam-user.md:0": {
+   "calls": 1,
+   "in": 1624,
+   "out": 1034,
+   "usd": 0.000679
+  },
+  "gen:quota-not-updated-after-limit-change.md:0": {
+   "calls": 1,
+   "in": 838,
+   "out": 685,
+   "usd": 0.000426
+  },
+  "gen:backup-clickhouse.md:1": {
+   "calls": 1,
+   "in": 969,
+   "out": 793,
+   "usd": 0.000493
+  },
+  "gen:loadbalancer-service-no-http-access-use-ingress.md:0": {
+   "calls": 1,
+   "in": 1094,
+   "out": 1121,
+   "usd": 0.00067
+  },
+  "gen:add-hive-aws-glue-catalog.md:0": {
+   "calls": 1,
+   "in": 1298,
+   "out": 1899,
+   "usd": 0.001079
+  },
+  "gen:google-jib.md:2": {
+   "calls": 1,
+   "in": 1501,
+   "out": 774,
+   "usd": 0.000537
+  },
+  "gen:s3-backend-invalid-credentials.md:0": {
+   "calls": 1,
+   "in": 884,
+   "out": 649,
+   "usd": 0.000413
+  },
+  "gen:rbac.md:0": {
+   "calls": 1,
+   "in": 2311,
+   "out": 924,
+   "usd": 0.000693
+  },
+  "gen:overview.md:0": {
+   "calls": 1,
+   "in": 1537,
+   "out": 725,
+   "usd": 0.000516
+  },
+  "gen:backup-clickhouse.md:2": {
+   "calls": 1,
+   "in": 969,
+   "out": 1040,
+   "usd": 0.000617
+  },
+  "gen:s3-backend-invalid-credentials.md:1": {
+   "calls": 1,
+   "in": 884,
+   "out": 716,
+   "usd": 0.000446
+  },
+  "gen:worker-oomkilled-backlog.md:0": {
+   "calls": 1,
+   "in": 1650,
+   "out": 1145,
+   "usd": 0.000737
+  },
+  "gen:add-hive-aws-glue-catalog.md:1": {
+   "calls": 1,
+   "in": 1298,
+   "out": 1615,
+   "usd": 0.000937
+  },
+  "gen:services-built-and-or-maintained-by-sre-team.md:0": {
+   "calls": 1,
+   "in": 1050,
+   "out": 1195,
+   "usd": 0.000702
+  },
+  "gen:s3-backend-invalid-credentials.md:2": {
+   "calls": 1,
+   "in": 884,
+   "out": 670,
+   "usd": 0.000423
+  },
+  "h5:multi": {
+   "calls": 120,
+   "in": 10672,
+   "out": 15246,
+   "usd": 0.00869
+  },
+  "h5:hyde": {
+   "calls": 342,
+   "in": 29848,
+   "out": 58398,
+   "usd": 0.032184
+  },
+  "h5:en_rewrite": {
+   "calls": 203,
+   "in": 14624,
+   "out": 14912,
+   "usd": 0.008918
+  },
+  "h7:keywords:q001": {
+   "calls": 1,
+   "in": 127,
+   "out": 119,
+   "usd": 7.2e-05
+  },
+  "h7:keywords:q004": {
+   "calls": 1,
+   "in": 112,
+   "out": 212,
+   "usd": 0.000117
+  },
+  "h7:keywords:q007": {
+   "calls": 1,
+   "in": 106,
+   "out": 131,
+   "usd": 7.6e-05
+  },
+  "h7:keywords:q010": {
+   "calls": 1,
+   "in": 113,
+   "out": 267,
+   "usd": 0.000145
+  },
+  "h7:keywords:q013": {
+   "calls": 1,
+   "in": 110,
+   "out": 201,
+   "usd": 0.000111
+  },
+  "h7:keywords:q016": {
+   "calls": 1,
+   "in": 133,
+   "out": 120,
+   "usd": 7.3e-05
+  },
+  "h7:keywords:q019": {
+   "calls": 1,
+   "in": 104,
+   "out": 90,
+   "usd": 5.5e-05
+  },
+  "h7:keywords:q022": {
+   "calls": 1,
+   "in": 151,
+   "out": 85,
+   "usd": 5.8e-05
+  },
+  "h7:keywords:q025": {
+   "calls": 1,
+   "in": 118,
+   "out": 148,
+   "usd": 8.6e-05
+  },
+  "h7:keywords:q028": {
+   "calls": 1,
+   "in": 154,
+   "out": 111,
+   "usd": 7.1e-05
+  },
+  "h7:keywords:q031": {
+   "calls": 1,
+   "in": 162,
+   "out": 103,
+   "usd": 6.8e-05
+  },
+  "h7:keywords:q034": {
+   "calls": 1,
+   "in": 115,
+   "out": 159,
+   "usd": 9.1e-05
+  },
+  "h7:keywords:q037": {
+   "calls": 1,
+   "in": 159,
+   "out": 194,
+   "usd": 0.000113
+  },
+  "h7:keywords:q040": {
+   "calls": 1,
+   "in": 146,
+   "out": 225,
+   "usd": 0.000127
+  },
+  "h7:keywords:q043": {
+   "calls": 1,
+   "in": 143,
+   "out": 107,
+   "usd": 6.8e-05
+  },
+  "h7:keywords:q046": {
+   "calls": 1,
+   "in": 186,
+   "out": 179,
+   "usd": 0.000108
+  },
+  "h7:keywords:q049": {
+   "calls": 1,
+   "in": 109,
+   "out": 174,
+   "usd": 9.8e-05
+  },
+  "h7:keywords:q052": {
+   "calls": 1,
+   "in": 182,
+   "out": 205,
+   "usd": 0.000121
+  },
+  "h7:keywords:q055": {
+   "calls": 1,
+   "in": 119,
+   "out": 141,
+   "usd": 8.2e-05
+  },
+  "h7:keywords:q058": {
+   "calls": 1,
+   "in": 120,
+   "out": 152,
+   "usd": 8.8e-05
+  },
+  "h7:keywords:q061": {
+   "calls": 1,
+   "in": 97,
+   "out": 129,
+   "usd": 7.4e-05
+  },
+  "h7:keywords:q064": {
+   "calls": 1,
+   "in": 115,
+   "out": 182,
+   "usd": 0.000102
+  },
+  "h7:keywords:q067": {
+   "calls": 1,
+   "in": 109,
+   "out": 152,
+   "usd": 8.7e-05
+  },
+  "h7:keywords:q070": {
+   "calls": 1,
+   "in": 101,
+   "out": 135,
+   "usd": 7.8e-05
+  },
+  "h7:keywords:q073": {
+   "calls": 1,
+   "in": 143,
+   "out": 105,
+   "usd": 6.7e-05
+  },
+  "h7:keywords:q076": {
+   "calls": 1,
+   "in": 143,
+   "out": 138,
+   "usd": 8.3e-05
+  },
+  "h7:keywords:q079": {
+   "calls": 1,
+   "in": 99,
+   "out": 123,
+   "usd": 7.1e-05
+  },
+  "h7:keywords:q082": {
+   "calls": 1,
+   "in": 145,
+   "out": 159,
+   "usd": 9.4e-05
+  },
+  "h7:keywords:q085": {
+   "calls": 1,
+   "in": 138,
+   "out": 96,
+   "usd": 6.2e-05
+  },
+  "h7:keywords:q088": {
+   "calls": 1,
+   "in": 122,
+   "out": 124,
+   "usd": 7.4e-05
+  },
+  "h7:keywords:q091": {
+   "calls": 1,
+   "in": 151,
+   "out": 129,
+   "usd": 8e-05
+  },
+  "h7:keywords:q094": {
+   "calls": 1,
+   "in": 106,
+   "out": 119,
+   "usd": 7e-05
+  },
+  "h7:keywords:q097": {
+   "calls": 1,
+   "in": 126,
+   "out": 138,
+   "usd": 8.2e-05
+  },
+  "h7:keywords:q100": {
+   "calls": 1,
+   "in": 160,
+   "out": 121,
+   "usd": 7.7e-05
+  },
+  "h7:keywords:q103": {
+   "calls": 1,
+   "in": 168,
+   "out": 143,
+   "usd": 8.8e-05
+  },
+  "h7:keywords:q106": {
+   "calls": 1,
+   "in": 116,
+   "out": 188,
+   "usd": 0.000106
+  },
+  "h7:keywords:q109": {
+   "calls": 1,
+   "in": 144,
+   "out": 153,
+   "usd": 9.1e-05
+  },
+  "h7:keywords:q112": {
+   "calls": 1,
+   "in": 130,
+   "out": 116,
+   "usd": 7.1e-05
+  },
+  "h7:keywords:q115": {
+   "calls": 1,
+   "in": 122,
+   "out": 206,
+   "usd": 0.000115
+  },
+  "h7:keywords:q118": {
+   "calls": 1,
+   "in": 100,
+   "out": 84,
+   "usd": 5.2e-05
+  },
+  "h8:answerable:naive_full:q001": {
+   "calls": 1,
+   "in": 8474,
+   "out": 85,
+   "usd": 0.00089
+  },
+  "h8:matches:naive_full:q001": {
+   "calls": 1,
+   "in": 135,
+   "out": 8,
+   "usd": 1.8e-05
+  },
+  "h8:answerable:fused_top3:q001": {
+   "calls": 1,
+   "in": 1925,
+   "out": 46,
+   "usd": 0.000216
+  },
+  "h8:matches:fused_top3:q001": {
+   "calls": 1,
+   "in": 137,
+   "out": 8,
+   "usd": 1.8e-05
+  },
+  "h8:answerable:best_graph_full:q001": {
+   "calls": 1,
+   "in": 8367,
+   "out": 44,
+   "usd": 0.000859
+  },
+  "h8:matches:best_graph_full:q001": {
+   "calls": 1,
+   "in": 135,
+   "out": 8,
+   "usd": 1.8e-05
+  },
+  "h8:answerable:naive_full:q004": {
+   "calls": 1,
+   "in": 14885,
+   "out": 146,
+   "usd": 0.001562
+  },
+  "h8:matches:naive_full:q004": {
+   "calls": 1,
+   "in": 151,
+   "out": 141,
+   "usd": 8.6e-05
+  },
+  "h8:answerable:fused_top3:q004": {
+   "calls": 1,
+   "in": 1091,
+   "out": 233,
+   "usd": 0.000226
+  },
+  "h8:matches:fused_top3:q004": {
+   "calls": 1,
+   "in": 158,
+   "out": 112,
+   "usd": 7.2e-05
+  },
+  "h8:answerable:best_graph_full:q004": {
+   "calls": 1,
+   "in": 13150,
+   "out": 206,
+   "usd": 0.001418
+  },
+  "h8:matches:best_graph_full:q004": {
+   "calls": 1,
+   "in": 140,
+   "out": 168,
+   "usd": 9.8e-05
+  },
+  "h8:answerable:naive_full:q007": {
+   "calls": 1,
+   "in": 9893,
+   "out": 78,
+   "usd": 0.001028
+  },
+  "h8:matches:naive_full:q007": {
+   "calls": 1,
+   "in": 125,
+   "out": 75,
+   "usd": 5e-05
+  },
+  "h8:answerable:fused_top3:q007": {
+   "calls": 1,
+   "in": 1577,
+   "out": 88,
+   "usd": 0.000202
+  },
+  "h8:matches:fused_top3:q007": {
+   "calls": 1,
+   "in": 125,
+   "out": 65,
+   "usd": 4.5e-05
+  },
+  "h8:answerable:best_graph_full:q007": {
+   "calls": 1,
+   "in": 9785,
+   "out": 85,
+   "usd": 0.001021
+  },
+  "h8:matches:best_graph_full:q007": {
+   "calls": 1,
+   "in": 127,
+   "out": 89,
+   "usd": 5.7e-05
+  },
+  "h8:answerable:naive_full:q010": {
+   "calls": 1,
+   "in": 7962,
+   "out": 32,
+   "usd": 0.000812
+  },
+  "h8:matches:naive_full:q010": {
+   "calls": 1,
+   "in": 109,
+   "out": 22,
+   "usd": 2.2e-05
+  },
+  "h8:answerable:fused_top3:q010": {
+   "calls": 1,
+   "in": 1747,
+   "out": 35,
+   "usd": 0.000192
+  },
+  "h8:matches:fused_top3:q010": {
+   "calls": 1,
+   "in": 112,
+   "out": 8,
+   "usd": 1.5e-05
+  },
+  "h8:answerable:best_graph_full:q010": {
+   "calls": 1,
+   "in": 7271,
+   "out": 27,
+   "usd": 0.000741
+  },
+  "h8:matches:best_graph_full:q010": {
+   "calls": 1,
+   "in": 104,
+   "out": 23,
+   "usd": 2.2e-05
+  },
+  "h8:answerable:naive_full:q013": {
+   "calls": 1,
+   "in": 10984,
+   "out": 33,
+   "usd": 0.001115
+  },
+  "h8:matches:naive_full:q013": {
+   "calls": 1,
+   "in": 107,
+   "out": 22,
+   "usd": 2.2e-05
+  },
+  "h8:answerable:fused_top3:q013": {
+   "calls": 1,
+   "in": 1467,
+   "out": 38,
+   "usd": 0.000166
+  },
+  "h8:matches:fused_top3:q013": {
+   "calls": 1,
+   "in": 111,
+   "out": 23,
+   "usd": 2.3e-05
+  },
+  "h8:answerable:best_graph_full:q013": {
+   "calls": 1,
+   "in": 10537,
+   "out": 61,
+   "usd": 0.001084
+  },
+  "h8:matches:best_graph_full:q013": {
+   "calls": 1,
+   "in": 107,
+   "out": 22,
+   "usd": 2.2e-05
+  },
+  "h8:answerable:naive_full:q016": {
+   "calls": 1,
+   "in": 11935,
+   "out": 91,
+   "usd": 0.001239
+  },
+  "h8:matches:naive_full:q016": {
+   "calls": 1,
+   "in": 142,
+   "out": 23,
+   "usd": 2.6e-05
+  },
+  "h8:answerable:fused_top3:q016": {
+   "calls": 1,
+   "in": 1700,
+   "out": 101,
+   "usd": 0.000221
+  },
+  "h8:matches:fused_top3:q016": {
+   "calls": 1,
+   "in": 143,
+   "out": 22,
+   "usd": 2.5e-05
+  },
+  "h8:answerable:best_graph_full:q016": {
+   "calls": 1,
+   "in": 11176,
+   "out": 103,
+   "usd": 0.001169
+  },
+  "h8:matches:best_graph_full:q016": {
+   "calls": 1,
+   "in": 142,
+   "out": 8,
+   "usd": 1.8e-05
+  },
+  "h8:answerable:naive_full:q019": {
+   "calls": 1,
+   "in": 8219,
+   "out": 33,
+   "usd": 0.000838
+  },
+  "h8:matches:naive_full:q019": {
+   "calls": 1,
+   "in": 101,
+   "out": 66,
+   "usd": 4.3e-05
+  },
+  "h8:answerable:fused_top3:q019": {
+   "calls": 1,
+   "in": 1579,
+   "out": 26,
+   "usd": 0.000171
+  },
+  "h8:matches:fused_top3:q019": {
+   "calls": 1,
+   "in": 94,
+   "out": 8,
+   "usd": 1.3e-05
+  },
+  "h8:answerable:best_graph_full:q019": {
+   "calls": 1,
+   "in": 8913,
+   "out": 26,
+   "usd": 0.000904
+  },
+  "h8:matches:best_graph_full:q019": {
+   "calls": 1,
+   "in": 94,
+   "out": 8,
+   "usd": 1.3e-05
+  },
+  "h8:answerable:naive_full:q022": {
+   "calls": 1,
+   "in": 8632,
+   "out": 18,
+   "usd": 0.000872
+  },
+  "h8:matches:naive_full:q022": {
+   "calls": 1,
+   "in": 132,
+   "out": 8,
+   "usd": 1.7e-05
+  },
+  "h8:answerable:fused_top3:q022": {
+   "calls": 1,
+   "in": 1899,
+   "out": 18,
+   "usd": 0.000199
+  },
+  "h8:matches:fused_top3:q022": {
+   "calls": 1,
+   "in": 132,
+   "out": 8,
+   "usd": 1.7e-05
+  },
+  "h8:answerable:best_graph_full:q022": {
+   "calls": 1,
+   "in": 8489,
+   "out": 18,
+   "usd": 0.000858
+  },
+  "h8:matches:best_graph_full:q022": {
+   "calls": 1,
+   "in": 132,
+   "out": 8,
+   "usd": 1.7e-05
+  },
+  "h8:answerable:naive_full:q025": {
+   "calls": 1,
+   "in": 8109,
+   "out": 180,
+   "usd": 0.000901
+  },
+  "h8:matches:naive_full:q025": {
+   "calls": 1,
+   "in": 178,
+   "out": 117,
+   "usd": 7.6e-05
+  },
+  "h8:answerable:fused_top3:q025": {
+   "calls": 1,
+   "in": 1558,
+   "out": 199,
+   "usd": 0.000255
+  },
+  "h8:matches:fused_top3:q025": {
+   "calls": 1,
+   "in": 158,
+   "out": 81,
+   "usd": 5.6e-05
+  },
+  "h8:answerable:best_graph_full:q025": {
+   "calls": 1,
+   "in": 7717,
+   "out": 197,
+   "usd": 0.00087
+  },
+  "h8:matches:best_graph_full:q025": {
+   "calls": 1,
+   "in": 172,
+   "out": 397,
+   "usd": 0.000216
+  },
+  "h8:answerable:naive_full:q028": {
+   "calls": 1,
+   "in": 7972,
+   "out": 86,
+   "usd": 0.00084
+  },
+  "h8:matches:naive_full:q028": {
+   "calls": 1,
+   "in": 131,
+   "out": 74,
+   "usd": 5e-05
+  },
+  "h8:answerable:fused_top3:q028": {
+   "calls": 1,
+   "in": 1864,
+   "out": 61,
+   "usd": 0.000217
+  },
+  "h8:matches:fused_top3:q028": {
+   "calls": 1,
+   "in": 131,
+   "out": 118,
+   "usd": 7.2e-05
+  },
+  "h8:answerable:best_graph_full:q028": {
+   "calls": 1,
+   "in": 8860,
+   "out": 44,
+   "usd": 0.000908
+  },
+  "h8:matches:best_graph_full:q028": {
+   "calls": 1,
+   "in": 131,
+   "out": 77,
+   "usd": 5.2e-05
+  },
+  "h8:answerable:naive_full:q031": {
+   "calls": 1,
+   "in": 8980,
+   "out": 67,
+   "usd": 0.000932
+  },
+  "h8:matches:naive_full:q031": {
+   "calls": 1,
+   "in": 193,
+   "out": 114,
+   "usd": 7.6e-05
+  },
+  "h8:answerable:fused_top3:q031": {
+   "calls": 1,
+   "in": 1532,
+   "out": 44,
+   "usd": 0.000175
+  },
+  "h8:matches:fused_top3:q031": {
+   "calls": 1,
+   "in": 170,
+   "out": 8,
+   "usd": 2.1e-05
+  },
+  "h8:answerable:best_graph_full:q031": {
+   "calls": 1,
+   "in": 8364,
+   "out": 101,
+   "usd": 0.000887
+  },
+  "h8:matches:best_graph_full:q031": {
+   "calls": 1,
+   "in": 183,
+   "out": 8,
+   "usd": 2.2e-05
+  },
+  "h8:answerable:naive_full:q034": {
+   "calls": 1,
+   "in": 8861,
+   "out": 39,
+   "usd": 0.000906
+  },
+  "h8:matches:naive_full:q034": {
+   "calls": 1,
+   "in": 118,
+   "out": 8,
+   "usd": 1.6e-05
+  },
+  "h8:answerable:fused_top3:q034": {
+   "calls": 1,
+   "in": 1500,
+   "out": 33,
+   "usd": 0.000167
+  },
+  "h8:matches:fused_top3:q034": {
+   "calls": 1,
+   "in": 112,
+   "out": 8,
+   "usd": 1.5e-05
+  },
+  "h8:answerable:best_graph_full:q034": {
+   "calls": 1,
+   "in": 8903,
+   "out": 43,
+   "usd": 0.000912
+  },
+  "h8:matches:best_graph_full:q034": {
+   "calls": 1,
+   "in": 107,
+   "out": 8,
+   "usd": 1.5e-05
+  },
+  "h8:answerable:naive_full:q037": {
+   "calls": 1,
+   "in": 8984,
+   "out": 155,
+   "usd": 0.000976
+  },
+  "h8:matches:naive_full:q037": {
+   "calls": 1,
+   "in": 200,
+   "out": 8,
+   "usd": 2.4e-05
+  },
+  "h8:answerable:fused_top3:q037": {
+   "calls": 1,
+   "in": 1690,
+   "out": 113,
+   "usd": 0.000226
+  },
+  "h8:matches:fused_top3:q037": {
+   "calls": 2,
+   "in": 342,
+   "out": 289,
+   "usd": 0.000179
+  },
+  "h8:answerable:best_graph_full:q037": {
+   "calls": 1,
+   "in": 10044,
+   "out": 107,
+   "usd": 0.001058
+  },
+  "h8:matches:best_graph_full:q037": {
+   "calls": 2,
+   "in": 342,
+   "out": 150,
+   "usd": 0.000109
+  },
+  "h8:answerable:naive_full:q040": {
+   "calls": 1,
+   "in": 6467,
+   "out": 103,
+   "usd": 0.000698
+  },
+  "h8:matches:naive_full:q040": {
+   "calls": 1,
+   "in": 173,
+   "out": 66,
+   "usd": 5e-05
+  },
+  "h8:answerable:fused_top3:q040": {
+   "calls": 1,
+   "in": 1554,
+   "out": 57,
+   "usd": 0.000184
+  },
+  "h8:matches:fused_top3:q040": {
+   "calls": 1,
+   "in": 167,
+   "out": 152,
+   "usd": 9.3e-05
+  },
+  "h8:answerable:best_graph_full:q040": {
+   "calls": 1,
+   "in": 9525,
+   "out": 79,
+   "usd": 0.000992
+  },
+  "h8:matches:best_graph_full:q040": {
+   "calls": 1,
+   "in": 161,
+   "out": 99,
+   "usd": 6.6e-05
+  },
+  "h8:answerable:naive_full:q043": {
+   "calls": 1,
+   "in": 12273,
+   "out": 100,
+   "usd": 0.001277
+  },
+  "h8:matches:naive_full:q043": {
+   "calls": 1,
+   "in": 162,
+   "out": 230,
+   "usd": 0.000131
+  },
+  "h8:answerable:fused_top3:q043": {
+   "calls": 1,
+   "in": 1564,
+   "out": 76,
+   "usd": 0.000194
+  },
+  "h8:matches:fused_top3:q043": {
+   "calls": 1,
+   "in": 141,
+   "out": 89,
+   "usd": 5.9e-05
+  },
+  "h8:answerable:best_graph_full:q043": {
+   "calls": 1,
+   "in": 12118,
+   "out": 96,
+   "usd": 0.00126
+  },
+  "h8:matches:best_graph_full:q043": {
+   "calls": 1,
+   "in": 155,
+   "out": 97,
+   "usd": 6.4e-05
+  },
+  "h8:answerable:naive_full:q046": {
+   "calls": 1,
+   "in": 8620,
+   "out": 164,
+   "usd": 0.000944
+  },
+  "h8:matches:naive_full:q046": {
+   "calls": 1,
+   "in": 252,
+   "out": 8,
+   "usd": 2.9e-05
+  },
+  "h8:answerable:fused_top3:q046": {
+   "calls": 1,
+   "in": 1905,
+   "out": 142,
+   "usd": 0.000262
+  },
+  "h8:matches:fused_top3:q046": {
+   "calls": 1,
+   "in": 252,
+   "out": 8,
+   "usd": 2.9e-05
+  },
+  "h8:answerable:best_graph_full:q046": {
+   "calls": 1,
+   "in": 8339,
+   "out": 129,
+   "usd": 0.000898
+  },
+  "h8:matches:best_graph_full:q046": {
+   "calls": 1,
+   "in": 252,
+   "out": 8,
+   "usd": 2.9e-05
+  },
+  "h8:answerable:naive_full:q049": {
+   "calls": 1,
+   "in": 8046,
+   "out": 31,
+   "usd": 0.00082
+  },
+  "h8:matches:naive_full:q049": {
+   "calls": 1,
+   "in": 104,
+   "out": 28,
+   "usd": 2.4e-05
+  },
+  "h8:answerable:fused_top3:q049": {
+   "calls": 1,
+   "in": 1557,
+   "out": 31,
+   "usd": 0.000171
+  },
+  "h8:matches:fused_top3:q049": {
+   "calls": 1,
+   "in": 104,
+   "out": 34,
+   "usd": 2.7e-05
+  },
+  "h8:answerable:best_graph_full:q049": {
+   "calls": 1,
+   "in": 7519,
+   "out": 23,
+   "usd": 0.000763
+  },
+  "h8:matches:best_graph_full:q049": {
+   "calls": 1,
+   "in": 96,
+   "out": 48,
+   "usd": 3.4e-05
+  },
+  "h8:answerable:naive_full:q052": {
+   "calls": 1,
+   "in": 8371,
+   "out": 159,
+   "usd": 0.000917
+  },
+  "h8:matches:naive_full:q052": {
+   "calls": 1,
+   "in": 235,
+   "out": 218,
+   "usd": 0.000133
+  },
+  "h8:answerable:fused_top3:q052": {
+   "calls": 1,
+   "in": 1893,
+   "out": 70,
+   "usd": 0.000224
+  },
+  "h8:matches:fused_top3:q052": {
+   "calls": 1,
+   "in": 216,
+   "out": 224,
+   "usd": 0.000134
+  },
+  "h8:answerable:best_graph_full:q052": {
+   "calls": 1,
+   "in": 8199,
+   "out": 118,
+   "usd": 0.000879
+  },
+  "h8:matches:best_graph_full:q052": {
+   "calls": 1,
+   "in": 229,
+   "out": 59,
+   "usd": 5.2e-05
+  },
+  "h8:answerable:naive_full:q055": {
+   "calls": 1,
+   "in": 7340,
+   "out": 42,
+   "usd": 0.000755
+  },
+  "h8:matches:naive_full:q055": {
+   "calls": 1,
+   "in": 125,
+   "out": 51,
+   "usd": 3.8e-05
+  },
+  "h8:answerable:fused_top3:q055": {
+   "calls": 1,
+   "in": 990,
+   "out": 155,
+   "usd": 0.000177
+  },
+  "h8:matches:fused_top3:q055": {
+   "calls": 1,
+   "in": 113,
+   "out": 69,
+   "usd": 4.6e-05
+  },
+  "h8:answerable:best_graph_full:q055": {
+   "calls": 1,
+   "in": 7637,
+   "out": 107,
+   "usd": 0.000817
+  },
+  "h8:matches:best_graph_full:q055": {
+   "calls": 1,
+   "in": 125,
+   "out": 41,
+   "usd": 3.3e-05
+  },
+  "h8:answerable:naive_full:q058": {
+   "calls": 1,
+   "in": 11150,
+   "out": 115,
+   "usd": 0.001173
+  },
+  "h8:matches:naive_full:q058": {
+   "calls": 1,
+   "in": 165,
+   "out": 111,
+   "usd": 7.2e-05
+  },
+  "h8:answerable:fused_top3:q058": {
+   "calls": 1,
+   "in": 1464,
+   "out": 62,
+   "usd": 0.000177
+  },
+  "h8:matches:fused_top3:q058": {
+   "calls": 1,
+   "in": 145,
+   "out": 74,
+   "usd": 5.1e-05
+  },
+  "h8:answerable:best_graph_full:q058": {
+   "calls": 1,
+   "in": 9532,
+   "out": 114,
+   "usd": 0.00101
+  },
+  "h8:matches:best_graph_full:q058": {
+   "calls": 1,
+   "in": 162,
+   "out": 88,
+   "usd": 6e-05
+  },
+  "h8:answerable:naive_full:q061": {
+   "calls": 1,
+   "in": 9793,
+   "out": 41,
+   "usd": 0.001
+  },
+  "h8:matches:naive_full:q061": {
+   "calls": 1,
+   "in": 84,
+   "out": 8,
+   "usd": 1.2e-05
+  },
+  "h8:answerable:fused_top3:q061": {
+   "calls": 1,
+   "in": 1966,
+   "out": 208,
+   "usd": 0.000301
+  },
+  "h8:matches:fused_top3:q061": {
+   "calls": 1,
+   "in": 74,
+   "out": 110,
+   "usd": 6.2e-05
+  },
+  "h8:answerable:best_graph_full:q061": {
+   "calls": 1,
+   "in": 8516,
+   "out": 24,
+   "usd": 0.000864
+  },
+  "h8:matches:best_graph_full:q061": {
+   "calls": 1,
+   "in": 85,
+   "out": 8,
+   "usd": 1.3e-05
+  },
+  "h8:answerable:naive_full:q064": {
+   "calls": 1,
+   "in": 9193,
+   "out": 29,
+   "usd": 0.000934
+  },
+  "h8:matches:naive_full:q064": {
+   "calls": 1,
+   "in": 108,
+   "out": 8,
+   "usd": 1.5e-05
+  },
+  "h8:answerable:fused_top3:q064": {
+   "calls": 1,
+   "in": 1738,
+   "out": 57,
+   "usd": 0.000202
+  },
+  "h8:matches:fused_top3:q064": {
+   "calls": 1,
+   "in": 98,
+   "out": 37,
+   "usd": 2.8e-05
+  },
+  "h8:answerable:best_graph_full:q064": {
+   "calls": 1,
+   "in": 8979,
+   "out": 29,
+   "usd": 0.000912
+  },
+  "h8:matches:best_graph_full:q064": {
+   "calls": 1,
+   "in": 108,
+   "out": 22,
+   "usd": 2.2e-05
+  },
+  "h8:answerable:naive_full:q067": {
+   "calls": 1,
+   "in": 9944,
+   "out": 60,
+   "usd": 0.001024
+  },
+  "h8:matches:naive_full:q067": {
+   "calls": 1,
+   "in": 99,
+   "out": 8,
+   "usd": 1.4e-05
+  },
+  "h8:answerable:fused_top3:q067": {
+   "calls": 1,
+   "in": 1574,
+   "out": 24,
+   "usd": 0.000169
+  },
+  "h8:matches:fused_top3:q067": {
+   "calls": 1,
+   "in": 97,
+   "out": 37,
+   "usd": 2.8e-05
+  },
+  "h8:answerable:best_graph_full:q067": {
+   "calls": 1,
+   "in": 11461,
+   "out": 24,
+   "usd": 0.001158
+  },
+  "h8:matches:best_graph_full:q067": {
+   "calls": 1,
+   "in": 97,
+   "out": 70,
+   "usd": 4.5e-05
+  },
+  "h8:answerable:naive_full:q070": {
+   "calls": 1,
+   "in": 8316,
+   "out": 67,
+   "usd": 0.000865
+  },
+  "h8:matches:naive_full:q070": {
+   "calls": 1,
+   "in": 97,
+   "out": 8,
+   "usd": 1.4e-05
+  },
+  "h8:answerable:fused_top3:q070": {
+   "calls": 1,
+   "in": 1535,
+   "out": 82,
+   "usd": 0.000194
+  },
+  "h8:matches:fused_top3:q070": {
+   "calls": 1,
+   "in": 98,
+   "out": 37,
+   "usd": 2.8e-05
+  },
+  "h8:answerable:best_graph_full:q070": {
+   "calls": 1,
+   "in": 9303,
+   "out": 62,
+   "usd": 0.000961
+  },
+  "h8:matches:best_graph_full:q070": {
+   "calls": 1,
+   "in": 97,
+   "out": 50,
+   "usd": 3.5e-05
+  },
+  "h8:answerable:naive_full:q073": {
+   "calls": 1,
+   "in": 8870,
+   "out": 24,
+   "usd": 0.000899
+  },
+  "h8:matches:naive_full:q073": {
+   "calls": 1,
+   "in": 131,
+   "out": 8,
+   "usd": 1.7e-05
+  },
+  "h8:answerable:fused_top3:q073": {
+   "calls": 1,
+   "in": 1868,
+   "out": 24,
+   "usd": 0.000199
+  },
+  "h8:matches:fused_top3:q073": {
+   "calls": 1,
+   "in": 131,
+   "out": 23,
+   "usd": 2.5e-05
+  },
+  "h8:answerable:best_graph_full:q073": {
+   "calls": 1,
+   "in": 8902,
+   "out": 27,
+   "usd": 0.000904
+  },
+  "h8:matches:best_graph_full:q073": {
+   "calls": 1,
+   "in": 133,
+   "out": 8,
+   "usd": 1.7e-05
+  },
+  "h8:answerable:naive_full:q076": {
+   "calls": 1,
+   "in": 7883,
+   "out": 46,
+   "usd": 0.000811
+  },
+  "h8:matches:naive_full:q076": {
+   "calls": 1,
+   "in": 153,
+   "out": 24,
+   "usd": 2.7e-05
+  },
+  "h8:answerable:fused_top3:q076": {
+   "calls": 1,
+   "in": 1549,
+   "out": 42,
+   "usd": 0.000176
+  },
+  "h8:matches:fused_top3:q076": {
+   "calls": 1,
+   "in": 149,
+   "out": 26,
+   "usd": 2.8e-05
+  },
+  "h8:answerable:best_graph_full:q076": {
+   "calls": 1,
+   "in": 7667,
+   "out": 82,
+   "usd": 0.000808
+  },
+  "h8:matches:best_graph_full:q076": {
+   "calls": 1,
+   "in": 159,
+   "out": 8,
+   "usd": 2e-05
+  },
+  "h8:answerable:naive_full:q079": {
+   "calls": 1,
+   "in": 8517,
+   "out": 115,
+   "usd": 0.000909
+  },
+  "h8:matches:naive_full:q079": {
+   "calls": 1,
+   "in": 107,
+   "out": 133,
+   "usd": 7.7e-05
+  },
+  "h8:answerable:fused_top3:q079": {
+   "calls": 1,
+   "in": 1849,
+   "out": 181,
+   "usd": 0.000275
+  },
+  "h8:matches:fused_top3:q079": {
+   "calls": 1,
+   "in": 106,
+   "out": 126,
+   "usd": 7.4e-05
+  },
+  "h8:answerable:best_graph_full:q079": {
+   "calls": 1,
+   "in": 8424,
+   "out": 119,
+   "usd": 0.000902
+  },
+  "h8:matches:best_graph_full:q079": {
+   "calls": 1,
+   "in": 97,
+   "out": 342,
+   "usd": 0.000181
+  },
+  "h8:answerable:naive_full:q082": {
+   "calls": 1,
+   "in": 8461,
+   "out": 94,
+   "usd": 0.000893
+  },
+  "h8:matches:naive_full:q082": {
+   "calls": 1,
+   "in": 151,
+   "out": 32,
+   "usd": 3.1e-05
+  },
+  "h8:answerable:fused_top3:q082": {
+   "calls": 1,
+   "in": 1870,
+   "out": 43,
+   "usd": 0.000208
+  },
+  "h8:matches:fused_top3:q082": {
+   "calls": 1,
+   "in": 151,
+   "out": 26,
+   "usd": 2.8e-05
+  },
+  "h8:answerable:best_graph_full:q082": {
+   "calls": 1,
+   "in": 8316,
+   "out": 92,
+   "usd": 0.000878
+  },
+  "h8:matches:best_graph_full:q082": {
+   "calls": 1,
+   "in": 151,
+   "out": 29,
+   "usd": 3e-05
+  },
+  "h8:answerable:naive_full:q085": {
+   "calls": 1,
+   "in": 8563,
+   "out": 41,
+   "usd": 0.000877
+  },
+  "h8:matches:naive_full:q085": {
+   "calls": 1,
+   "in": 144,
+   "out": 26,
+   "usd": 2.7e-05
+  },
+  "h8:answerable:fused_top3:q085": {
+   "calls": 1,
+   "in": 1928,
+   "out": 43,
+   "usd": 0.000214
+  },
+  "h8:matches:fused_top3:q085": {
+   "calls": 1,
+   "in": 146,
+   "out": 23,
+   "usd": 2.6e-05
+  },
+  "h8:answerable:best_graph_full:q085": {
+   "calls": 1,
+   "in": 8396,
+   "out": 34,
+   "usd": 0.000857
+  },
+  "h8:matches:best_graph_full:q085": {
+   "calls": 1,
+   "in": 137,
+   "out": 23,
+   "usd": 2.5e-05
+  },
+  "h8:answerable:naive_full:q088": {
+   "calls": 1,
+   "in": 11936,
+   "out": 87,
+   "usd": 0.001237
+  },
+  "h8:matches:naive_full:q088": {
+   "calls": 1,
+   "in": 136,
+   "out": 33,
+   "usd": 3e-05
+  },
+  "h8:answerable:fused_top3:q088": {
+   "calls": 1,
+   "in": 1747,
+   "out": 49,
+   "usd": 0.000199
+  },
+  "h8:matches:fused_top3:q088": {
+   "calls": 1,
+   "in": 134,
+   "out": 30,
+   "usd": 2.8e-05
+  },
+  "h8:answerable:best_graph_full:q088": {
+   "calls": 1,
+   "in": 10597,
+   "out": 54,
+   "usd": 0.001087
+  },
+  "h8:matches:best_graph_full:q088": {
+   "calls": 1,
+   "in": 139,
+   "out": 27,
+   "usd": 2.7e-05
+  },
+  "h8:answerable:naive_full:q091": {
+   "calls": 1,
+   "in": 8502,
+   "out": 138,
+   "usd": 0.000919
+  },
+  "h8:matches:naive_full:q091": {
+   "calls": 1,
+   "in": 169,
+   "out": 221,
+   "usd": 0.000127
+  },
+  "h8:answerable:fused_top3:q091": {
+   "calls": 1,
+   "in": 1840,
+   "out": 81,
+   "usd": 0.000225
+  },
+  "h8:matches:fused_top3:q091": {
+   "calls": 1,
+   "in": 195,
+   "out": 271,
+   "usd": 0.000155
+  },
+  "h8:answerable:best_graph_full:q091": {
+   "calls": 1,
+   "in": 10997,
+   "out": 71,
+   "usd": 0.001135
+  },
+  "h8:matches:best_graph_full:q091": {
+   "calls": 1,
+   "in": 186,
+   "out": 230,
+   "usd": 0.000134
+  },
+  "h8:answerable:naive_full:q094": {
+   "calls": 1,
+   "in": 8872,
+   "out": 107,
+   "usd": 0.000941
+  },
+  "h8:matches:naive_full:q094": {
+   "calls": 1,
+   "in": 124,
+   "out": 201,
+   "usd": 0.000113
+  },
+  "h8:answerable:fused_top3:q094": {
+   "calls": 1,
+   "in": 2073,
+   "out": 53,
+   "usd": 0.000234
+  },
+  "h8:matches:fused_top3:q094": {
+   "calls": 1,
+   "in": 123,
+   "out": 119,
+   "usd": 7.2e-05
+  },
+  "h8:answerable:best_graph_full:q094": {
+   "calls": 1,
+   "in": 8592,
+   "out": 114,
+   "usd": 0.000916
+  },
+  "h8:matches:best_graph_full:q094": {
+   "calls": 1,
+   "in": 135,
+   "out": 102,
+   "usd": 6.4e-05
+  },
+  "h8:answerable:naive_full:q097": {
+   "calls": 1,
+   "in": 9896,
+   "out": 165,
+   "usd": 0.001072
+  },
+  "h8:matches:naive_full:q097": {
+   "calls": 1,
+   "in": 159,
+   "out": 168,
+   "usd": 0.0001
+  },
+  "h8:answerable:fused_top3:q097": {
+   "calls": 1,
+   "in": 1595,
+   "out": 115,
+   "usd": 0.000217
+  },
+  "h8:matches:fused_top3:q097": {
+   "calls": 1,
+   "in": 154,
+   "out": 84,
+   "usd": 5.7e-05
+  },
+  "h8:answerable:best_graph_full:q097": {
+   "calls": 1,
+   "in": 8441,
+   "out": 131,
+   "usd": 0.00091
+  },
+  "h8:matches:best_graph_full:q097": {
+   "calls": 1,
+   "in": 149,
+   "out": 67,
+   "usd": 4.8e-05
+  },
+  "h8:answerable:naive_full:q100": {
+   "calls": 1,
+   "in": 7846,
+   "out": 57,
+   "usd": 0.000813
+  },
+  "h8:matches:naive_full:q100": {
+   "calls": 1,
+   "in": 181,
+   "out": 179,
+   "usd": 0.000108
+  },
+  "h8:answerable:fused_top3:q100": {
+   "calls": 1,
+   "in": 1856,
+   "out": 56,
+   "usd": 0.000214
+  },
+  "h8:matches:fused_top3:q100": {
+   "calls": 1,
+   "in": 180,
+   "out": 24,
+   "usd": 3e-05
+  },
+  "h8:answerable:best_graph_full:q100": {
+   "calls": 1,
+   "in": 5819,
+   "out": 58,
+   "usd": 0.000611
+  },
+  "h8:matches:best_graph_full:q100": {
+   "calls": 1,
+   "in": 182,
+   "out": 49,
+   "usd": 4.3e-05
+  },
+  "h8:answerable:naive_full:q103": {
+   "calls": 1,
+   "in": 9166,
+   "out": 164,
+   "usd": 0.000999
+  },
+  "h8:matches:naive_full:q103": {
+   "calls": 1,
+   "in": 222,
+   "out": 258,
+   "usd": 0.000151
+  },
+  "h8:answerable:fused_top3:q103": {
+   "calls": 1,
+   "in": 1869,
+   "out": 83,
+   "usd": 0.000228
+  },
+  "h8:matches:fused_top3:q103": {
+   "calls": 1,
+   "in": 212,
+   "out": 74,
+   "usd": 5.8e-05
+  },
+  "h8:answerable:best_graph_full:q103": {
+   "calls": 1,
+   "in": 8410,
+   "out": 90,
+   "usd": 0.000886
+  },
+  "h8:matches:best_graph_full:q103": {
+   "calls": 1,
+   "in": 220,
+   "out": 96,
+   "usd": 7e-05
+  },
+  "h8:answerable:naive_full:q106": {
+   "calls": 1,
+   "in": 8376,
+   "out": 25,
+   "usd": 0.00085
+  },
+  "h8:matches:naive_full:q106": {
+   "calls": 1,
+   "in": 105,
+   "out": 22,
+   "usd": 2.2e-05
+  },
+  "h8:answerable:fused_top3:q106": {
+   "calls": 1,
+   "in": 1857,
+   "out": 25,
+   "usd": 0.000198
+  },
+  "h8:matches:fused_top3:q106": {
+   "calls": 1,
+   "in": 104,
+   "out": 22,
+   "usd": 2.1e-05
+  },
+  "h8:answerable:best_graph_full:q106": {
+   "calls": 1,
+   "in": 7433,
+   "out": 25,
+   "usd": 0.000756
+  },
+  "h8:matches:best_graph_full:q106": {
+   "calls": 1,
+   "in": 104,
+   "out": 8,
+   "usd": 1.4e-05
+  },
+  "h8:answerable:naive_full:q109": {
+   "calls": 1,
+   "in": 8832,
+   "out": 111,
+   "usd": 0.000939
+  },
+  "h8:matches:naive_full:q109": {
+   "calls": 1,
+   "in": 140,
+   "out": 177,
+   "usd": 0.000102
+  },
+  "h8:answerable:fused_top3:q109": {
+   "calls": 1,
+   "in": 1852,
+   "out": 97,
+   "usd": 0.000234
+  },
+  "h8:matches:fused_top3:q109": {
+   "calls": 1,
+   "in": 138,
+   "out": 305,
+   "usd": 0.000166
+  },
+  "h8:answerable:best_graph_full:q109": {
+   "calls": 1,
+   "in": 9043,
+   "out": 95,
+   "usd": 0.000952
+  },
+  "h8:matches:best_graph_full:q109": {
+   "calls": 1,
+   "in": 132,
+   "out": 45,
+   "usd": 3.6e-05
+  },
+  "h8:answerable:naive_full:q112": {
+   "calls": 1,
+   "in": 8552,
+   "out": 75,
+   "usd": 0.000893
+  },
+  "h8:matches:naive_full:q112": {
+   "calls": 1,
+   "in": 131,
+   "out": 8,
+   "usd": 1.7e-05
+  },
+  "h8:answerable:fused_top3:q112": {
+   "calls": 1,
+   "in": 1648,
+   "out": 29,
+   "usd": 0.000179
+  },
+  "h8:matches:fused_top3:q112": {
+   "calls": 1,
+   "in": 124,
+   "out": 22,
+   "usd": 2.3e-05
+  },
+  "h8:answerable:best_graph_full:q112": {
+   "calls": 1,
+   "in": 8345,
+   "out": 30,
+   "usd": 0.00085
+  },
+  "h8:matches:best_graph_full:q112": {
+   "calls": 1,
+   "in": 125,
+   "out": 23,
+   "usd": 2.4e-05
+  },
+  "h8:answerable:naive_full:q115": {
+   "calls": 1,
+   "in": 6481,
+   "out": 40,
+   "usd": 0.000668
+  },
+  "h8:matches:naive_full:q115": {
+   "calls": 1,
+   "in": 107,
+   "out": 51,
+   "usd": 3.6e-05
+  },
+  "h8:answerable:fused_top3:q115": {
+   "calls": 1,
+   "in": 1434,
+   "out": 33,
+   "usd": 0.00016
+  },
+  "h8:matches:fused_top3:q115": {
+   "calls": 1,
+   "in": 100,
+   "out": 37,
+   "usd": 2.9e-05
+  },
+  "h8:answerable:best_graph_full:q115": {
+   "calls": 1,
+   "in": 6986,
+   "out": 21,
+   "usd": 0.000709
+  },
+  "h8:matches:best_graph_full:q115": {
+   "calls": 1,
+   "in": 107,
+   "out": 33,
+   "usd": 2.7e-05
+  },
+  "h8:answerable:naive_full:q118": {
+   "calls": 1,
+   "in": 8763,
+   "out": 23,
+   "usd": 0.000888
+  },
+  "h8:matches:naive_full:q118": {
+   "calls": 1,
+   "in": 88,
+   "out": 22,
+   "usd": 2e-05
+  },
+  "h8:answerable:fused_top3:q118": {
+   "calls": 1,
+   "in": 1956,
+   "out": 62,
+   "usd": 0.000227
+  },
+  "h8:matches:fused_top3:q118": {
+   "calls": 1,
+   "in": 90,
+   "out": 24,
+   "usd": 2.1e-05
+  },
+  "h8:answerable:best_graph_full:q118": {
+   "calls": 1,
+   "in": 8685,
+   "out": 25,
+   "usd": 0.000881
+  },
+  "h8:matches:best_graph_full:q118": {
+   "calls": 1,
+   "in": 90,
+   "out": 22,
+   "usd": 2e-05
+  }
+ }
+}
