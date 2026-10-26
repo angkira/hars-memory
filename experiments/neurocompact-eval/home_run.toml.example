@@ -1,5 +1,6 @@
-# home_run.toml - copy to home_run.toml and fill in. Used by scripts/home_run.py (HOME-RUNBOOK.md).
-# Paths may use ~ ; nothing secret goes in here (API keys live in the environment).
+# home_run.toml - copy to home_run.toml and (usually) change NOTHING but the paths. Used by scripts/home_run.py
+# (HOME-RUNBOOK.md). Paths may use ~ ; nothing secret goes in here (API keys live in the environment).
+# Defaults are the small, cheap run decided in Amendment C.3 (budget USD 20-30 in total).
 
 [general]
 profile       = "anthropic"                 # FROZEN per decision set (Amendment C.1-4)
@@ -10,44 +11,52 @@ embedder_id   = ""      # your real embedder id; recorded when the server report
 key_env       = ""      # e.g. "EVAL_API_KEY" to read the key from another variable than ANTHROPIC_API_KEY
 min_free_gb   = 30
 
-# HARD USD caps. 0 = NOT FILLED IN: every paid step refuses to start until you set it.
-# `home_run.py dry-run` prints the estimate per track to choose from.
+# HARD USD caps (Amendment C.3-3). 0 = NOT FILLED IN: every paid step refuses to start.
+# gen/run/judge are campaign-wide per phase (summed over the tracks) unless a [caps.<track>] override exists;
+# `total` is the ceiling over everything. `home_run.py dry-run` prints the estimate against `total`.
 #   gen   = QA generation (Claude Code track)
 #   run   = replays / compactions / answers + the flagged estimate of HARS extraction
 #   judge = the blind judge
 [caps]
-gen   = 0.0        # <GEN_CAP_USD>
-run   = 0.0        # <RUN_CAP_USD>
-judge = 0.0        # <JUDGE_CAP_USD>
+total = 30.0
+gen   = 3.0
+run   = 20.0
+judge = 5.0
 # per-track overrides (optional), same keys:
 # [caps.beam]
-# run = 40.0
-# judge = 10.0
+# run = 12.0
 
-[oh]                                  # OpenHands chain track (14 chains, single + xspan_locator + unanswerable)
-artifact_dir = "~/hars-data/20261026T144511Z-oh-multihop-qa"   # the copied artifact dir (holds chains.jsonl)
+[oh]                                  # OpenHands chain track: all 14 chains (single + xspan_locator + unanswerable)
+# the unpacked dataset dir; leave empty to auto-detect <artifact_root>/*-oh-multihop-qa, or unpack the tarball with
+#   home_run.py --oh-tar ~/oh-multihop-qa-20261026T144511Z.tar.gz dry-run
+artifact_dir = ""
 batch_chains = 4                      # chains per run_chainreplay invocation (the host has an OOM history)
 retries      = 1                      # re-run invalid / missing (chain, B) cells this many times
-budgets      = [1536, 1024, 512]      # the protocol sweep; 1536 is the primary cell and runs first
+budgets      = [1536]                 # primary cell only. OPT-IN protocol sweep: [1536, 1024, 512] (~3x the cost)
 graph_store  = ""                     # <HARS sessions dir> for the funnel's anchor_in_graph stage (optional)
 
-[beam]                                # Amendment C.2 long-session track: primary = BEAM-1M
+[beam]                                # Amendment C.2/C.3 long-session track: BEAM-1M, a seeded sample
 repo        = "~/data/BEAM"           # git clone https://github.com/mohammadtavakoli78/BEAM
 size        = "1M"
-chats       = "all"                   # all 35 chats of BEAM-1M (the primary is defined on all of them)
+chats       = "sample"                # "sample" = N seeded chats (C.3-2); "all" = all 35 (about 3.5x the cost)
+n_chats     = 10                      # N, fixed before results; the selection is written to beam/selection.json
+seed        = 20261026                # random.Random("<seed>:<size>").sample(sorted chat numbers, N)
 limit       = 0
 checkpoints = "end"
-budgets     = [1536, 1024, 512]       # 1536 alone is enough for the primary; 1024/512 feed L2/L3
+budgets     = [1536]                  # primary only. OPT-IN: [1536, 1024, 512] adds L2/L3 (n/a = p 1 without it)
 session_concurrency = 1
 extra_args  = []                      # appended to run_longsession.py (a protocol change if you alter window/keep-tail!)
 
-[cc]                                  # your Claude Code transcripts: DESCRIPTIVE only (C.2)
-paths       = ["~/.claude/projects/-home-you-project"]
-min_tokens  = 300000
+[cc]                                  # your Claude Code transcripts: DESCRIPTIVE only (C.2). Pick the session(s):
+#   home_run.py cc --find "HARS Experts Research"      (title / first message substring; prints candidates)
+#   home_run.py cc --session-id <cse_... or uuid>      home_run.py cc --list      (longest, with compaction counts)
+paths       = []                      # or list transcript files/dirs explicitly; --find/--session-id override this
+root        = "~/.claude/projects"    # where --find/--list/--session-id search (*/*.jsonl)
+min_tokens  = 0                       # a picked session is never filtered by length
 limit       = 0
-n_single    = 20
-n_multihop  = 8
-session_budget_usd = 5.0
+n_single    = 12
+n_multihop  = 4
+session_budget_usd = 2.5
 checkpoints = "every:3"
 budgets     = [1536]
 max_questions = 0

@@ -43,9 +43,11 @@ estimate of HARS extraction, judge = the blind judge. See HOME-RUNBOOK.md.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -62,6 +64,7 @@ except ImportError:                     # pragma: no cover
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
+import cc_discover  # noqa: E402
 import ls_redact  # noqa: E402
 import providers as P  # noqa: E402
 
@@ -73,20 +76,28 @@ LLM_S_PER_SUMMARY, LLM_S_PER_ASK = 20.0, 8.0    # rough wall-clock model for run
 TRACKS = ("oh", "beam", "cc")
 PHASES = ("gen", "run", "judge")
 PLACEHOLDER_CAP = 0.0
+HOME_RUN_VERSION = "2026-10-26.c3"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
+HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
+BUDGET_TOTAL_DEFAULT = 30.0
+CC_TYPICAL = {"gen": 2.0, "run": 1.5, "judge": 0.7}      # USD for one ~7-boundary Claude Code session (runbook section 0)
 
 DEFAULT_CONFIG: dict = {
     "general": {"profile": "anthropic", "mcp": "http://127.0.0.1:8307/mcp", "artifact_root": DEFAULT_ROOT,
                 "name": "home", "campaign_dir": "", "embedder_id": "", "python": "", "key_env": "",
                 "min_free_gb": 30.0, "http_timeout_s": 10},
     # USD hard caps; 0 = placeholder the owner has not filled in yet (paid steps then refuse)
-    "caps": {"gen": PLACEHOLDER_CAP, "run": PLACEHOLDER_CAP, "judge": PLACEHOLDER_CAP,
+    # gen/run/judge are campaign-wide per phase (summed over tracks) unless a [caps.<track>] override exists;
+    # `total` (0 = unchecked) is the hard ceiling over everything (Amendment C.3-3: USD 30)
+    "caps": {"gen": PLACEHOLDER_CAP, "run": PLACEHOLDER_CAP, "judge": PLACEHOLDER_CAP, "total": 0.0,
              "oh": {}, "beam": {}, "cc": {}},
-    "oh": {"artifact_dir": "", "batch_chains": 4, "retries": 1, "budgets": [1536, 1024, 512],
+    # small by default (Amendment C.3-2): 14 OH chains at B=1536; BEAM-1M N=10 seeded chats at B=1536; sweeps opt-in
+    "oh": {"artifact_dir": "", "batch_chains": 4, "retries": 1, "budgets": [1536],
            "graph_store": ""},
-    "beam": {"repo": "", "size": "1M", "chats": "all", "limit": 0, "checkpoints": "end",
-             "budgets": [1536, 1024, 512], "session_concurrency": 1, "extra_args": []},
-    "cc": {"paths": [], "min_tokens": 300000, "limit": 0, "n_single": 20, "n_multihop": 8,
-           "session_budget_usd": 5.0, "checkpoints": "every:3", "budgets": [1536], "max_questions": 0, "extra_args": []},
+    "beam": {"repo": "", "size": "1M", "chats": "sample", "n_chats": 10, "seed": 20261026, "limit": 0,
+             "checkpoints": "end", "budgets": [1536], "session_concurrency": 1, "extra_args": []},
+    "cc": {"paths": [], "root": "~/.claude/projects", "min_tokens": 0, "limit": 0, "n_single": 12, "n_multihop": 4,
+           "session_budget_usd": 2.5, "checkpoints": "every:3", "budgets": [1536], "max_questions": 0, "extra_args": []},
     "smoke": {"run_cap_oh": 0.60, "run_cap_ls": 0.25, "judge_cap": 0.25},
     "hars": {"data_dir": "", "port": 8307},
 }
@@ -193,8 +204,43 @@ def load_config(path: str | None, overrides: dict | None = None) -> dict:
         if cfg[sec].get(key):
             cfg[sec][key] = ex(cfg[sec][key])
     cfg["cc"]["paths"] = [ex(p) for p in (cfg["cc"].get("paths") or [])]
+    cfg["cc"]["root"] = ex(cfg["cc"].get("root") or "~/.claude/projects")
+    oh = cfg["oh"].get("artifact_dir")
+    if not oh or not os.path.isfile(os.path.join(oh, "chains.jsonl")):
+        found = find_oh_dir(cfg["general"]["artifact_root"])
+        if found:
+            cfg["oh"]["artifact_dir"] = found
+            cfg["oh"]["_autodetected"] = True
     cfg["_config_path"] = os.path.abspath(path) if path else None
     return cfg
+
+
+OH_TAR_DEFAULT = "oh-multihop-qa-20261026T144511Z.tar.gz"
+
+
+def find_oh_dir(root: str) -> str | None:
+    """Newest `<root>/*-oh-multihop-qa` directory that holds chains.jsonl (the unpacked OH dataset)."""
+    cands = sorted(d for d in glob.glob(os.path.join(root, "*-oh-multihop-qa")) if os.path.isfile(os.path.join(d, "chains.jsonl")))
+    return cands[-1] if cands else None
+
+
+def extract_oh_tar(tar_path: str, root: str) -> str:
+    """Unpack the OpenHands dataset tarball into the artifacts root (safe: no absolute / `..` members,
+    no links) and return the `<root>/<UTC>-oh-multihop-qa` directory that holds chains.jsonl."""
+    tar_path = os.path.expanduser(tar_path)
+    if not os.path.isfile(tar_path):
+        raise HomeRunError(f"OH tarball not found: {tar_path} (expected {OH_TAR_DEFAULT})")
+    os.makedirs(root, exist_ok=True)
+    with tarfile.open(tar_path, "r:*") as tf:
+        for m in tf.getmembers():
+            n = os.path.normpath(m.name)
+            if n.startswith(("/", "..")) or ".." in n.split(os.sep) or m.issym() or m.islnk() or m.isdev():
+                raise HomeRunError(f"refusing unsafe tar member {m.name!r}")
+        tf.extractall(root, filter="data")
+    found = find_oh_dir(root)
+    if not found:
+        raise HomeRunError(f"{tar_path} unpacked into {root} but no *-oh-multihop-qa/chains.jsonl was found")
+    return found
 
 
 def cap_for(cfg: dict, track: str, phase: str) -> float:
@@ -205,6 +251,11 @@ def cap_for(cfg: dict, track: str, phase: str) -> float:
         return float(v or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def has_track_cap(cfg: dict, track: str, phase: str) -> bool:
+    t = (cfg["caps"].get(track) or {}).get(phase)
+    return t not in (None, "")
 
 
 def need_cap(cfg: dict, track: str, phase: str) -> float:
@@ -336,6 +387,13 @@ class Campaign:
     def spent(self, track: str, phase: str) -> float:
         return self.ledger()["totals"].get(f"{track}.{phase}", 0.0)
 
+    def spent_for_cap(self, track: str, phase: str) -> float:
+        """What counts against the cap of (track, phase): that track's own spend when it has a
+        [caps.<track>] override, else the phase spend of ALL tracks (campaign-wide cap)."""
+        if has_track_cap(self.cfg, track, phase):
+            return self.spent(track, phase)
+        return sum(v for k, v in self.ledger()["totals"].items() if k.endswith("." + phase))
+
     def charge(self, track: str, phase: str, step: str, usd: float, source: str, note: str = "") -> None:
         led = read_json(self.p("ledger.json"), {"entries": []})
         # idempotent per (step, source): a re-parse of the same artifact replaces its entry
@@ -347,10 +405,18 @@ class Campaign:
 
     def remaining(self, track: str, phase: str) -> float:
         cap = need_cap(self.cfg, track, phase)
-        rem = cap - self.spent(track, phase)
+        sp = self.spent_for_cap(track, phase)
+        rem = cap - sp
         if rem < 0.0005:
-            raise HomeRunError(f"{track}.{phase} cap ${cap:.2f} is spent (${self.spent(track, phase):.4f}); "
+            raise HomeRunError(f"{track}.{phase} cap ${cap:.2f} is spent (${sp:.4f}); "
                                "raise the cap in home_run.toml to continue (the step resumes).")
+        total = float(self.cfg["caps"].get("total") or 0.0)
+        if total > 0:
+            all_spent = sum(self.ledger()["totals"].values())
+            if total - all_spent < 0.0005:
+                raise HomeRunError(f"total budget ${total:.2f} is spent (${all_spent:.4f} over all tracks); raise "
+                                   "[caps] total in home_run.toml to continue (the step resumes).")
+            rem = min(rem, total - all_spent)
         return round(rem, 4)
 
     # ---- subprocess
@@ -485,6 +551,76 @@ def check_row(name: str, status: str, detail: str, scope: str = "all") -> dict:
     return {"check": name, "status": status, "detail": detail, "scope": scope}
 
 
+def stale_copy_rows(probes: Probes, base: str | None = None) -> list[dict]:
+    """Is this the current checkout of the eval, or an obsolete copy (e.g. /tmp/opencode/nc-eval:
+    old runner, OpenRouter-only judge/extractor, Haiku 4.5 defaults, 5-session dataset)?"""
+    base = base or BASE
+    ev = os.path.dirname(base)
+    rows: list[dict] = []
+    must = [os.path.join(base, "providers.py"), os.path.join(base, "cc_discover.py"),
+            os.path.join(base, "run_longsession.py"), os.path.join(ev, "profiles", "anthropic.json"),
+            os.path.join(ev, "pi-agent", "extensions", "neurocompact.ts"), os.path.join(ev, "REPORT-PROTOCOL.md")]
+    missing = [os.path.relpath(p, ev) for p in must if not os.path.isfile(p)]
+    verfile = os.path.join(ev, "EVAL-VERSION")
+    try:
+        ver = open(verfile).read().strip()
+    except OSError:
+        ver = ""
+    proto = ""
+    try:
+        proto = open(os.path.join(ev, "REPORT-PROTOCOL.md"), encoding="utf-8").read()
+    except OSError:
+        pass
+    real = os.path.realpath(base)
+    suspicious = any(m in real for m in ("/tmp/", "opencode", "/nc-eval/"))
+    rc, top = probes.cmd(["git", "-C", base, "rev-parse", "--show-toplevel"])
+    in_git = rc == 0 and bool(top.strip())
+    rc2, branch = probes.cmd(["git", "-C", base, "rev-parse", "--abbrev-ref", "HEAD"]) if in_git else (1, "")
+    bad = []
+    if missing:
+        bad.append("missing " + ", ".join(missing))
+    if ver != HOME_RUN_VERSION:
+        bad.append(f"version marker {ver or '(none)'!r} != {HOME_RUN_VERSION!r} (EVAL-VERSION)")
+    if proto and "Amendment C.3" not in proto and "AMENDMENT C.3" not in proto:
+        bad.append("REPORT-PROTOCOL.md has no Amendment C.3")
+    if bad:
+        rows.append(check_row("stale_copy", "FAIL",
+                              f"THIS IS A STALE OR INCOMPLETE COPY of the eval ({'; '.join(bad)}). Use "
+                              "experiments/neurocompact-eval/ of a fresh checkout of branch "
+                              "claude/youthful-thompson-yv6xqd; the old /tmp/opencode/nc-eval copy is obsolete "
+                              "(old runner, OpenRouter-only judge/extractor, Haiku 4.5 defaults, 5-session dataset)."))
+    elif suspicious or not in_git:
+        rows.append(check_row("stale_copy", "WARN",
+                              f"running from {real}: " + ("not inside a git checkout " if not in_git else "")
+                              + ("path looks like a scratch/obsolete copy (/tmp, opencode, nc-eval) "
+                                 if suspicious else "")
+                              + "- run from experiments/neurocompact-eval/ of the repo checkout "
+                                "(branch claude/youthful-thompson-yv6xqd)"))
+    else:
+        rows.append(check_row("stale_copy", "OK", f"eval {ver} from {real} (git {top.strip()}, branch "
+                                                  f"{branch.strip() or '?'})"))
+    return rows
+
+
+def role_model_table(cfg: dict) -> tuple[list[str], list[dict]]:
+    """Resolved role -> model table (profile defaults + prices) and WARN rows for stale defaults."""
+    prof = P.load_profile(cfg["general"]["profile"])
+    models = P.resolve_models(prof, {})
+    lines = [f"role -> model (profile {prof.name}, prompt cache {'ON' if prof.cache_enabled else 'off'})",
+             f"  {'role':<13} {'model':<26} {'in/out USD per MTok':<22} {'cache read/write':<18} price status"]
+    rows = []
+    for r in P.ROLES:
+        m = models.get(r)
+        e = prof.price(m) if m else None
+        lines.append(f"  {r:<13} {str(m):<26} "
+                     + ((f"{e['in']}/{e['out']}".ljust(22) + f"{e.get('cache_read', '-')}/{e.get('cache_write', '-')}".ljust(18)
+                         + e["status"]) if e else "no price"))
+        if prof.name == "anthropic" and r in HAIKU_ROLES and m != EXPECTED_DEFAULT_MODEL:
+            rows.append(check_row(f"model.default.{r}", "WARN",
+                                  f"{r} resolves to {m!r}, the frozen decision-set default is {EXPECTED_DEFAULT_MODEL}"))
+    return lines, rows
+
+
 def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = False,
                   tracks=TRACKS, offline: bool = False) -> list[dict]:
     g = cfg["general"]
@@ -498,6 +634,7 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
     add("repo", "OK" if head and not dirty.strip() else "WARN",
         f"git {head[:10] or 'unknown'}" + (" (uncommitted changes under the eval dir: recorded runs are not "
                                           "reproducible from the sha alone)" if dirty.strip() else ""))
+    rows.extend(stale_copy_rows(probes))
     # profile + models + prices
     try:
         prof = P.load_profile(g["profile"])
@@ -505,6 +642,7 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
         add("profile", "FAIL", str(e))
         return rows
     models = P.resolve_models(prof, {})
+    rows.extend(role_model_table(cfg)[1])
     unconf = [f"{r}:{models[r]}" for r in P.ROLES if models.get(r)
               and (prof.price(models[r]) or {}).get("status") != "confirmed"]
     add("profile", "WARN" if unconf else "OK",
@@ -616,9 +754,12 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
                                         else "missing - git clone https://github.com/mohammadtavakoli78/BEAM, set [beam] repo"),
         scope="beam")
     ccp = [p for p in cfg["cc"].get("paths") or [] if os.path.exists(os.path.expanduser(p))]
-    add("input.cc", "OK" if ccp else "WARN",
+    nfiles = len(cc_discover.list_files(cfg["cc"].get("root") or cc_discover.DEFAULT_ROOT))
+    add("input.cc", "OK" if (ccp or nfiles) else "WARN",
         f"{len(ccp)} path(s) exist of {len(cfg['cc'].get('paths') or [])} configured" if cfg["cc"].get("paths")
-        else "(unset) set [cc] paths = ['~/.claude/projects/<proj>']", scope="cc")
+        else (f"{nfiles} transcript(s) under {cfg['cc'].get('root')}: pick one with `home_run.py cc --find \"<title>\"` "
+              "or `cc --list`" if nfiles else f"no transcripts under {cfg['cc'].get('root')}: set [cc] root or "
+              "[cc] paths, or pass --projects-root"), scope="cc")
     # writable root
     try:
         os.makedirs(root, exist_ok=True)
@@ -750,8 +891,10 @@ def parse_chainreplay_dry(text: str) -> dict:
         pm = re.search(r"projected cost: .*?= \$([\d.]+)", blk)
         if pm:
             per_chain[cid] = float(pm.group(1))
+    cm = re.search(r"prompt cache (ON|off): projected saving vs uncached \$([\d.]+)", text)
     return {"compactions": int(m.group(1)), "asks": int(m.group(2)), "minutes": float(m.group(3)),
-            "usd": float(m.group(4)), "per_chain_usd_single_b": per_chain}
+            "usd": float(m.group(4)), "per_chain_usd_single_b": per_chain,
+            "cache_on": bool(cm and cm.group(1) == "ON"), "cache_saving_single_b": float(cm.group(2)) if cm else 0.0}
 
 
 def parse_gen_dry(text: str) -> float:
@@ -773,6 +916,7 @@ def ls_dry_summary(res: dict, n_budgets: int, judge_unit: float) -> dict:
     return {"run_usd": float(res.get("grand_total_usd") or 0.0), "sessions": len(res.get("sessions", [])),
             "boundaries": boundaries, "asks": asks, "judged_items": asks, "judge_usd": asks * judge_unit,
             "wall_hours": ingest_h + llm_h, "ingest_hours": ingest_h,
+            "cache_saving_usd": float(res.get("grand_cache_saving_usd") or 0.0),
             "unpriced_models": res.get("unpriced_models", [])}
 
 
@@ -821,6 +965,25 @@ def oh_inputs(camp: Campaign) -> str:
     return dst
 
 
+def beam_selection(cfg: dict) -> dict | None:
+    """Deterministic, seeded N-chat sample of BEAM (Amendment C.3-2); None when chats != "sample".
+    Population = the numeric chat dirs under chats/<size>/, sorted; random.Random("<seed>:<size>").sample;
+    the result is sorted and recorded BEFORE any run (beam/selection.json)."""
+    b = cfg["beam"]
+    if str(b.get("chats") or "all") != "sample":
+        return None
+    size = str(b["size"])
+    d = os.path.join(b.get("repo") or "", "chats", size)
+    if not os.path.isdir(d):
+        raise HomeRunError(f"BEAM chats dir not found: {d} ([beam] repo must be a BEAM checkout)")
+    pop = sorted(int(x) for x in os.listdir(d) if x.isdigit() and os.path.isdir(os.path.join(d, x)))
+    n = int(b.get("n_chats") or 10)
+    seed = b.get("seed", 20261026)
+    sel = sorted(random.Random(f"{seed}:{size}").sample(pop, n)) if n < len(pop) else list(pop)
+    return {"method": 'sorted(random.Random(f"{seed}:{size}").sample(sorted(population), n))', "seed": seed,
+            "size": size, "n": n, "population": pop, "selected": sel, "protocol": "Amendment C.3-2"}
+
+
 def beam_import(camp: Campaign, step: str = "beam.import") -> str:
     b = camp.cfg["beam"]
     data = camp.p("beam", "data")
@@ -831,15 +994,20 @@ def beam_import(camp: Campaign, step: str = "beam.import") -> str:
                                "https://github.com/mohammadtavakoli78/BEAM) containing chats/")
         if os.path.isdir(data) and os.listdir(data):
             camp.quarantine(data)
+        sel = beam_selection(camp.cfg)
+        if sel:
+            write_json(camp.p("beam", "selection.json"), sel)
+            print(f"  BEAM sample (seed {sel['seed']}): {len(sel['selected'])} of {len(sel['population'])} chats "
+                  f"{sel['selected']} -> beam/selection.json")
         argv = [camp.script("import_beam.py"), "--repo", b["repo"], "--size", str(b["size"]), "--out", data,
-                "--chats", str(b.get("chats") or "all")]
+                "--chats", ",".join(str(x) for x in sel["selected"]) if sel else str(b.get("chats") or "all")]
         if int(b.get("limit") or 0):
             argv += ["--limit", str(int(b["limit"]))]
         camp.run(step, argv, isolated=True)
         n = len([f for f in os.listdir(data) if f.endswith((".json", ".jsonl"))]) if os.path.isdir(data) else 0
         exp = BEAM_EXPECTED.get(str(b["size"]))
         warn = ""
-        if exp and str(b.get("chats") or "all") == "all" and not int(b.get("limit") or 0) and n != exp:
+        if exp and not sel and str(b.get("chats") or "all") == "all" and not int(b.get("limit") or 0) and n != exp:
             warn = f"BEAM {b['size']} has {exp} chats per the dataset description, the import found {n}"
             print("  WARNING " + warn)
         return {"sessions": n, "expected": exp, "warning": warn}
@@ -889,6 +1057,7 @@ def estimate_oh(camp: Campaign) -> dict:
     ju = judge_unit_usd(camp.cfg)
     return {"track": "oh", "gen_usd": 0.0, "run_usd": d["usd"], "judge_usd": d["asks"] * ju,
             "judged_items": d["asks"], "wall_hours": d["minutes"] / 60.0, "budgets": b,
+            "cache_saving_usd": d["cache_saving_single_b"] * len(b),
             "chains": len(read_jsonl(chains)), "per_chain_usd_single_b": d["per_chain_usd_single_b"],
             "note": "run = pi agent turns + flagged HARS/keyword estimates (run_chainreplay projection)"}
 
@@ -922,7 +1091,8 @@ def estimate_beam(camp: Campaign) -> dict:
     return {"track": "beam", "gen_usd": 0.0, "run_usd": s["run_usd"], "judge_usd": s["judge_usd"],
             "judged_items": s["judged_items"], "wall_hours": s["wall_hours"], "budgets": b["budgets"],
             "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": s["ingest_hours"],
-            "unpriced_models": s["unpriced_models"],
+            "unpriced_models": s["unpriced_models"], "cache_saving_usd": s.get("cache_saving_usd", 0.0),
+            "selection": (beam_selection(camp.cfg) or {}).get("selected"),
             "note": "HARS ingest wall-clock uses 11 s/piece (a guess: calibrate on the first session)"}
 
 
@@ -960,7 +1130,7 @@ def estimate_cc(camp: Campaign) -> dict:
              "boundaries": 0, "unpriced_models": []}
     return {"track": "cc", "gen_usd": gen_usd, "run_usd": s["run_usd"], "judge_usd": s["judge_usd"],
             "judged_items": s["judged_items"], "wall_hours": s["wall_hours"], "budgets": c["budgets"],
-            "sessions": s["sessions"], "sessions_imported": len(sessions),
+            "sessions": s["sessions"], "sessions_imported": len(sessions), "cache_saving_usd": s.get("cache_saving_usd", 0.0),
             "note": "questions are placeholders (n_single+n_multihop per session, real boundaries, "
                     "orig arm included); QA generation is an upper-ish bound (max calls)"}
 
@@ -971,7 +1141,15 @@ def dry_run_report(camp: Campaign, tracks: list[str]) -> dict:
         try:
             est[t] = {"oh": estimate_oh, "beam": estimate_beam, "cc": estimate_cc}[t](camp)
         except HomeRunError as e:
-            est[t] = {"track": t, "skipped": str(e)}
+            if t == "cc" and not camp.cfg["cc"].get("paths"):
+                # no session picked yet: carry the typical one-session figures of HOME-RUNBOOK section 0 so the
+                # all-tracks total is not understated (replaced by the real estimate after `cc --find/--session-id`)
+                est[t] = {"track": "cc", "gen_usd": CC_TYPICAL["gen"], "run_usd": CC_TYPICAL["run"],
+                          "judge_usd": CC_TYPICAL["judge"], "judged_items": 0, "wall_hours": 2.5, "cache_saving_usd": 0.0,
+                          "assumed": True, "note": "TYPICAL one session (none picked yet: use `cc --find TEXT` / "
+                                                   "`cc --list`); run `dry-run --find TEXT` for the real figure"}
+            else:
+                est[t] = {"track": t, "skipped": str(e)}
     lines = ["track  | gen est   | run est    | judge est | total      | wall-clock | caps gen/run/judge   | check",
              "-------+-----------+------------+-----------+------------+------------+----------------------+------"]
     grand = {"gen": 0.0, "run": 0.0, "judge": 0.0}
@@ -995,6 +1173,26 @@ def dry_run_report(camp: Campaign, tracks: list[str]) -> dict:
                      f"{caps['gen']:>6.2f}/{caps['run']:>6.2f}/{caps['judge']:>6.2f} | {chk}")
     lines.append(f"TOTAL  | {fmt_usd(grand['gen']):>9} | {fmt_usd(grand['run']):>10} | {fmt_usd(grand['judge']):>9} |"
                  f" {fmt_usd(sum(grand.values())):>10} |")
+    total = sum(grand.values())
+    tcap = float(camp.cfg["caps"].get("total") or 0.0)
+    ceiling = tcap if tcap > 0 else BUDGET_TOTAL_DEFAULT
+    saving = sum(float(est[t].get("cache_saving_usd") or 0.0) for t in tracks if not est[t].get("skipped"))
+    verdict = (f"OK (headroom {fmt_usd(ceiling - total)})" if total <= ceiling else
+               f"OVER by {fmt_usd(total - ceiling)}: narrow the tracks / lower BEAM n_chats / skip the sweep")
+    skipped = [t for t in tracks if est[t].get("skipped")]
+    if skipped:
+        lines += ["", f"!!! the total EXCLUDES the skipped track(s) {skipped} (inputs missing, see above): fix the inputs and "
+                      "re-run dry-run before trusting it"]
+    assumed = [t for t in tracks if est[t].get("assumed")]
+    if assumed:
+        lines += [f"NOTE {assumed}: typical one-session figures, not your data (pick a session: dry-run --find TEXT)"]
+    lines += ["", f"ALL TRACKS TOTAL {fmt_usd(total)} vs {fmt_usd(ceiling)} total budget "
+                  f"({'[caps] total' if tcap > 0 else 'default ceiling, set [caps] total'}): {verdict}",
+              f"  by phase vs the campaign-wide caps: "
+              + ", ".join(f"{ph} {fmt_usd(grand[ph])}/{fmt_usd(float(camp.cfg['caps'].get(ph) or 0))}" for ph in PHASES),
+              f"  prompt cache (Amendment C.3, cost-only) is already inside the numbers above; estimated saving vs "
+              f"uncached {fmt_usd(saving)} (the dry runs of the scripts price cache writes/reads; summariser "
+              "and compaction calls are not cached)"]
     lines += ["", f"judge unit: {JUDGE_IN_TOK} in / {JUDGE_OUT_TOK} out tokens per judged item at the profile's judge "
                   f"price ({fmt_usd(judge_unit_usd(camp.cfg))} per item); wall-clock = the runners' own model "
                   f"(OH) or ingest + {LLM_S_PER_SUMMARY:.0f}s/summary + {LLM_S_PER_ASK:.0f}s/ask (long-session).",
@@ -1003,6 +1201,7 @@ def dry_run_report(camp: Campaign, tracks: list[str]) -> dict:
     text = "\n".join(lines)
     print("\n" + text)
     out = {"ts": utc_iso(), "profile": camp.cfg["general"]["profile"], "estimates": est,
+           "total_budget_usd": ceiling, "within_total_budget": total <= ceiling, "cache_saving_usd": round(saving, 4),
            "grand_total_usd": round(sum(grand.values()), 4), "by_phase": {k: round(v, 4) for k, v in grand.items()}}
     write_json(camp.p("dry-run.json"), out)
     with open(camp.p("dry-run.md"), "w") as f:
@@ -1348,10 +1547,68 @@ def cmd_beam(camp: Campaign, args) -> int:
     return 0
 
 
+def cc_discover_cmd(cfg: dict, args, *, input_fn=input, isatty=None, out=print) -> tuple[int, dict | None]:
+    """`cc --list | --find TEXT | --session-id ID`: scan <root>/*/*.jsonl, print the candidates (size, dates,
+    messages, compact boundaries, title) and let the owner pick (prompt on a TTY, else --pick N or the single
+    match). Returns (exit code, chosen candidate or None). Reads transcripts only; zero spend."""
+    root = getattr(args, "projects_root", None) or cfg["cc"].get("root") or cc_discover.DEFAULT_ROOT
+    root = os.path.expanduser(root)
+    find, sid, lst = getattr(args, "find", None), getattr(args, "session_id", None), getattr(args, "list", False)
+    files = cc_discover.list_files(root)
+    out(f"[cc] scanning {len(files)} transcript file(s) under {root}")
+    if not files:
+        raise HomeRunError(f"no *.jsonl transcripts under {root} (expected ~/.claude/projects/<project>/<session>.jsonl;"
+                           " pass --projects-root or set [cc] root)")
+    cands = cc_discover.discover(root, find=find, session_id=sid, list_top=int(getattr(args, "top", 15) or 15) if lst else 0)
+    if lst:
+        out("longest sessions, most compact boundaries first (only sessions with boundaries can run the cc track):")
+        out(cc_discover.format_candidates(cands))
+        out("\nnext: home_run.py cc --find \"<title words>\"   or   cc --session-id <id>   (then --pick N if several)")
+        return 0, None
+    what = f"title/first message containing {find!r}" if find else f"session id {sid!r}"
+    if not cands:
+        raise HomeRunError(f"no session matches {what} under {root}. Try `cc --list`, a shorter --find, a "
+                           "different --projects-root, or the full transcript path via --cc-paths.")
+    out(f"{len(cands)} candidate(s) for {what}:")
+    out(cc_discover.format_candidates(cands))
+    pick = getattr(args, "pick", None)
+    if pick is None:
+        if len(cands) == 1:
+            pick = 1
+        else:
+            tty = sys.stdin.isatty() if isatty is None else isatty
+            if not tty:
+                out("\nseveral candidates and no terminal: re-run with --pick N (the # column); nothing was imported or spent.")
+                return 3, None
+            ans = input_fn(f"Pick one [1-{len(cands)}, q = quit]: ").strip().lower()
+            if ans in ("", "q", "quit"):
+                out("nothing picked.")
+                return 3, None
+            pick = int(ans) if ans.isdigit() else 0
+    if not (1 <= int(pick) <= len(cands)):
+        raise HomeRunError(f"--pick {pick} is out of range 1..{len(cands)}")
+    ch = cands[int(pick) - 1]
+    out(f"\n[cc] picked #{pick}: {ch['path']}  ({human_size(ch['size'])}, {ch['messages']} msgs, "
+        f"{ch['compactions']} compact boundaries, {ch['first_ts'][:10]}..{ch['last_ts'][:10]})")
+    if ch["compactions"] == 0:
+        raise HomeRunError("this session has NO /compact boundary: the cc track (`orig` arm, real boundaries) cannot run "
+                           "on it. Pick another candidate or run `cc --list`.")
+    return 0, ch
+
+
 def cmd_cc(camp: Campaign, args) -> int:
     import longsession as L  # noqa: PLC0415
     cfg = camp.cfg
     c = cfg["cc"]
+    sel = cfg.get("_cc_selected")
+    if sel:
+        sp = camp.p("cc", "selected-session.json")
+        prev = read_json(sp, None)
+        if prev and prev.get("path") != sel["path"]:
+            raise HomeRunError(f"this campaign already imported {prev['path']}; use --new to run another session")
+        write_json(sp, {k: sel[k] for k in ("path", "file_id", "project", "size", "first_ts", "last_ts", "messages",
+                                           "compactions", "matched") if k in sel} | {"ts": utc_iso(),
+                        "label": cc_discover.label(sel, 80), "selection": "home_run cc --find/--session-id"})
     data = cc_import(camp)
     qa_dir = camp.p("cc", "data-qa")
 
@@ -1760,6 +2017,9 @@ def common_parser() -> argparse.ArgumentParser:
     c.add_argument("--beam-size", default=S, choices=("100K", "500K", "1M", "10M"))
     c.add_argument("--beam-limit", type=int, default=S, help="max BEAM chats (0 = all)")
     c.add_argument("--cc-paths", nargs="+", default=S, help="Claude Code transcript files/dirs")
+    c.add_argument("--oh-tar", default=S, metavar="TAR",
+                   help=f"unpack the OpenHands dataset tarball ({OH_TAR_DEFAULT}) into the artifact root and use it")
+    c.add_argument("--beam-n", type=int, default=S, help="BEAM: number of seeded sample chats (default 10)")
     c.add_argument("--offline-selftest", action="store_true", default=S,
                    help="CI only: mock LLM + fake HARS for the long-session tracks, no network")
     return c
@@ -1777,6 +2037,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("hars-env", parents=[common], help="print the HARS server env block")
     dr = sub.add_parser("dry-run", parents=[common], help="cost / wall-clock estimate of all tracks (zero spend)")
     dr.add_argument("--tracks", default="oh,beam,cc")
+    dr.add_argument("--find", default=None, metavar="TEXT", help="price the Claude Code session whose title matches")
+    dr.add_argument("--session-id", default=None, metavar="ID")
+    dr.add_argument("--pick", type=int, default=None, metavar="N")
+    dr.add_argument("--projects-root", default=None)
     sm = sub.add_parser("smoke", parents=[common], help="1 chain + 1 tiny long session (own campaign)")
     sm.add_argument("--no-live", action="store_true")
     sm.add_argument("--skip-oh", action="store_true")
@@ -1792,6 +2056,14 @@ def build_parser() -> argparse.ArgumentParser:
         t.add_argument("--skip-judge", action="store_true", help="stop after export (no judge spend)")
         if name == "oh":
             t.add_argument("--retries", type=int, default=None, help="re-run invalid/missing (chain, B) cells N times")
+        if name == "cc":
+            t.add_argument("--find", default=None, metavar="TEXT",
+                           help="find the session by a substring of its title / first user message, e.g. \"HARS Experts Research\"")
+            t.add_argument("--session-id", default=None, metavar="ID", help="find the session by sessionId / uuid (cse_ or plain)")
+            t.add_argument("--list", action="store_true", help="list the longest sessions with compaction counts and exit")
+            t.add_argument("--pick", type=int, default=None, metavar="N", help="choose candidate N of --find/--session-id (non-interactive)")
+            t.add_argument("--projects-root", default=None, help="where transcripts live (default [cc] root = ~/.claude/projects)")
+            t.add_argument("--top", type=int, default=15, help="--list: how many sessions")
     b = sub.add_parser("bundle", parents=[common], help="tar.gz of what the analyst needs (redaction-scanned)")
     b.add_argument("--include-raw", action="store_true", help="also pack raw transcripts, session stores, judge input")
     b.add_argument("--no-redact", action="store_true", help="skip the redaction pass (scan report still written)")
@@ -1825,6 +2097,8 @@ def overrides_from_args(args) -> dict:
         o["beam"] = beam
     if getattr(args, "cc_paths", None):
         o["cc"] = {"paths": args.cc_paths}
+    if getattr(args, "beam_n", None):
+        o.setdefault("beam", {})["n_chats"] = args.beam_n
     return o
 
 
@@ -1837,8 +2111,19 @@ def main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
             cfg["general"]["_offline"] = True
         offline = bool(cfg["general"].get("_offline"))
         probes = probes or Probes()
+        if getattr(args, "oh_tar", None):
+            cfg["oh"]["artifact_dir"] = extract_oh_tar(args.oh_tar, cfg["general"]["artifact_root"])
+            print(f"[oh] unpacked {args.oh_tar} -> {cfg['oh']['artifact_dir']}")
         print(f"[config] {cfg_path or '(none: built-in defaults; caps unset)'} | profile {cfg['general']['profile']} "
-              f"| HARS {cfg['general']['mcp']} | root {cfg['general']['artifact_root']}")
+              f"| HARS {cfg['general']['mcp']} | root {cfg['general']['artifact_root']} | home_run {HOME_RUN_VERSION}")
+        if args.cmd in ("cc", "dry-run") and (getattr(args, "list", False) or getattr(args, "find", None)
+                                              or getattr(args, "session_id", None)):
+            rc, chosen = cc_discover_cmd(cfg, args)
+            if chosen is None:
+                return rc
+            cfg["cc"]["paths"] = [chosen["path"]]
+            cfg["cc"]["min_tokens"] = 0
+            cfg["_cc_selected"] = chosen
         if args.cmd == "hars-env":
             print("\n".join(hars_env_block(cfg)))
             return 0
@@ -1849,7 +2134,11 @@ def main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
         if args.cmd == "doctor":
             tracks = tuple(t for t in args.tracks.split(",") if t)
             rows = doctor_checks(cfg, probes, live=not args.no_live, deep=args.deep, tracks=tracks, offline=offline)
-            write_json(camp.p("doctor.json"), {"ts": utc_iso(), "checks": rows})
+            tbl, _ = role_model_table(cfg)
+            write_json(camp.p("doctor.json"), {"ts": utc_iso(), "version": HOME_RUN_VERSION, "role_models": tbl,
+                                               "checks": rows})
+            print(f"home_run {HOME_RUN_VERSION} @ {BASE}\n")
+            print("\n".join(tbl) + "\n")
             rc = print_doctor(rows)
             print("\n# HARS server LLM env for this profile (providers.py hars-env):")
             print("\n".join(hars_env_block(cfg)))

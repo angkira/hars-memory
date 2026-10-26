@@ -84,12 +84,18 @@ class ConfigAndCaps(unittest.TestCase):
         self.assertEqual(H.cap_for(cfg, "oh", "run"), 10.0)
         self.assertEqual(H.cap_for(cfg, "oh", "judge"), 0.0)
 
-    def test_toml_example_parses_and_has_unfilled_caps(self):
+    def test_toml_example_parses_and_has_suggested_caps(self):
         p = os.path.join(os.path.dirname(SCRIPTS), "home_run.toml.example")
         cfg = H.load_config(p, {})
-        self.assertEqual((cfg["caps"]["gen"], cfg["caps"]["run"], cfg["caps"]["judge"]), (0.0, 0.0, 0.0))
+        # Amendment C.3-3: suggested caps filled in; the built-in defaults stay 0 (= refuse without a config)
+        self.assertEqual((cfg["caps"]["gen"], cfg["caps"]["run"], cfg["caps"]["judge"], cfg["caps"]["total"]),
+                         (3.0, 20.0, 5.0, 30.0))
+        self.assertEqual(H.load_config(None, {})["caps"]["run"], 0.0)
         self.assertEqual(cfg["general"]["profile"], "anthropic")
         self.assertEqual(cfg["beam"]["size"], "1M")
+        # small by default: primary B only, BEAM N=10 seeded sample, sweeps opt-in (Amendment C.3-2)
+        self.assertEqual((cfg["oh"]["budgets"], cfg["beam"]["budgets"], cfg["cc"]["budgets"]), ([1536], [1536], [1536]))
+        self.assertEqual((cfg["beam"]["chats"], cfg["beam"]["n_chats"], cfg["beam"]["seed"]), ("sample", 10, 20261026))
         self.assertFalse(cfg["general"]["artifact_root"].startswith("/tmp"))
 
     def test_cli_cap_flags_reach_the_config(self):

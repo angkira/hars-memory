@@ -149,7 +149,7 @@ NATIVE_TRIGGER = CTX_WINDOW - RESERVE_TOKENS   # 30768: the effective native tri
 #   pi_flags     -> pi CLI args for the model. openrouter keeps its historical
 #                   `--model openrouter/<m> --provider openrouter`; anthropic uses the
 #                   documented `--provider anthropic --model <m>` (pi README /
-#                   docs/usage.md CLI table; built-in ids such as claude-haiku-4-5).
+#                   docs/usage.md CLI table; built-in ids such as claude-haiku-5-5).
 #   nc_provider  -> NC_PROVIDER / NC_SUM_PROVIDER consumed by pi-agent/extensions/
 #                   neurocompact.ts (modelRegistry.find(<provider>, <model id>)).
 #   key_env      -> env var pi reads for the key (pi docs/providers.md table).
@@ -302,7 +302,8 @@ def charge_pi_spend(pi_argv: list[str], stdout: str) -> None:
     usd = 0.0
     priced = True
     for t in sp["turns"]:
-        c = (ACTIVE_PROFILE.cost_usd(model, t["input"], t["output"], t["cacheRead"], t["cacheWrite"])
+        c = (ACTIVE_PROFILE.cost_usd(model, t["input"], t["output"], t["cacheRead"], t["cacheWrite"],
+                                     cache_ttl="1h" if cache_env().get("PI_CACHE_RETENTION") == "long" else None)
              if ACTIVE_PROFILE else None)
         if c is None:
             priced = False
@@ -3015,19 +3016,39 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
            "ask_in": 0, "ask_out": 0, "replay_s": 0.0, "comp_s": 0.0, "ask_s": 0.0,
            "compactions": 0, "asks": 0, "recall_s": 0.0}
     ctx = 500.0  # system prompt + tools scaffolding
-    est["replay_new"] = 0       # tokens that are NEW in a replay turn (cache write); the rest is a cache read
-    est["ask_first"] = 0        # prompt tokens of the first ask per (arm): cache write; later asks read
+    # prompt-cache bookkeeping (Amendment C.3, only used when PROMPT_CACHE): a prompt shorter than the
+    # model's minimum cacheable length (profile cache.min_tokens, conservative 4096) is not cached at all;
+    # the first turn above it writes the whole prompt, later turns read the previous prompt and write the delta.
+    min_cache = int((ACTIVE_PROFILE.cache_cfg if ACTIVE_PROFILE else {}).get("min_tokens") or 4096)
+    est["replay_uncached"] = 0   # replay prompt tokens billed at the plain input price
+    est["replay_write"] = 0      # replay prompt tokens written to the cache
+    est["replay_read"] = 0       # replay prompt tokens served from the cache
+    est["ask_first"] = 0         # prompt tokens of the first ask per arm: cache write; later asks read
     est["ask_cached"] = 0
+    est["ask_uncached"] = 0
+    prev_ctx = 0.0
+
+    def replay_turn(c: float, delta: float) -> None:
+        nonlocal prev_ctx
+        if c < min_cache:
+            est["replay_uncached"] += int(c)
+        elif prev_ctx >= min_cache:
+            est["replay_read"] += int(prev_ctx)
+            est["replay_write"] += int(c - prev_ctx)
+        else:
+            est["replay_write"] += int(c)
+        prev_ctx = c
+
     for i, sp in enumerate(spans):
         for _ in sp["segments"]:
             ctx += 350.0          # one turn per segment, context grows
             est["replay_in"] += int(ctx)
-            est["replay_new"] += 350
+            replay_turn(ctx, 350.0)
             est["replay_out"] += 6
             est["replay_s"] += MICRO_REPLAY_S
         ctx += 150.0              # boundary turn
         est["replay_in"] += int(ctx)
-        est["replay_new"] += 150
+        replay_turn(ctx, 150.0)
         est["replay_out"] += 30
         est["replay_s"] += MICRO_REPLAY_S
     for arm in arms:
@@ -3055,7 +3076,9 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
         note_est = int(CAPS["baseline"] * 0.55) if arm == "baseline" else est_note_nc
         post_ctx = note_est + KEEP_RECENT + (recall_cap_est if arm in RECALL_ARMS else 0)
         for k in range(asks):
-            if k == 0:
+            if post_ctx < min_cache:
+                est["ask_uncached"] += int(post_ctx)
+            elif k == 0:
                 est["ask_first"] += int(post_ctx)
             else:
                 est["ask_cached"] += int(post_ctx)
@@ -3073,11 +3096,10 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
         e = hit[1] if hit else {}
         rd = float(e.get("cache_read", pin * 0.1)) / max(pin, 1e-12)
         wr = float(e.get("cache_write", pin * 1.25)) / max(pin, 1e-12)
-        rep_read = max(0, est["replay_in"] - est["replay_new"])
-        usd_agent = ((est["comp_in"] + (est["ask_in"] - est["ask_first"] - est["ask_cached"]))
-                     / 1e6 * pin
-                     + (est["replay_new"] + est["ask_first"]) / 1e6 * pin * wr
-                     + (rep_read + est["ask_cached"]) / 1e6 * pin * rd
+        plain = est["comp_in"] + est["replay_uncached"] + est["ask_uncached"] + 300 * est["asks"]
+        usd_agent = (plain / 1e6 * pin
+                     + (est["replay_write"] + est["ask_first"]) / 1e6 * pin * wr
+                     + (est["replay_read"] + est["ask_cached"]) / 1e6 * pin * rd
                      + (est["replay_out"] + est["comp_out"] + est["ask_out"]) / 1e6 * pout)
     usd_hars = 0.0
     if ARM_CHUNKS in arms:

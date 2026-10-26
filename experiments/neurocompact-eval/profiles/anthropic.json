@@ -70,6 +70,7 @@
   "ttl": "5m",
   "pi_retention": "short",
   "summarizer_retention": "none",
+  "min_tokens": 4096,
   "note": "Cost-only (Amendment C.3). Direct calls: native /v1/messages with cache_control on system + stable prefix. pi agent loop: pi-ai caches with cache_control (short=5m, long=1h via PI_CACHE_RETENTION). Multipliers (Anthropic docs, WebSearch 2026-10-26): 5m write 1.25x input, 1h write 2x, read 0.1x (Sonnet 5.5 read reported as 0.05x by third parties, unconfirmed)."
  }
 }
