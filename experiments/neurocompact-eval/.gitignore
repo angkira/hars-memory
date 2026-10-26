@@ -1,0 +1,8 @@
+# Private session-derived data: NEVER commit (repo is public). Keep in /mnt/datasets/ft/artifacts/.
+export/calib_items.jsonl
+export/chains*.jsonl
+export/chains-manifest.json
+verify_chains.report.md
+runs/
+sessions/
+*.pid

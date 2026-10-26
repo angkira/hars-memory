@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "hars-memory": {
+      "url": "http://127.0.0.1:8301/mcp",
+      "description": "HARS long-term memory: recall facts, decisions and numbers from earlier parts of this session that are no longer in the visible context",
+      "exposure": "direct",
+      "timeout": 120
+    }
+  }
+}

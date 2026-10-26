@@ -1,0 +1,16 @@
+{
+ "chains": 2,
+ "mean_nc_memory_tokens": 1412.0,
+ "mean_baseline_memory_tokens": 1425.0,
+ "run_ratio": 0.991,
+ "window": [
+  0.8,
+  1.05
+ ],
+ "in_window": true,
+ "tokenizer": "estimator:chars/3.6",
+ "baseline_cap": 1536,
+ "note_cap": 640,
+ "mem_budget": 1536,
+ "ts": "2026-10-26T01:49:13"
+}
