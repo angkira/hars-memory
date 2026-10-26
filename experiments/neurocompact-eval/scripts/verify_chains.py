@@ -19,6 +19,16 @@ scratch:
     ZERO  zero probe hits across all 3 spans AND the full session transcript
     EMPTY answer / gold_anchor / evidence are all empty
 
+  per multihop item (qtype="multihop", definition + gates in multihop.py; old datasets
+  without `qtype` are all `single`)
+    MH-SHAPE  exactly 2 evidence hops, in DIFFERENT spans, earlier -> later, answer short
+    MH-EVID   both evidence quotes verbatim in THEIR span and >= 8 words
+    MH-LINK   link_anchor in ev1, in the question, only in its span (1..3x)
+    MH-ANS    gold_anchor in ev2, only in its span (1..3x), not in the question, != link
+    MH-NS     lexical "not answerable from one evidence alone" heuristic
+    MH-GUARD  oh_pipeline contamination guard on both anchors + question shingle vs issue
+  and a per-qtype / per-chain item mix table.
+
   dataset independence (section "Independence")
     distinct sessions, chains per session, chain pairs sharing a span (identity:
     session_id + boundary ordinal chain_idx+span_idx-1; and content: identical span
@@ -171,6 +181,7 @@ def main() -> int:
     rows, fails, span_rows = [], [], []
     stats = {}
     seen_qids = {}          # qid is the pairing key: must be unique dataset-wide
+    mix = {}                # chain_id -> {single|multihop|unanswerable: [PASS|FAIL, ...]}
 
     def bump(gate, ok):
         n, p = stats.get(gate, (0, 0))
@@ -201,7 +212,9 @@ def main() -> int:
         if not seg_match:
             fails.append((c["chain_id"], "SEGMENTS", "stored segments differ from rebuild"))
 
+        issue_fix = None
         for qa in c["qa"]:
+            qtype = qa.get("qtype") or "single"
             if qa["qid"] in seen_qids:
                 fails.append((c["chain_id"], qa["qid"],
                               f"qid collision with {seen_qids[qa['qid']]}"))
@@ -210,7 +223,54 @@ def main() -> int:
             hard = {}
             soft_half = None
             detail = ""
-            if qa["answerable"]:
+            if qtype == "multihop":
+                import multihop as mh  # noqa: PLC0415
+                if issue_fix is None:
+                    import oh_pipeline as ohp  # noqa: PLC0415
+                    issue_fix = ohp.contaminated_text(s)
+                taken = {(x.get("gold_anchor") or "").strip().lower()
+                         for x in c["qa"] if x is not qa and x.get("gold_anchor")}
+                taken |= {(x.get("link_anchor") or "").strip().lower()
+                          for x in c["qa"] if x is not qa and x.get("link_anchor")}
+                ok_mh, why_mh, ck = mh.validate_multihop(
+                    mh.item_from_record(qa), span_texts, issue_fix[0], issue_fix[1], taken)
+                spans_ok = (sorted(qa.get("span_idxs") or []) ==
+                            sorted(e.get("span_idx") for e in qa.get("evidence_spans") or []))
+                grp = {
+                    "MH-SHAPE": all(ck.get(k, False) for k in
+                                    ("question", "answer_len", "hops_count", "different_spans",
+                                     "hop_order")) and spans_ok,
+                    "MH-EVID": all(ck.get(k, False) for k in
+                                   ("ev1_verbatim", "ev2_verbatim", "ev1_words", "ev2_words")),
+                    "MH-LINK": all(ck.get(k, False) for k in
+                                   ("link_form", "link_in_ev1", "link_in_question",
+                                    "link_hits_ok", "link_only_in_span")),
+                    "MH-ANS": all(ck.get(k, False) for k in
+                                  ("gold_form", "gold_in_ev2", "gold_hits_ok", "gold_only_in_span",
+                                   "gold_not_in_question", "answer_not_in_question",
+                                   "anchors_distinct", "anchors_untaken")),
+                    "MH-NS": all(ck.get(k, False) for k in
+                                 ("ns_link_not_in_ev2", "ns_gold_not_in_ev1",
+                                  "ns_answer_not_in_ev1", "ns_question_token_not_only_ev2")),
+                    "MH-GUARD": ck.get("oh_guard", False),
+                }
+                hard.update(grp)
+                if not ok_mh and all(grp.values()):      # a validator reason no group covers
+                    hard["MH-OTHER"] = False
+                detail = (f"spans={qa.get('span_idxs')} link={qa.get('link_anchor')!r} "
+                          f"gold={qa.get('gold_anchor')!r}"
+                          + ("" if ok_mh else f" why={why_mh[:3]}"))
+                soft_half = None
+                for a_ in (qa.get("link_anchor"), qa.get("gold_anchor")):
+                    a_ = (a_ or "").strip().lower()
+                    if a_:
+                        bump("ANCHOR-UNIQ(chain)", a_ not in chain_anchors)
+                        if a_ in chain_anchors:
+                            fails.append((c["chain_id"], qa["qid"],
+                                          f"anchor {a_!r} reused from {chain_anchors[a_]}"))
+                        else:
+                            chain_anchors[a_] = qa["qid"]
+            elif qa["answerable"]:
                 own = span_texts.get(qa["span_idx"])
                 anchor = (qa["gold_anchor"] or "").strip()
                 ev = qa["evidence"] or ""
@@ -250,7 +310,7 @@ def main() -> int:
                 bump(g, ok)
             if soft_half is not None:
                 bump("HALF(soft)", soft_half)
-            if qa["answerable"]:
+            if qa["answerable"] and qtype != "multihop":
                 a = (qa["gold_anchor"] or "").strip().lower()
                 if a:
                     bump("ANCHOR-UNIQ(chain)", a not in chain_anchors)
@@ -263,7 +323,12 @@ def main() -> int:
             if not hard_ok:
                 fails.append((c["chain_id"], qa["qid"],
                               ",".join(g for g, v in hard.items() if not v)))
-            rows.append((c["chain_id"], qa["qid"], "A" if qa["answerable"] else "U",
+            mix.setdefault(c["chain_id"], {}).setdefault(
+                "multihop" if qtype == "multihop" else
+                ("single" if qa["answerable"] else "unanswerable"), []).append(
+                    "PASS" if hard_ok else "FAIL")
+            rows.append((c["chain_id"], qa["qid"],
+                         "M" if qtype == "multihop" else ("A" if qa["answerable"] else "U"),
                          qa["lag"], qa["span_idx"], qa["slice"],
                          "PASS" if hard_ok else "FAIL",
                          ("in-half" if soft_half else "OUT-OF-HALF") if soft_half is not None else "-",
@@ -287,8 +352,36 @@ def main() -> int:
     L = ["# verify_chains: independent re-validation", ""]
     L.append(f"chains: {len(chains)} | items: {len(rows)} "
              f"(answerable {sum(1 for r in rows if r[2] == 'A')}, "
+             f"multihop {sum(1 for r in rows if r[2] == 'M')}, "
              f"unanswerable {sum(1 for r in rows if r[2] == 'U')})")
     L.append("")
+    L.append("## Per-qtype counts (items / hard-gate pass)")
+    L.append("")
+    L.append("| chain | single | multihop | unanswerable | total |")
+    L.append("|---|---|---|---|---|")
+    tot = {"single": [0, 0], "multihop": [0, 0], "unanswerable": [0, 0]}
+    for cid, m in mix.items():
+        cells = []
+        for t in ("single", "multihop", "unanswerable"):
+            v = m.get(t, [])
+            tot[t][0] += len(v)
+            tot[t][1] += v.count("PASS")
+            cells.append(f"{len(v)} ({v.count('PASS')} pass)")
+        L.append(f"| {cid} | {' | '.join(cells)} | {sum(len(v) for v in m.values())} |")
+    L.append("| **all** | " + " | ".join(f"{tot[t][0]} ({tot[t][1]} pass)"
+                                         for t in ("single", "multihop", "unanswerable"))
+             + f" | {sum(v[0] for v in tot.values())} |")
+    L.append("")
+    mh_pairs: dict[str, int] = {}
+    for c in chains:
+        for qa in c["qa"]:
+            if (qa.get("qtype") or "single") == "multihop":
+                k = "+".join(map(str, qa.get("span_idxs") or []))
+                mh_pairs[k] = mh_pairs.get(k, 0) + 1
+    if mh_pairs:
+        L.append("multihop evidence span pairs: " + ", ".join(
+            f"spans {k}: {v}" for k, v in sorted(mh_pairs.items())))
+        L.append("")
     L.append("## Span rebuild check (stored vs recomputed from sessions)")
     L.append("")
     L.append("| chain | segments==rebuild | chars/tok==rebuild | span chars s1/s2/s3 | est tok s1/s2/s3 |")

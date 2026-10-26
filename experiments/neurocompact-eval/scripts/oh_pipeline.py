@@ -14,6 +14,10 @@ Usage:
 Paid QA generation through Anthropic instead of OpenRouter (make only):
   EVAL_API_KEY=... python3 -I oh_pipeline.py --sessions-dir DIR --qa-provider anthropic \\
       make --model claude-haiku-5-5 ...
+`make` and `multihop` also widen the evidence windows / suggested anchors (install_anchor_help).
+Option `--qa-thinking disabled` (before --sessions-dir, like --qa-provider) turns adaptive
+thinking off: with it on, Haiku 5.5 spent the whole 4000-token repair budget on thinking and
+returned no text (2026-10-26, 32 of 42 calls hit max_tokens); verbatim copying needs none.
 make_chains.llm() is replaced in-process by an Anthropic Messages adapter (official SDK;
 no temperature/top_p/top_k -- they 400 on current models; adaptive thinking at the model
 default; reasoning tokens count against max_tokens).  Prices are set to Haiku 5.5 list
@@ -21,6 +25,23 @@ default; reasoning tokens count against max_tokens).  Prices are set to Haiku 5.
 (default EVAL_API_KEY) and never printed.
 
 The contamination guard (install_guard) is always on for `make`.
+
+Unanswerable probes: `make` replaces the NC_<BASE>_<TAIL> env-var probe pool (foreign to
+Python repos) with repo-style probes from py_probes.py (module path / function / setting
+name fitting the session's package layout, verified absent from the full transcript,
+distinct across chains with --unique-probes).  Pass --nc-probes to keep the old NC_* pool.
+
+Multi-hop questions (qtype="multihop", multihop.py has the frozen definition): a second
+phase over the chains.jsonl written by `make`.  Every item gets a `qtype` (single|multihop;
+unanswerable items are qtype=single with answerable=false) and each chain gains --n (3)
+cross-compaction items:
+  EVAL_API_KEY=... python3 -I oh_pipeline.py --sessions-dir DIR --qa-provider anthropic \\
+      multihop --chains chains.jsonl --out chains-mh.jsonl --model claude-haiku-5-5 ...
+`salvage` (oh_salvage.py) rebuilds chains from the raw logs of dropped `make` runs instead of
+losing every valid item of a chain with one bad slot (same gates, per-item provenance).
+`reprobe` replaces every unanswerable by a deterministic repo-style template probe (no LLM).
+`make` itself (and make_chains.py) is unchanged: the old dataset stays byte-identical.
+`verify` checks both qtypes and reports per-qtype counts.
 
 Recommended make args for this dataset: --disjoint --unique-probes --dedup-anchors
 (one chain per session, so --disjoint is a no-op unless --n-boundaries 6 was imported).
@@ -34,14 +55,16 @@ sys.path.insert(0, BASE)
 
 def main() -> int:
     argv = sys.argv[1:]
-    provider, key_env = "openrouter", "EVAL_API_KEY"
-    while argv and argv[0] in ("--qa-provider", "--key-env") and len(argv) > 1:
+    provider, key_env, thinking = "openrouter", "EVAL_API_KEY", "default"
+    while argv and argv[0] in ("--qa-provider", "--key-env", "--qa-thinking") and len(argv) > 1:
         if argv[0] == "--qa-provider":
             provider = argv[1]
+        elif argv[0] == "--qa-thinking":
+            thinking = argv[1]
         else:
             key_env = argv[1]
         argv = argv[2:]
-    if len(argv) < 3 or argv[0] != "--sessions-dir" or argv[2] not in ("make", "verify"):
+    if len(argv) < 3 or argv[0] != "--sessions-dir" or argv[2] not in ("make", "verify", "multihop", "salvage", "reprobe"):
         print(__doc__)
         return 2
     sessions_dir, which, rest = os.path.abspath(argv[1]), argv[2], argv[3:]
@@ -49,10 +72,26 @@ def main() -> int:
         raise SystemExit(f"no such sessions dir: {sessions_dir}")
     import make_chains  # noqa: PLC0415
     make_chains.SESS_DIR = sessions_dir
-    if which == "make":
+    if which in ("make", "salvage"):
         install_guard(make_chains)
-    if which == "make" and provider == "anthropic":
-        install_anthropic(make_chains, key_env)
+        if "--nc-probes" in rest:
+            rest = [a for a in rest if a != "--nc-probes"]
+        else:
+            import py_probes  # noqa: PLC0415
+            py_probes.install(make_chains)
+    if which in ("make", "multihop", "salvage"):
+        install_anchor_help(make_chains)
+    if which in ("make", "multihop", "salvage") and provider == "anthropic":
+        install_anthropic(make_chains, key_env, thinking)
+    if which == "multihop":
+        import multihop  # noqa: PLC0415
+        return multihop.main(rest)
+    if which == "salvage":
+        import oh_salvage  # noqa: PLC0415
+        return oh_salvage.main(rest)
+    if which == "reprobe":
+        import oh_salvage  # noqa: PLC0415
+        return oh_salvage.reprobe(rest)
     if which == "make":
         for flag in ("--out", "--manifest"):
             if not args_has(rest, flag) and "--dry-run" not in rest:
@@ -149,8 +188,41 @@ def install_guard(mc) -> None:
     mc.load_sessions, mc.validate = load_sessions, validate
 
 
-def install_anthropic(mc, key_env: str) -> None:
+def install_anchor_help(mc, windows: int = 16, suggestions: int = 10, retries: int = 3) -> None:
+    """Python-code spans offer few tokens that occur once in a span and never in the other two
+    (2026-10-26: 1 suggestion per half; Haiku then invented anchors that failed ANCH/DISC, and
+    26 of 140 rejections were anchors inside the final diff).  Widen the candidate windows
+    (8 -> `windows` per half), keep up to `suggestions` anchors per half, and drop suggestions
+    that occur in ANY loaded session's issue text or final-change text so they pass the
+    contamination guard by construction.  More repair rounds (`retries`) per chain."""
+    orig_ew = getattr(mc, "_orig_evidence_windows", mc.evidence_windows)
+    orig_sa = getattr(mc, "_orig_suggested_anchors", mc.suggested_anchors)
+    mc._orig_evidence_windows, mc._orig_suggested_anchors = orig_ew, orig_sa   # idempotent
+    blob: list = []
+
+    def contaminated_blob() -> str:
+        if not blob:
+            parts = []
+            for s in mc.load_sessions():
+                parts += list(contaminated_text(s))
+            blob.append("\n".join(parts).lower())
+        return blob[0]
+
+    def evidence_windows(text, want=windows):
+        return orig_ew(text, windows)
+
+    def suggested_anchors(wins, span_text, other_texts, limit=suggestions, exclude=None):
+        cand = orig_sa(wins, span_text, other_texts, limit=80, exclude=exclude)
+        b = contaminated_blob()
+        return [(n, t) for n, t in cand if t.lower() not in b][:suggestions]
+
+    mc.evidence_windows, mc.suggested_anchors = evidence_windows, suggested_anchors
+    mc.MAX_RETRIES_PER_SLOT = retries
+
+
+def install_anthropic(mc, key_env: str, thinking: str = "default") -> None:
     """Replace make_chains.llm with an Anthropic Messages adapter (same signature/returns)."""
+    import hashlib  # noqa: PLC0415
     import time  # noqa: PLC0415
     secret = os.environ.get(key_env, "")
     if not secret:
@@ -169,9 +241,12 @@ def install_anthropic(mc, key_env: str) -> None:
             return "", {}
         last = ""
         for attempt in range(len(retry_waits) + 1):
+            t0 = time.time()
             try:
+                extra = {"thinking": {"type": "disabled"}} if thinking == "disabled" else {}
                 r = client.messages.create(model=model, max_tokens=max_tokens,
-                                           messages=[{"role": "user", "content": prompt}])
+                                           messages=[{"role": "user", "content": prompt}],
+                                           **extra)
             except anthropic.APIStatusError as e:
                 last = f"HTTP {e.status_code}: {str(e.message)[:300]}"
                 if e.status_code < 500 and e.status_code != 429:
@@ -184,8 +259,11 @@ def install_anthropic(mc, key_env: str) -> None:
                          "completion_tokens": r.usage.output_tokens}
                 spend.add(usage)
                 mc.log_raw({"kind": "llm", "model": model, "prompt_chars": len(prompt),
+                            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                             "prompt": prompt, "raw": content, "finish_reason": r.stop_reason,
-                            "usage": usage})
+                            "usage": usage, "latency_s": round(time.time() - t0, 3),
+                            "cost_usd": round(usage["prompt_tokens"] * mc.PRICE_IN
+                                              + usage["completion_tokens"] * mc.PRICE_OUT, 6)})
                 if not content:
                     print(f"  llm returned no content (stop_reason={r.stop_reason})", flush=True)
                 return content, usage
