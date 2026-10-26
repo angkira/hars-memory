@@ -22,6 +22,10 @@
  *      cap; default ON for the nc arm, OFF for baseline),
  *      NC_NOTE_ONLY=1 (skip the summarizer and reuse the summary already in
  *      the session; fallback path for the nc-note-only fork arm),
+ *      NC_DROP_PIECE_CHARS (default 8000; M3, Protocol Amendment C: the WHOLE serialized
+ *      dropped span, capped at RAW_CAP, is persisted as message-aligned pieces of this size
+ *      in ONE memory_compact call), NC_DROP_MODE=full|headtail (headtail = the old
+ *      first/last 12000-char design, for measuring the M3 loss only),
  *      NC_SELFTEST=1 (run the trimmer over its fixtures — including forced
  *      stop=length amputations with boundary repair — print before/after,
  *      exit non-zero on any violation; no model, no network, no MCP).
@@ -69,8 +73,17 @@ const MODEL_ID = process.env.NC_MODEL_ID || "muse-glimmer-30b";
 const SUM_PROVIDER = process.env.NC_SUM_PROVIDER || PROVIDER;
 const SUM_MODEL_ID = process.env.NC_SUM_MODEL_ID || MODEL_ID;
 
-const RAW_CAP = 60000; // cap on the serialized dropped context we look at
-const DROP_HALF = 12000; // per-item cap sent to memory_compact (2 items)
+const RAW_CAP = 60000; // cap on the serialized dropped context we look at (UNCHANGED: the
+// baseline summarizer sees the same text; raising it would change the baseline arm too)
+// M3 fix (Protocol Amendment C): the WHOLE serialized span (<= RAW_CAP) goes to
+// memory_compact, cut into pieces of ~DROP_PIECE chars at message boundaries. The former
+// design sent only the first and last DROP_HALF=12000 chars of a span longer than 24000, so
+// anchors in the middle never reached HARS while the baseline summarizer (up to 60k) saw them.
+const DROP_PIECE = Number.parseInt(process.env.NC_DROP_PIECE_CHARS || "", 10) || 8000;
+// NC_DROP_MODE=full (default) | headtail (the pre-amendment head+tail design, kept ONLY to
+// reproduce / measure the M3 loss; never use it for a decision run)
+const DROP_MODE = (process.env.NC_DROP_MODE || "full").toLowerCase();
+const DROP_HALF = 12000; // headtail mode only
 
 let mcpSessionId: string | null = null;
 
@@ -484,6 +497,65 @@ function noteTail(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// M3: the dropped span, in order and complete, as ~DROP_PIECE pieces.
+// ---------------------------------------------------------------------------
+// serializeConversation() joins messages with a blank line and prefixes each with one of
+// these role tags, so a message boundary is "\n\n" followed by a tag.
+const MSG_BOUNDARY = /\n\n(?=\[(?:User|Assistant|Assistant tool calls|Tool result)\]: )/;
+
+/** Hard-split one oversized message at the last newline / space before `max` (else at max). */
+function splitOversized(msg: string, max: number): string[] {
+	const out: string[] = [];
+	let rest = msg;
+	while (rest.length > max) {
+		let cut = rest.lastIndexOf("\n", max);
+		if (cut < max * 0.5) cut = rest.lastIndexOf(" ", max);
+		if (cut < max * 0.5) cut = max;
+		out.push(rest.slice(0, cut));
+		rest = rest.slice(cut).replace(/^\s+/, "");
+	}
+	if (rest.length > 0) out.push(rest);
+	return out;
+}
+
+/**
+ * Cut the serialized span into pieces of at most `max` chars at MESSAGE boundaries: messages
+ * are packed greedily in order (joined with the same blank line); a single message longer
+ * than `max` is split at whitespace. Lossless up to the whitespace at piece seams, ordered,
+ * no empty pieces.
+ */
+export function splitDroppedPieces(text: string, max: number = DROP_PIECE): string[] {
+	const t = text.trim();
+	if (!t) return [];
+	if (t.length <= max) return [t];
+	const pieces: string[] = [];
+	let cur = "";
+	for (const msg of t.split(MSG_BOUNDARY)) {
+		const parts = msg.length > max ? splitOversized(msg, max) : [msg];
+		for (const part of parts) {
+			if (cur && cur.length + 2 + part.length > max) {
+				pieces.push(cur);
+				cur = part;
+			} else {
+				cur = cur ? `${cur}\n\n${part}` : part;
+			}
+		}
+	}
+	if (cur) pieces.push(cur);
+	return pieces;
+}
+
+/** What goes into memory_compact(dropped_context=...) for one compaction. */
+function droppedForPersist(convText: string): string[] {
+	if (DROP_MODE === "headtail") {
+		return convText.length > 2 * DROP_HALF
+			? [convText.slice(0, DROP_HALF), convText.slice(-DROP_HALF)]
+			: [convText];
+	}
+	return splitDroppedPieces(convText);
+}
+
+// ---------------------------------------------------------------------------
 // NC_SELFTEST=1: pure trimmer fixtures, no model / network / MCP.
 // ---------------------------------------------------------------------------
 
@@ -719,8 +791,68 @@ Pending: update the user config files and restart both MCP clients to use valid 
 				(bad.length ? ` violations=[${bad.join(", ")}]` : ""),
 		);
 	}
+	violations += runSplitSelfTest();
 	console.log(`[selftest] RESULT: ${violations === 0 ? "PASS" : `FAIL (${violations})`}`);
 	return violations === 0 ? 0 : 1;
+}
+
+/** M3 fixtures: splitDroppedPieces is lossless, ordered, bounded, message-aligned. */
+function runSplitSelfTest(): number {
+	const ANCHOR = "ANCHOR_MID_7f3a91";
+	const mk = (n: number, size: (i: number) => number, anchorAt = -1): string => {
+		const tags = ["User", "Assistant", "Assistant tool calls", "Tool result"];
+		const msgs: string[] = [];
+		for (let i = 0; i < n; i++) {
+			let body = `m${i} ` + "lorem ipsum dolor ".repeat(Math.ceil(size(i) / 18));
+			body = body.slice(0, size(i));
+			if (i === anchorAt) body = `${ANCHOR} ${body}`;
+			msgs.push(`[${tags[i % tags.length]}]: ${body}`);
+		}
+		return msgs.join("\n\n");
+	};
+	const squash = (x: string) => x.replace(/\s+/g, "");
+	const fx: Array<{ name: string; text: string; max: number; anchor?: boolean; aligned?: boolean }> = [
+		{ name: "split-60k-many-messages", text: mk(150, (i) => 200 + ((i * 37) % 500)), max: 8000, aligned: true },
+		{ name: "split-60k-anchor-in-the-middle", text: mk(120, () => 480, 60), max: 8000, anchor: true, aligned: true },
+		{ name: "split-one-oversized-message", text: mk(1, () => 20000), max: 8000 },
+		{ name: "split-mixed-oversized", text: `${mk(5, () => 900)}\n\n${mk(1, () => 17000)}\n\n${mk(5, () => 900)}`, max: 8000 },
+		{ name: "split-short-single-piece", text: mk(3, () => 300), max: 8000, aligned: true },
+	];
+	let bad = 0;
+	for (const f of fx) {
+		const pieces = splitDroppedPieces(f.text, f.max);
+		const checks: Array<[string, boolean]> = [
+			["non_empty", pieces.length > 0 && pieces.every((p) => p.length > 0)],
+			["each<=max", pieces.every((p) => p.length <= f.max)],
+			["lossless_ordered", squash(pieces.join("\n\n")) === squash(f.text)],
+			// all but the last piece are reasonably full (greedy packing, not 1 msg per piece)
+			["packed", pieces.length <= Math.ceil(f.text.length / (f.max * 0.55)) + 1],
+		];
+		if (f.aligned) {
+			checks.push(["starts_at_message_boundary",
+				pieces.every((p) => /^\[(?:User|Assistant|Assistant tool calls|Tool result)\]: /.test(p))]);
+		}
+		if (f.anchor) {
+			const headTail = f.text.length > 24000 ? [f.text.slice(0, 12000), f.text.slice(-12000)] : [f.text];
+			checks.push(
+				["anchor_kept_by_full_split", pieces.some((p) => p.includes(ANCHOR))],
+				["anchor_lost_by_old_headtail", !headTail.some((p) => p.includes(ANCHOR))],
+			);
+		}
+		const failed = checks.filter(([, ok]) => !ok).map(([k]) => k);
+		bad += failed.length;
+		console.log(
+			`[selftest] ${failed.length ? "FAIL" : "PASS"} ${f.name}: chars=${f.text.length} pieces=${pieces.length} ` +
+				`sizes=[${pieces.map((p) => p.length).join(",")}]` +
+				(failed.length ? ` violations=[${failed.join(", ")}]` : ""),
+		);
+	}
+	const empty = splitDroppedPieces("   ", 8000);
+	if (empty.length !== 0) {
+		bad += 1;
+		console.log("[selftest] FAIL split-empty: expected no pieces");
+	} else console.log("[selftest] PASS split-empty: 0 pieces");
+	return bad;
 }
 
 const NC_SELFTEST_ON =
@@ -998,10 +1130,11 @@ ${convText}
 		let persistError: string | undefined;
 		if (PERSIST) {
 			try {
-				const dropped =
-					convText.length > 2 * DROP_HALF
-						? [convText.slice(0, DROP_HALF), convText.slice(-DROP_HALF)]
-						: [convText];
+				// ONE memory_compact call per compaction (a call allocates a new compaction seq,
+				// so a call per piece would make the 3-compaction persistence gate see 3*k
+				// documents and index the summary k times); the pieces are its dropped_context
+				// items, each indexed in order.
+				const dropped = droppedForPersist(convText);
 				const r = await mcpToolCall("memory_compact", {
 					session_id: SID,
 					summary: summaryOrRaw,
@@ -1011,6 +1144,9 @@ ${convText}
 						tokens_before: tokensBefore,
 						messages: all.length,
 						persist: PERSIST ? 1 : 0,
+						drop_mode: DROP_MODE,
+						drop_pieces: dropped.length,
+						drop_chars: dropped.reduce((n, d) => n + d.length, 0),
 					},
 				});
 				persisted = r?.ok !== false;
