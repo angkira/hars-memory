@@ -3,6 +3,24 @@
 Written 2026-10-26 by the interim agent. Read with: RUNBOOK-gate.md, REPORT-PROTOCOL.md,
 INFRA-NOTES.md, REPORT-forensics-gate212839.md.
 
+## STATE UPDATE 2026-10-26 (Amendment C.3: small run, prompt cache, cc discovery) — NEWEST, READ FIRST
+
+The owner's home agent had looked at an OLD working copy (`/tmp/opencode/nc-eval`: old runner, OpenRouter-only judge/extractor, Haiku 4.5 defaults,
+5-session dataset). That copy is OBSOLETE; only `experiments/neurocompact-eval/` of branch `claude/youthful-thompson-yv6xqd` counts
+(HOME-RUNBOOK.md "START HERE"; `home_run.py doctor` row `stale_copy` + `EVAL-VERSION`). What changed:
+
+- **Amendment C.3** (REPORT-PROTOCOL.md 4a.3): prompt caching is cost-only (identical inputs, all arms cached identically); sample sizes fixed before
+  results: OH 14 chains B=1536 only, BEAM-1M N=10 seeded chats (seed 20261026, `beam/selection.json`) B=1536 only (L2/L3 n/a unless the sweep is
+  enabled), CC owner sessions; suggested caps gen 3 / run 20 / judge 5, total 30.
+- **Defaults**: the runners no longer fall back to qwen / glm / gpt-6-luna / muse; no flag = profile `anthropic` (haiku-5-5 agent, answer, summarizer,
+  extractor, keyword; sonnet-5-5 judge, QA generator). `doctor` prints the role -> model table. `make_chains.py` / `make_longreplay_dataset.py`
+  (dataset builders pinned by golden-output tests) keep their historical OpenRouter model ids on purpose.
+- **Prompt cache**: `providers.chat(cache_prefix_chars=...)` native `/v1/messages` + `cache_control`, `--prompt-cache auto|on|off`, profile `cache`
+  section, cache read/write (5m/1h) accounting, `prompt_cache` block in the run MANIFEST; pi-ai 1.4.0 already caches the agent loop (short) - the
+  runner now records `NC_PROMPT_CACHE` / `PI_CACHE_RETENTION` / `NC_SUM_CACHE_RETENTION`; the summarizer call stays `cacheRetention: none`.
+- **`home_run.py cc --find TEXT | --session-id ID | --list [--pick N]`** (`cc_discover.py`), `--oh-tar`, `--beam-n`, campaign-wide caps + `[caps] total`,
+  dry-run prints the all-tracks total vs $30.
+
 ## STATE UPDATE 2026-10-26 (late: home-run tooling + Amendment C.2) — READ THIS FIRST
 
 The owner runs everything at home (own HARS, real embedder, Anthropic key; later maybe OpenRouter/Gemini via

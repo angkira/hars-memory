@@ -445,6 +445,79 @@ BEAM types are exploratory.
   L4, L5}. The two tracks are separate decision sets (separate datasets, separate primaries) and
   are not pooled.
 
+### 4a.3 PROTOCOL AMENDMENT C.3 (2026-10-26, written before any decision-set result was seen)
+
+Provenance: the owner's budget decision for the home run ("a couple dozen dialogues is enough",
+USD 20-30 in total) and the cost review of the first home-run tooling. No record of any decision set
+exists at the time of writing (only offline fixtures and cents-level smoke runs). As with C, C.1 and
+C.2, nothing below may be edited after the first decision-set record exists; a deviation is Amendment
+D. C.3 changes how the model calls are BILLED and how many units are sampled; it does not touch any
+metric, threshold, arm, budget formula (B, note cap, recall cap), parity gate, prompt text, judge, or
+the section-5 WIN / FAIL rules.
+
+**C.3-1. Provider prompt caching is a COST-ONLY change.** Anthropic prompt caching marks a stable
+prompt prefix (`cache_control`); a request that hits the cache bills those tokens at a lower price and
+returns the same completion distribution for the same input. It does not alter what the model is
+given. Concretely:
+
+- The text of every model input is byte-identical with and without caching. Direct calls
+  (`providers.chat`, used by the long-session runner for the summariser and answer calls) send the
+  same system / user strings; with caching ON the last user message is split at a character offset
+  into two text blocks whose concatenation is the original string, and `cache_control` marks the
+  first block (answers: the memory note + verbatim tail shared by all questions asked at one
+  boundary) and the system prompt. The summariser's one-shot prompt is not cached (a cache write that
+  is never read costs 1.25x for nothing). Sampling parameters are omitted exactly as before
+  (profile policy) and `thinking` stays `disabled` for the direct summariser calls.
+- Caching-enabled direct calls use Anthropic's native `/v1/messages` endpoint (the OpenAI-compatible
+  endpoint cannot carry `cache_control`); calls with nothing to cache (judge, liveness pings) stay on
+  the compatible endpoint, unchanged. The endpoint is a property of the decision set, set once by the
+  profile (`cache.enabled`, `--prompt-cache auto|on|off`) and recorded in every run MANIFEST
+  (`prompt_cache` block: cached calls, cache read / write tokens, cost, cost without cache); it is
+  never switched inside a decision set (C.1-4 applies: a change of the setting is a new decision set).
+- The pi agent loop (OpenHands chain track) already marks its requests with `cache_control` by default
+  in pi-ai 1.4.0 (retention "short", 5 minutes, refreshed by every hit; `PI_CACHE_RETENTION=long` =
+  1 hour). The runner now records this explicitly (`NC_PROMPT_CACHE`, `PI_CACHE_RETENTION`,
+  `NC_SUM_CACHE_RETENTION` in the per-arm env printed by `--dry-run`); pi has no switch to disable it
+  for the agent loop, so `--prompt-cache off` only affects the cost model and the direct calls. The
+  extension's summarizer call keeps `cacheRetention: "none"` (default of `NC_SUM_CACHE_RETENTION`).
+- Every arm is cached identically: the same profile setting, the same env for baseline / nc-chunks /
+  nc-graph / nc-note-only (`NC_PROMPT_CACHE`, `NC_SUM_CACHE_RETENTION`, `PI_CACHE_RETENTION` are equal
+  across arms; the unit test pins this), the same prefix construction for all arms and for the `orig`
+  arm. The cost-per-question comparison of section 5 (FAIL rule "cost/Q > 3x baseline") is therefore
+  evaluated on cache-priced costs for ALL arms; the recorded `cost_without_cache_usd` allows the
+  uncached comparison as a sensitivity check.
+- Prices (profile `anthropic`, fields `cache_read`, `cache_write`, `cache_write_1h`; status per entry;
+  Anthropic documentation via WebSearch, 2026-10-26): 5-minute cache write = 1.25 x base input price,
+  1-hour write = 2 x, cache read = 0.1 x (Haiku 5.5: write USD 0.125, read USD 0.01 per MTok; above
+  100k prompt tokens the tier prices apply). Third-party pages report a 0.05 x read multiplier for
+  the Sonnet 5.5 generation; the profile keeps the 0.05 x value (USD 0.10) but it is NOT confirmed,
+  and it only matters for Sonnet calls, which carry no cached prefix in this design.
+
+**C.3-2. Sample sizes of the home run (fixed here, before results).**
+
+- *OpenHands chain track:* the 14 chains of artifact `20261026T144511Z-oh-multihop-qa`, unchanged.
+  Budget cell **B = 1536 only**; the sweep 1536,1024,512 is opt-in (`[oh] budgets`). The S1-S3
+  family is defined at the primary B = 1536 (C.2-1), so it is unaffected.
+- *BEAM-1M:* **N = 10 chats** replace "all chats" of C.2-3. The ten are drawn deterministically, before
+  any run: the chat numbers found under `chats/1M/` are sorted numerically and
+  `random.Random("20261026:1M").sample(numbers, 10)` is taken, then sorted; `home_run.py` writes the
+  population, seed and selection to `beam/selection.json` and passes the list to `import_beam.py
+  --chats`. No chat is added or dropped after seeing results. `MIN_CHAINS = 8` is met (10 chats). B =
+  **1536 only**: L2 and L3 need the sweep and are **n/a (p = 1) unless the sweep is enabled**
+  (`[beam] budgets = [1536, 1024, 512]`); the Holm family stays m = 5 and L1, L4, L5 are tested at B =
+  1536 as in C.2-3. With ten chats the intervals are wide (L4 / L5 rest on roughly twenty
+  `multi_session_reasoning` items); an INCONCLUSIVE verdict is the expected outcome for small
+  effects and is reported as such, never as a failure of the architecture.
+- *Claude Code sessions:* descriptive only (C.2-3). The owner picks the session(s)
+  (`home_run.py cc --find TITLE | --session-id ID | --list`); the pick is recorded in
+  `cc/selected-session.json`. Generated questions: 12 single + 4 multihop per session
+  (`gen_longsession_qa.py` verbatim-evidence gates unchanged).
+
+**C.3-3. Cost ceiling values (fills the placeholders of C.1-5).** Suggested hard caps for the
+home run: QA generation USD 3, runs (replay / compaction / answers + the flagged HARS estimate) USD 20,
+judge USD 5, total USD 30 across all tracks (`[caps]` are campaign-wide per phase unless a per-track
+override exists). `home_run.py dry-run` prints the estimate against the total before any spend.
+
 ## 5. Measurement stack
 
 **Recall packer v2** (run_chainreplay.py, frozen after the gate-212839 offline eval):

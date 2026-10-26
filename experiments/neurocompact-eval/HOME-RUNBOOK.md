@@ -1,8 +1,42 @@
 # HOME-RUNBOOK - running the neurocompact eval on your own machine
 
+## START HERE (read this block, then skip to step 1)
+
+1. **Use ONLY this checkout.** `git clone <your hars-memory remote> && cd hars-memory && git checkout claude/youthful-thompson-yv6xqd`,
+   then work from **`experiments/neurocompact-eval/`** inside that repo. Everything below
+   (`scripts/home_run.py`, `home_run.toml.example`, `profiles/`, `pi-agent/`) lives there and nowhere else.
+2. **`/tmp/opencode/nc-eval` is OBSOLETE - do not use it.** It is an old working copy: old runner, OpenRouter-only judge and
+   extractor, Haiku 4.5 defaults, the 5-session dataset. Nothing in it matches the protocol (`REPORT-PROTOCOL.md` Amendments C-C.3).
+   `home_run.py doctor` now checks this itself: the `stale_copy` row is **FAIL** when a script, a profile or the
+   `EVAL-VERSION` marker is missing or different (and WARN when the path looks like a scratch copy or is not a git checkout).
+3. **Models** (printed by `doctor` as a role -> model table): agent, answer, summarizer, HARS extractor and keyword model are all
+   **`claude-haiku-5-5`**; judge and QA generator **`claude-sonnet-5-5`**. If you see anything else, you are not on this checkout.
+4. **The OpenHands dataset** is one tarball, `oh-multihop-qa-20261026T144511Z.tar.gz` (4.5 MB, 14 chains, not in git). Put it anywhere and
+   let home_run unpack it into the artifacts root (safe extraction, then it is auto-detected, no config edit):
+   ```bash
+   cd experiments/neurocompact-eval
+   uv run python scripts/home_run.py --oh-tar ~/Downloads/oh-multihop-qa-20261026T144511Z.tar.gz dry-run --tracks oh
+   #   same thing by hand:  mkdir -p /mnt/datasets/ft/artifacts && tar -xzf oh-multihop-qa-20261026T144511Z.tar.gz -C /mnt/datasets/ft/artifacts
+   #   -> /mnt/datasets/ft/artifacts/20261026T144511Z-oh-multihop-qa/chains.jsonl  (found automatically; or set [oh] artifact_dir)
+   ```
+5. **Small and cheap by default** (Amendment C.3, budget USD 20-30 in total): OpenHands 14 chains at B=1536 only; BEAM-1M 10 seeded chats at
+   B=1536 only; Claude Code: the session(s) you pick. Sweeps (1536,1024,512) are opt-in in `home_run.toml`. Prompt caching is ON for the
+   anthropic profile (cost-only, same model inputs). `home_run.py dry-run` prints the all-tracks total against USD 30 before any spend.
+6. **Minimal sequence** (after `cp home_run.toml.example ../../home_run.toml`, the only edits are paths):
+   ```bash
+   cd experiments/neurocompact-eval/scripts
+   uv run python home_run.py doctor --deep          # 0 FAIL (stale_copy, keys, real embedder, pi, models table)
+   uv run python home_run.py dry-run --find "HARS Experts Research"     # total vs $30, nothing spent
+   uv run python home_run.py oh && uv run python home_run.py beam
+   uv run python home_run.py cc --find "HARS Experts Research"          # prints candidates, you pick; then import -> QA -> run -> judge
+   uv run python home_run.py bundle                 # send the ONE .tar.gz back
+   ```
+
+---
+
 Written 2026-10-26. You run everything here with your HARS, your real embedder and your Anthropic key
 (later maybe OpenRouter / Gemini through a profile), and send ONE file back: the bundle (step 9).
-The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, **C.2**). Nothing in this
+The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, C.2, **C.3**). Nothing in this
 runbook changes a metric or a rule; the tooling is `scripts/home_run.py` (one entry point) on top of the
 existing scripts. All paths below are relative to the repo root.
 
@@ -18,13 +52,29 @@ Verified list prices (profile `anthropic`, `profiles/anthropic.json`, status `co
 are the numbers of today's data (tokenizer = the chars/3.6 estimator because tiktoken was not installed where
 they were computed; with tiktoken they move by roughly +-15%).
 
+**Default run (what `home_run.toml.example` does, Amendment C.3): about USD 15-20 of the USD 30 ceiling.**
+
 | Track | what | run (replay/compaction/answers + flagged HARS estimate) | judge (Sonnet) | gen (QA) | wall-clock |
 |---|---|---|---|---|---|
-| `oh` B=1536 only | 14 chains x 10 items x 4 arms | **$3.64** | $1.90 (560 items) | - | ~7 h |
-| `oh` sweep 1536,1024,512 (protocol) | same x 3 B | **$10.91** | $5.71 (1680 items) | - | ~21 h |
-| `beam` B=1536 only | BEAM-1M, 35 chats, 45M tokens, 360 boundaries, 20k HARS pieces | **$34.29** (of which HARS extraction $21.07, an ESTIMATE) | $4.76 (1400 items) | - | ~68 h (61 h HARS ingest at the guessed 11 s/piece) |
-| `beam` sweep 1536,1024,512 | same, asks x3 | **$59.88** | $14.28 | - | ~82 h |
-| `cc` (your sessions) | per session with ~7 real boundaries, 28 generated questions, every:3 checkpoints | ~$1-1.5 / session | ~$0.5-1 / session | ~$2 / session (Sonnet, upper-ish bound) | ~2-3 h / session |
+| `oh` DEFAULT: B=1536 only | 14 chains x 10 items x 4 arms | **$0.75** with prompt cache (uncached $3.64) | $1.90 (560 items) | - | ~7 h |
+| `beam` DEFAULT: B=1536 only, **N=10 seeded chats** | BEAM-1M, ~13M tokens, ~100 boundaries, ~5.7k HARS pieces | **~$9.8** (of which HARS extraction ~$6.0, an ESTIMATE; scaled from the 35-chat figure, `dry-run` gives the real one; answer-call cache saving not included) | ~$1.4 (400 items) | - | ~19 h (~17 h HARS ingest at the guessed 11 s/piece) |
+| `cc` DEFAULT: the session(s) you pick (`cc --find`) | per session with ~7 real boundaries, 16 generated questions (12 single + 4 multihop), every:3 checkpoints | ~$1-1.5 / session | ~$0.3-0.7 / session | ~$1-2 / session (Sonnet, upper-ish bound) | ~2-3 h / session |
+| **DEFAULT TOTAL, one cc session** | | **~$12** | **~$3.7** | **~$1.5** | **~$17**; caps 3 / 20 / 5, total 30 |
+
+Opt-in (not run by default; `dry-run` prices them from your `[oh]/[beam]` budgets, figures below are UNCACHED list-price estimates of the C.2 numbers):
+
+| Opt-in | what | run | judge | wall-clock |
+|---|---|---|---|---|
+| `oh` sweep `budgets = [1536,1024,512]` | same x 3 B | $10.91 (about $2.3 cached) | $5.71 | ~21 h |
+| `beam` all 35 chats (`chats = "all"`) | 45M tokens, 360 boundaries, 20k HARS pieces | $34.29 (HARS extraction $21.07, an ESTIMATE) | $4.76 | ~68 h |
+| `beam` sweep (L2/L3) | asks x3 | + about 75% of the run, judge x3 | $14.28 (35 chats) | + |
+
+**Prompt caching (Amendment C.3, cost-only):** Anthropic bills a cached prompt prefix at 0.1x the input price (cache read) after one
+write at 1.25x (5 min) or 2x (1 h). The model inputs are byte-identical; only the bill changes, and every arm is cached identically.
+Where it applies: the pi agent's growing replay context (the OH track, where it removes about 80% of the agent cost) and the memory + tail
+prefix of the long-session answers. The one-shot summariser / compaction calls are not cached. `--prompt-cache off` (or
+`cache.enabled=false` in `profiles/anthropic.json`) shows the uncached figures; the run MANIFEST records `prompt_cache` (cached calls,
+read/write tokens, cost, cost without cache).
 
 Formulas (also in `README-longsession.md`): judge = items x (1300 in x $2 + 80 out x $10)/1e6 = $0.0034 per
 item; BEAM/CC run = baseline summaries + note summaries + `chunks x (2700 in, 600 out)` HARS extraction +
@@ -32,9 +82,9 @@ asks; OH run = `run_chainreplay --dry-run` projection (agent turns + extractor +
 **Two numbers are guesses and dominate the BEAM wall-clock: HARS ingest seconds per piece (11 s) and extractor
 tokens per chunk.** Calibrate on the first session (`<campaign>/beam/run/compactions.jsonl`, rows with
 `"arm": "hars"` have `seconds`) and re-run `dry-run`. (Measured in the build container with a Haiku extractor: 6.4-7.1 s per 4000-char piece;
-BEAM pieces are 8000 chars, so 11 s/piece is a plausible middle, but it is a guess.) If 68 h is too much, the BEAM run is **resumable**
-(Ctrl-C, re-run the same command); if you cannot afford all 35 chats, decide the number N BEFORE running
-(`--beam-limit N`, first N in file order), state it in your reply, and do not pick chats after seeing results.
+BEAM pieces are 8000 chars, so 11 s/piece is a plausible middle, but it is a guess.) If ~19 h is too much, the BEAM run is **resumable**
+(Ctrl-C, re-run the same command). The default N=10 chats is fixed in `[beam] n_chats` (seeded sample, written to
+`<campaign>/beam/selection.json` before the run, Amendment C.3-2); change N BEFORE running (`--beam-n N`), never after seeing results.
 
 ## 1. Clean checkout
 
@@ -45,7 +95,7 @@ uv run python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); print('
 npm i -g @earendil-works/pi-coding-agent@1.4.0     # only the `oh` track needs pi; 1.4.x is pinned (event parser)
 #   no global npm?  npm i --prefix ~/.local/pi @earendil-works/pi-coding-agent@1.4.0 && export PATH=~/.local/pi/node_modules/.bin:$PATH
 pi --version && node --version             # 1.4.x and Node >= 20
-cp experiments/neurocompact-eval/home_run.toml.example home_run.toml     # you fill it in below
+cp experiments/neurocompact-eval/home_run.toml.example home_run.toml     # defaults are the small run + suggested caps; edit paths only
 ```
 
 The tokenizer is part of the decision set (every record carries it; `merge_runs` refuses a mix): run everything
@@ -82,25 +132,31 @@ Do not run two clients against the HARS engine at once (1 thread / queue 32 by d
 
 ## 4. Inputs
 
-* **OpenHands chains**: copy the artifact dir (14 chains, single + `xspan_locator` + unanswerable) to the machine, e.g.
-  `~/hars-data/20261026T144511Z-oh-multihop-qa/` (it holds `chains.jsonl`, `chains-manifest.json`, `verify-report.md`).
-  Set `[oh] artifact_dir` (or `--oh-dir`). It is not in git. Public SWE-bench sessions, no secrets.
+* **OpenHands chains**: the tarball `oh-multihop-qa-20261026T144511Z.tar.gz` (14 chains, single + `xspan_locator` + unanswerable; not in git;
+  public SWE-bench sessions, no secrets). `home_run.py --oh-tar PATH.tar.gz <subcommand>` unpacks it into the artifact root
+  (`/mnt/datasets/ft/artifacts/20261026T144511Z-oh-multihop-qa/`: `chains.jsonl`, `chains-manifest.json`, `verify-report.md`);
+  `[oh] artifact_dir` empty = auto-detect the newest `<artifact_root>/*-oh-multihop-qa`; or set it (`--oh-dir`) to a directory you unpacked yourself.
 * **BEAM**: `git clone https://github.com/mohammadtavakoli78/BEAM ~/data/BEAM` (4 GB). Set `[beam] repo`.
-  Only the JSON files are read (never pickles); `chats/1M/` has 35 chats.
-* **Claude Code sessions**: point `[cc] paths` at project dirs/files under `~/.claude/projects/<proj>/*.jsonl`
-  (subagent files are excluded by default). Only sessions that contain real `/compact` boundaries can run. Secret
-  **redaction is ON and cannot be turned off through home_run**; read the redaction counts the import prints.
-  Your private text lives in `<campaign>/cc/data*` and in `cc/run/*`: none of it leaves the machine except the
-  excerpts inside `records.jsonl` / `judged.jsonl` (see step 9).
+  Only the JSON files are read (never pickles); `chats/1M/` has 35 chats. Default: **10 of them**, drawn once with
+  `random.Random("20261026:1M").sample(...)` and written to `<campaign>/beam/selection.json` before the run (`chats = "all"` = all 35).
+* **Claude Code sessions**: no path needed. `home_run.py cc --find "HARS Experts Research"` (title or first-message substring),
+  `cc --session-id <cse_... or uuid>` or `cc --list` (longest sessions with their compaction counts) search
+  `~/.claude/projects/*/*.jsonl` (`[cc] root` / `--projects-root` to change). It prints each candidate (session id, project, size, date
+  range, message count, **#compact boundaries**, title) and you pick (`--pick N`, or the prompt on a terminal); only a session with real
+  `/compact` boundaries can run. The pick is recorded in `<campaign>/cc/selected-session.json`. (The target session is probably
+  `~/.claude/projects/-home-angkira-Project-software-cortex/03023d8a-4fa0-4ff8-8345-a67624798daf.jsonl`; `cc --session-id 03023d8a-4fa0-4ff8-8345-a67624798daf`
+  confirms it.) Explicit files still work: `[cc] paths` / `--cc-paths`. Secret **redaction is ON and cannot be turned off through home_run**;
+  read the redaction counts the import prints. Your private text lives in `<campaign>/cc/data*` and in `cc/run/*`: none of it leaves the machine
+  except the excerpts inside `records.jsonl` / `judged.jsonl` (see step 9).
 
-## 5. Caps (hard, yours to choose)
+## 5. Caps (hard)
 
-Edit `home_run.toml` `[caps]` (0 = not filled in = every paid step refuses): `gen` (QA generation), `run`
-(replays, compactions, answers + the flagged HARS estimate), `judge`. Run `dry-run` (step 6) and set each cap a bit
-above its estimate; per-track overrides: `[caps.oh]`, `[caps.beam]`, `[caps.cc]`. Each underlying script gets
-`--budget-usd = cap - already spent` (ledger in the campaign dir) and stops at it ("BUDGET STOP"); the runs are
-B-major, so a stop still leaves the primary B=1536 cell complete. A run whose estimate is above its cap is refused
-unless `--accept-partial`.
+`home_run.toml.example` ships suggested caps: `gen` 3, `run` 20, `judge` 5 and `total` 30 (USD). `gen` = QA generation, `run` = replays,
+compactions, answers + the flagged HARS estimate, `judge` = the blind judge. They are **campaign-wide per phase** (summed over the tracks)
+unless a `[caps.<track>]` override exists; `total` is the hard ceiling over everything (0 in the file = every paid step refuses). Run
+`dry-run` (step 6): it prints the all-tracks total against USD 30 and each phase against its cap. Each underlying script gets
+`--budget-usd = min(cap - already spent, total - already spent)` (ledger in the campaign dir) and stops at it ("BUDGET STOP"); the runs are
+B-major, so a stop still leaves the primary B=1536 cell complete. A run whose estimate is above its cap is refused unless `--accept-partial`.
 
 ## 6. The command sequence
 
@@ -110,13 +166,14 @@ All commands: `uv run python experiments/neurocompact-eval/scripts/home_run.py [
 command lines included. Re-running a subcommand skips finished steps and resumes unfinished runs.
 
 ```bash
-HR dry-run                       # zero spend: per-track gen/run/judge estimate vs your caps, wall-clock
+HR dry-run [--find "TITLE"]      # zero spend: per-track gen/run/judge estimate, ALL-TRACKS TOTAL vs $30, cache saving, wall-clock
 HR smoke                         # 1 cheapest OH chain + 1 tiny synthetic long session, ~$0.5-0.8 total (own campaign); must PASS
-HR oh                            # OpenHands chains: batches of 4, B-major (1536 first), retries invalid cells once,
+HR oh                            # OpenHands chains (add --oh-tar TAR the first time): batches of 4, B-major, retries invalid cells once,
                                  #   merge -> export -> judge -> metrics_v2 -> funnel
-HR beam                          # BEAM-1M: import -> run_longsession (end checkpoint, B sweep per [beam] budgets)
+HR beam                          # BEAM-1M: seeded 10-chat import -> run_longsession (end checkpoint, B per [beam] budgets)
                                  #   -> export_longsession_judge -> judge (rubric) -> metrics_v2 --end-only --include-sid ^beam-1M-
-HR cc                            # your sessions: import (redacted) -> QA generation -> run (real boundaries, orig arm)
+HR cc --find "TITLE"             # (or --session-id ID / --list): pick the session, then import (redacted) -> QA generation
+                                 #   -> run (real boundaries, orig arm)
                                  #   -> judge -> metrics (all rows, and --end-only)
 HR bundle                        # step 9
 ```
@@ -126,14 +183,14 @@ Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export
 printed in every report, C.1-2). The vendor switch (OpenRouter / Gemini) is `--profile NAME` and a NEW decision set
 (C.1-4): never mix profiles or embedders inside one campaign.
 
-Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `oh` (cheapest, ~7 h at B=1536) -> `beam` -> `cc` -> `bundle`.
+Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `oh` (cheapest, ~7 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
 
 ## 7. What each track gives you (and what it cannot)
 
 * `oh`: primary = nc-graph vs baseline at B=1536 on 14 sessions, S1-S3 Holm family (C.2-1). The old "multihop"
   items are analysed as `xspan_locator` (descriptive S4d/S5d). `REPORT-chains.md`, `metrics.json`, `funnel.md`.
-* `beam`: the C.2-3 long-session track: primary nc-graph vs baseline at B=1536 on all BEAM-1M chats, family L1-L5
+* `beam`: the C.2-3 / C.3-2 long-session track: primary nc-graph vs baseline at B=1536 on the 10 seeded BEAM-1M chats, family L1-L5 (L2/L3 n/a without the sweep)
   on the rubric-graded score, genuine multi-hop = `multi_session_reasoning`. Only 34 of 350 items carry a
   deterministic anchor, so anchor-based rules are n/a or low-power by construction; the score legs carry the result.
 * `cc`: descriptive only (C.2-3): `orig` (Claude Code's own summary) vs baseline vs nc arms, lag and checkpoint tables.
@@ -171,6 +228,6 @@ prints**; if it says hits > 0 skim the report before sending. Send the `.tar.gz`
 
 ## 10. Decisions that are yours
 
-1. The three caps. 2. How many BEAM chats (all 35 = ~$39 and ~3 days at the guessed ingest speed; decide N in advance if
-fewer). 3. Whether to run the B sweep on BEAM (L2/L3 need it; B=1536 alone leaves them n/a, p = 1). 4. Your embedder
-(frozen afterwards). 5. Which Claude Code sessions (descriptive only).
+1. The caps (suggested 3 / 20 / 5, total 30). 2. Whether to enlarge a track (BEAM `chats = "all"` or a larger `n_chats`; the OH or BEAM B sweep:
+L2/L3 need the sweep, B=1536 alone leaves them n/a, p = 1) - decide BEFORE running. 3. Your embedder (frozen afterwards). 4. Which Claude Code
+sessions (descriptive only).
