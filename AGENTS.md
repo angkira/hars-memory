@@ -64,6 +64,9 @@ hars_memory/
                         `memory regress`), retrieval metrics (metrics.py)
   service/             — tenant-scoped HTTP index-job API, durable SQL jobs,
                         artifact stores, index engines, and lease worker
+  tui/                — optional `[tui]` extra (Textual): `memory tui` / `memory-tui`. Pure HTTP client of a
+                        running service (+ read-only session/eval file readers); must not import
+                        mcp_server/lightrag/torch. See docs/tui.md.
   sdk.py               — synchronous HTTP client for create/extend/poll/download
   strategies.py        — validated index/search strategies and YAML matrices
   scripts/              — cleanup_kb.py (index-only maintenance),
