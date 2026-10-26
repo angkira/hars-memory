@@ -30,6 +30,8 @@ import os
 import re
 
 MEM_RE = re.compile(r"<memory>(.*?)</memory>", re.S)
+# arms whose ask carries an injected <memory> block (legacy `nc` = nc-chunks, Amendment C)
+RECALL_ARMS = ("nc", "nc-chunks", "nc-graph")
 DEFAULT_CAP = 12000
 
 
@@ -51,14 +53,25 @@ def load_entries(path: str) -> list[dict]:
     return out
 
 
-def find_ask_session(sessions_root: str, chain_id: str, arm: str, qid: str):
-    """sessions/<chain>/asks/<arm>/<qid>/*.jsonl -> deterministic first match."""
-    pat = os.path.join(sessions_root, str(chain_id), "asks", str(arm), str(qid), "*.jsonl")
-    files = sorted(glob.glob(pat))
-    return files[0] if files else None
+def chain_dirkey(chain_id: str, budget=None) -> str:
+    """Mirror of run_chainreplay.chain_dirkey: `<chain>__b<B>` for a mem_budget sweep run."""
+    return f"{chain_id}__b{int(budget)}" if budget else str(chain_id)
 
 
-def parse_ask_session(path: str, arm: str, recall_arms: tuple = ("nc",)) -> dict:
+def find_ask_session(sessions_root: str, chain_id: str, arm: str, qid: str, budget=None):
+    """sessions/<chain>[__b<B>]/asks/<arm>/<qid>/*.jsonl -> deterministic first match.
+    A legacy `nc` arm is also looked up as `nc-chunks` (Amendment C rename) and vice versa."""
+    arms = [str(arm)] + [a for a in {"nc": ["nc-chunks"], "nc-chunks": ["nc"]}.get(str(arm), [])]
+    for a in arms:
+        pat = os.path.join(sessions_root, chain_dirkey(chain_id, budget), "asks", a,
+                           str(qid), "*.jsonl")
+        files = sorted(glob.glob(pat))
+        if files:
+            return files[0]
+    return None
+
+
+def parse_ask_session(path: str, arm: str, recall_arms: tuple = RECALL_ARMS) -> dict:
     """Split an ask session into (C3 summary, recall block, post-compaction messages).
 
     Returns dict with:
@@ -135,9 +148,10 @@ def assemble(summary: str, recall: str, post_messages, cap: int = DEFAULT_CAP):
 
 
 def build_visible_context(sessions_root: str, chain_id: str, arm: str, qid: str,
-                          cap: int = DEFAULT_CAP) -> tuple[str | None, dict]:
-    """(visible_context, meta). visible_context is None when no ask session exists."""
-    path = find_ask_session(sessions_root, chain_id, arm, qid)
+                          cap: int = DEFAULT_CAP, budget=None) -> tuple[str | None, dict]:
+    """(visible_context, meta). visible_context is None when no ask session exists.
+    `budget` (the record's mem_budget) selects the `__b<B>` session dir of a sweep run."""
+    path = find_ask_session(sessions_root, chain_id, arm, qid, budget)
     meta: dict = {"ask_session": None, "cap": cap}
     if path is None:
         meta["error"] = "ask_session_not_found"

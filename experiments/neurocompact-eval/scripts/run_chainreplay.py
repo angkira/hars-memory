@@ -7,7 +7,12 @@ Protocol (external reviewer's design, implemented literally):
   after C3 span 1 has lag 3 (re-summarized twice), span 2 lag 2, span 3 lag 1.
   All questions are asked only after the 3rd compaction.
 
-Arms (each chain runs every requested arm; same 3-compaction history):
+Arms (each chain runs every requested arm; same 3-compaction history).
+Amendment C (2026-10-26, REPORT-PROTOCOL.md section 4): the old `nc` arm is renamed
+`nc-chunks` (`nc` stays a CLI alias); `nc-graph` is a fork of the nc-chunks post-C3 session
+that differs ONLY in `session_graph: true` on memory_recall; `--mem-budgets 1536,1024,512`
+sweeps the ask-time budget (every B-dependent cap is a frozen function of B). The text
+below describes the original design; read "nc" as "nc-chunks".
   baseline      — NC_PERSIST=0: the extension writes a bounded, schema-matched
                   COMPREHENSIVE summary (hard cap 1536 tok, NC_SUM_SECTION_TRIM=1)
                   and nothing is persisted.
@@ -265,11 +270,13 @@ DEFAULT_MCP = "http://127.0.0.1:8307/mcp"   # HARS nc-hars-chain-glm (glm extrac
 # nc/note-only: cap on the schema-matched note; the note is written before the
 # ask-time budget is known, so its realized size is measured at C3 and the
 # recall cap is derived from it (see recall_cap_for()).
-CAPS = {"baseline": 1536, "nc": 640, "nc-note-only": 640}   # overridden by CLI
+CAPS = {"baseline": 1536, "nc-chunks": 640, "nc-graph": 640,
+        "nc-note-only": 640}   # overridden by CLI
 DEFAULT_MEM_BUDGET = 1536        # ask-time memory target, realized tokens
 RECALL_CAP_MIN = 256             # never pack less than this (else nc is starved)
 RECALL_CAP_MAX = 1024            # never pack more than this (protocol ceiling)
 PARITY_LO, PARITY_HI = 0.80, 1.05   # reviewer's realized-token parity window
+KG_EMPTY_DIAG_RATE = 0.30        # nc-graph: > 30% asks with an empty KG result = "graph not exercised"
 CLIP_LIMIT = 1.0 / 6.0           # >1/6 clipped compactions in an arm => invalid
 RECALL_BUDGET_TOKENS = RECALL_CAP_MAX   # packer default = the protocol ceiling
 # (RECALL_MIN_CHARS=100 on the packed text was removed: the packer's own header is
@@ -293,6 +300,8 @@ MICRO_REPLAY_S = float(os.environ.get("NC_PROJ_REPLAY_S") or 6.0)
 MICRO_RECALL_S = float(os.environ.get("NC_PROJ_RECALL_S") or 5.0)
 HARS_EXTRACT_IN = 1500.0    # per memory_compact: extractor prompt tokens (est)
 HARS_EXTRACT_OUT = 1200.0   # per memory_compact: extractor completion tokens (est)
+MICRO_KEYWORD_S = float(os.environ.get("NC_PROJ_KEYWORD_S") or 2.0)   # nc-graph keyword LLM call
+KEYWORD_IN, KEYWORD_OUT = 450.0, 80.0    # per nc-graph recall: keyword-extraction tokens (est)
 
 # USD per 1M tokens (OpenRouter public list, fetched 2026-10-25)
 PRICES = {
@@ -300,9 +309,49 @@ PRICES = {
     "z-ai/glm-5.3-flash": (0.15, 0.50),
     # Anthropic list price (USD / 1M tok), NOT fetched here: verify before relying on it
     "claude-haiku-4-5": (1.00, 5.00),
+    # claude-haiku-5-5 (Amendment C agent/answer/extractor model): list price NOT verified,
+    # the haiku-4-5 line is used as a placeholder for the --dry-run projection only
+    "claude-haiku-5-5": (1.00, 5.00),
 }
 
-ARM_ORDER = ("baseline", "nc", "nc-note-only")
+# Amendment C (2026-10-26): the old `nc` arm is chunk-RAG over the compaction documents
+# (M2: no keywords -> graph branch skipped) and is renamed `nc-chunks`. `nc-graph` is a fork
+# of the nc-chunks session after C3 (same note, same session dir, same packer, same cap) that
+# differs ONLY in `session_graph: true` on memory_recall. `nc` stays accepted on the CLI as
+# an alias of `nc-chunks`.
+ARM_CHUNKS = "nc-chunks"
+ARM_GRAPH = "nc-graph"
+ARM_NOTE = "nc-note-only"
+ARM_ORDER = ("baseline", ARM_CHUNKS, ARM_GRAPH, ARM_NOTE)
+ARM_ALIASES = {"nc": ARM_CHUNKS}
+RECALL_ARMS = (ARM_CHUNKS, ARM_GRAPH)       # arms whose ask injects a packed memory_recall
+FORK_ARMS = (ARM_GRAPH, ARM_NOTE)           # arms forked from the nc-chunks post-C3 session
+DEFAULT_ARMS = ",".join(ARM_ORDER)
+
+# Budget sweep (Amendment C): every B-dependent quantity is a frozen function of B.
+# At B = 1536 each formula returns exactly the pre-amendment constants (640 / 256 / 1024).
+B_REF = 1536
+SWEEP_BUDGETS_DEFAULT = (512, 1024, 1536)
+PRIMARY_BUDGET = 1536
+GRAPH_MODE = "hybrid"          # session_graph_mode of the nc-graph recall (frozen)
+EXTRACTOR_MODEL_DEFAULT = "claude-haiku-5-5"   # HARS extractor == keyword model (this run)
+
+
+def scaled(base: int, budget: int) -> int:
+    """round(base * budget / 1536): the one scaling rule for note cap and recall clamps."""
+    return int(round(base * int(budget) / B_REF))
+
+
+def note_cap_formula(budget: int) -> int:
+    return scaled(640, budget)          # 213 / 427 / 640
+
+
+def recall_floor_formula(budget: int) -> int:
+    return scaled(256, budget)          # 85 / 171 / 256
+
+
+def recall_ceil_formula(budget: int) -> int:
+    return scaled(1024, budget)         # 341 / 683 / 1024
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +495,23 @@ def check_alignment(chain: dict) -> list[dict]:
     for q in chain["qa"]:
         idx = int(q["span_idx"])
         ev = norm_ws(str(q["evidence"]))
+        legs = q.get("evidence_spans")
+        if isinstance(legs, list) and legs:
+            # multi-hop / cross-compaction item (Amendment C secondary stratum): facts in
+            # two (or more) spans; EVERY leg {span_idx, evidence} must align. Interface
+            # assumption pending the dataset agent's schema: the item's top-level
+            # span_idx/evidence stay the (latest) anchor leg.
+            bad = [l for l in legs if not (
+                isinstance(l, dict) and int(l.get("span_idx") or 0) in texts
+                and norm_ws(str(l.get("evidence") or ""))
+                and norm_ws(str(l["evidence"])).lower() in texts[int(l["span_idx"])].lower())]
+            ok = not bad
+            why = (f"exact substring in each of {len(legs)} spans" if ok else
+                   f"{len(bad)}/{len(legs)} evidence legs NOT a normalized substring of "
+                   "their span")
+            out.append({"qid": q["qid"], "span_idx": idx, "ok": ok, "why": why,
+                        "evidence": ev[:140]})
+            continue
         if idx == 0:
             # unanswerable probe: nothing to align; it must carry no evidence
             ok = not ev and q["answerable"] is False
@@ -533,11 +599,27 @@ def hars_status(mcp_url: str, session_id: str) -> dict:
         return {"compactions": -1, "error": describe_exception(e), "unreachable": True}
 
 
-def hars_recall(mcp_url: str, session_id: str, question: str, timeout: int = 600) -> dict:
+GRAPH_RECALL_ARGS = {"session_graph": True, "session_graph_mode": GRAPH_MODE}
+# Keyword policy of the nc-graph arm (Amendment C, frozen): the runner supplies NO keywords;
+# the server resolves them: LLM keyword extraction (extractor model, cached) -> on error the
+# question text. `keyword_source` ("caller" | "llm" | "question_fallback") is logged per ask.
+
+
+def recall_args(session_id: str, question: str, graph: bool = False) -> dict:
+    """The frozen memory_recall call shape per arm. nc-chunks: byte-identical to the
+    pre-amendment call; nc-graph: the same plus session_graph/session_graph_mode."""
+    a = {"session_id": session_id, "question": question, "top_k": 8}
+    if graph:
+        a.update(GRAPH_RECALL_ARGS)
+    return a
+
+
+def hars_recall(mcp_url: str, session_id: str, question: str, timeout: int = 600,
+                graph: bool = False) -> dict:
     """memory_recall; returns the raw tool payload (or {'context': '', 'error': ...})."""
     try:
-        d = mcp_call(mcp_url, "memory_recall",
-                     {"session_id": session_id, "question": question, "top_k": 8}, timeout=timeout)
+        d = mcp_call(mcp_url, "memory_recall", recall_args(session_id, question, graph),
+                     timeout=timeout)
         if not isinstance(d, dict):
             return {"context": "", "error": f"unexpected payload {type(d).__name__}"}
         return d
@@ -1319,8 +1401,8 @@ def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str 
         "PI_CODING_AGENT_DIR": AGENT_DIR,
         "NC_PROVIDER": provider_cfg(provider)["nc_provider"],
         "NC_MODEL_ID": agent_model,
-        "NC_PERSIST": "1" if arm == "nc" else "0",
-        "NC_NOTE_ONLY": "1" if arm == "nc-note-only" else "0",
+        "NC_PERSIST": "1" if arm in (ARM_CHUNKS, ARM_GRAPH) else "0",
+        "NC_NOTE_ONLY": "1" if arm == ARM_NOTE else "0",
         "NC_SESSION_ID": sid,
         "NC_MCP_URL": mcp_url,
         "NC_SUM_PROVIDER": provider_cfg(provider)["nc_provider"],
@@ -1340,7 +1422,7 @@ def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str 
                                     or sum_reasoning_default(sum_model or agent_model,
                                                              provider)),
         "NC_FORCE_COMPACT_THRESHOLD": str(FORCE_OFF),
-        "NC_INJECT_RECALL": "1" if arm == "nc" else "0",
+        "NC_INJECT_RECALL": "1" if arm in RECALL_ARMS else "0",
     })
     env.pop("NC_ORIG_SUMMARY_FILE", None)
     env.pop("NC_DEBUG", None)
@@ -1623,7 +1705,7 @@ def pack_selftest() -> int:
                                  baseline_sum_max_tokens=1536, note_sum_max_tokens=640,
                                  agent_model="selftest")
     comps = {"baseline": [{"span_idx": 3, "realized_tokens": 1500, "cap": 1536}],
-             "nc": [{"span_idx": 3, "realized_tokens": 600, "cap": 640}]}
+             ARM_CHUNKS: [{"span_idx": 3, "realized_tokens": 600, "cap": 640}]}
     v_bad = chain_budget("c-selftest", fake, comps, [900], True, {"q1": dead_why})
     v_ok = chain_budget("c-selftest", fake, comps, [900], True, {"q1": good_why})
     rc = recall_cap_for(600, fake, baseline_realized=1500)
@@ -1705,6 +1787,79 @@ def recall_failure_reasons(payload: dict, packed: dict) -> list[str]:
     if content_units == 0:
         why.append("0 content units packed (header/wrapper only)")
     return why
+
+
+GRAPH_FAIL_STATUSES = ("error", "skipped", "unknown_session")
+
+
+def graph_block(payload: dict) -> dict | None:
+    sg = (payload or {}).get("session_graph") if isinstance(payload, dict) else None
+    return sg if isinstance(sg, dict) else None
+
+
+def graph_failure_reasons(payload: dict) -> list[str]:
+    """Extra RECALL FAIL reasons for the nc-graph arm ([] = graph branch ran). Pure.
+
+    `session_graph.status == "error"` invalidates the chain (Amendment C item 7). So do a
+    missing block (a server that ignored the flag would silently turn nc-graph into
+    nc-chunks) and status skipped/unknown_session. status "empty" (no KG hits) is NOT a
+    failure: it is reported via kg_empty_rate."""
+    sg = graph_block(payload)
+    if sg is None:
+        return ["session_graph block absent (server ignored session_graph?)"]
+    status = str(sg.get("status") or "")
+    why: list[str] = []
+    if status in GRAPH_FAIL_STATUSES:
+        why.append(f"session_graph status={status}"
+                   + (f": {str(sg.get('error'))[:120]}" if sg.get("error") else ""))
+    elif sg.get("error"):
+        why.append(f"session_graph error: {str(sg.get('error'))[:120]}")
+    return why
+
+
+def graph_summary(payload: dict) -> dict:
+    """Per-ask nc-graph readout, tolerant to missing fields (server interface may evolve)."""
+    sg = graph_block(payload) or {}
+    usage = sg.get("keyword_usage") if isinstance(sg.get("keyword_usage"), dict) else {}
+
+    def num(*vals):
+        for v in vals:
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return float(v)
+        return None
+
+    ents, rels = sg.get("entities"), sg.get("relations")
+    return {
+        "session_graph_status": sg.get("status"),
+        "keyword_source": sg.get("keyword_source"),
+        "ll_keywords": sg.get("ll_keywords"),
+        "hl_keywords": sg.get("hl_keywords"),
+        "kg_entities": ents if isinstance(ents, int) else None,
+        "kg_relations": rels if isinstance(rels, int) else None,
+        "kg_empty": (None if not isinstance(ents, int) or not isinstance(rels, int)
+                     else (ents + rels) == 0),
+        "session_graph_latency_ms": num(sg.get("latency_ms")),
+        "keyword_latency_ms": num(sg.get("keyword_latency_ms")),
+        "keyword_tokens_in": num(usage.get("input"), usage.get("prompt_tokens"),
+                                 sg.get("keyword_tokens_in")),
+        "keyword_tokens_out": num(usage.get("output"), usage.get("completion_tokens"),
+                                  sg.get("keyword_tokens_out")),
+        "keyword_cost_usd": num(sg.get("keyword_cost_usd"), usage.get("cost_usd")),
+    }
+
+
+KG_HEADING = "### Direct relations / entities"
+
+
+def split_packed_sections(text: str) -> tuple[str, str]:
+    """(kg_text, chunk_text) of a packed recall body (pack_recall layout: optional
+    `### Direct relations / entities` block first, then `[rank N]` chunk blocks)."""
+    text = text or ""
+    i = text.find(KG_HEADING)
+    if i < 0:
+        return "", text
+    j = text.find("\n\n[rank ", i)
+    return (text[i:j], text[:i] + text[j:]) if j >= 0 else (text[i:], text[:i])
 
 
 def status_gate_problems(status: dict) -> tuple[list[str], list[str]]:
@@ -1805,6 +1960,33 @@ def pack_injection(raw: str, sid: str, budget: int = RECALL_BUDGET_TOKENS,
 # ---------------------------------------------------------------------------
 # budget accounting — REALIZED tokens, never configured caps
 # ---------------------------------------------------------------------------
+def args_for_budget(args, budget: int, sweep: bool):
+    """Per-B copy of the CLI namespace. Without --mem-budgets it is the namespace itself
+    (pre-amendment behaviour). With it, every B-dependent knob is the frozen function of B."""
+    if not sweep:
+        return args
+    import copy
+    a = copy.copy(args)
+    a.mem_budget = int(budget)
+    a.baseline_sum_max_tokens = int(budget)
+    a.note_sum_max_tokens = note_cap_formula(budget)
+    a.recall_cap_min = recall_floor_formula(budget)
+    a.recall_cap_max = recall_ceil_formula(budget)
+    a.b_tag = True
+    return a
+
+
+def ctx_budget_banner(args, args0) -> None:
+    """Print the budget cell about to run and pin the per-B arm caps."""
+    CAPS["baseline"] = int(args.baseline_sum_max_tokens)
+    CAPS[ARM_CHUNKS] = CAPS[ARM_GRAPH] = CAPS[ARM_NOTE] = int(args.note_sum_max_tokens)
+    if getattr(args, "b_tag", False):
+        print(f"\n######## mem_budget B={args.mem_budget}: baseline trim {args.baseline_sum_max_tokens}"
+              f" | note cap {args.note_sum_max_tokens} | recall cap = clamp(B - realized note, "
+              f"{args.recall_cap_min}, {args.recall_cap_max})"
+              f"{' | PRIMARY cell' if args.mem_budget == PRIMARY_BUDGET else ''}", flush=True)
+
+
 def note_cap_for(arm: str, args) -> int:
     """Configured cap for an arm: baseline = summary ceiling, else the note cap."""
     return (args.baseline_sum_max_tokens if arm == "baseline"
@@ -1877,7 +2059,10 @@ def cap_advice(target: float, realized: float, cap: float) -> dict:
 def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[int],
                  require_no_clip: bool,
                  recall_failures: dict[str, list[str]] | None = None,
-                 recall_degraded_by_qid: dict[str, str | None] | None = None) -> dict:
+                 recall_degraded_by_qid: dict[str, str | None] | None = None,
+                 graph_recall_tokens: list[int] | None = None,
+                 graph_failures: dict[str, list[str]] | None = None,
+                 graph_kg_empty: dict[str, bool] | None = None) -> dict:
     """Per-chain realized-budget record + the parity / clip / recall verdicts.
 
     `recall_failures` maps qid -> recall_failure_reasons(); any non-empty entry
@@ -1885,6 +2070,12 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
     disguise and must not enter the decision set. `recall_degraded_by_qid` maps
     qid -> session.degraded; any degraded ask invalidates the chain (RECALL
     DEGRADED k/n) unless args.allow_degraded, which keeps it valid but recorded.
+
+    Amendment C: `graph_*` carry the nc-graph arm (same cap, same note, same packer).
+    `graph_failures` (qid -> reasons, incl. session_graph.status == "error") invalidates
+    the chain exactly like a chunks RECALL FAIL; `graph_kg_empty` (qid -> KG sections
+    empty) is NOT invalidating, it only feeds `kg_empty_rate` and the diagnostic flag
+    `graph_not_exercised` (> KG_EMPTY_DIAG_RATE of asks).
     """
     def c3(arm: str) -> dict | None:
         for r in comps_by_arm.get(arm) or []:
@@ -1892,13 +2083,13 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
                 return r
         return None
 
-    b3, n3 = c3("baseline"), c3("nc")
+    b3, n3 = c3("baseline"), c3(ARM_CHUNKS)
     # `truncated` on a compaction record means UNREPAIRED clip: stop=length with
     # no boundary repair (stop=length + boundary_repaired is `clipped_repaired`
     # and is deliberately not counted here).
     clipped = {a: sum(1 for r in (comps_by_arm.get(a) or []) if r.get("truncated"))
-               for a in ("baseline", "nc")}
-    counts = {a: len(comps_by_arm.get(a) or []) for a in ("baseline", "nc")}
+               for a in ("baseline", ARM_CHUNKS)}
+    counts = {a: len(comps_by_arm.get(a) or []) for a in ("baseline", ARM_CHUNKS)}
     rec = {
         "chain_id": chain_id,
         "mem_budget": int(args.mem_budget),
@@ -1935,6 +2126,18 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
         "judge_model": getattr(args, "judge_model", None),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    rec["nc_graph_recall_tokens"] = (int(round(sum(graph_recall_tokens) / len(graph_recall_tokens)))
+                                     if graph_recall_tokens else None)
+    rec["nc_graph_memory_total"] = (None if rec["nc_note_tokens"] is None
+                                    or rec["nc_graph_recall_tokens"] is None
+                                    else rec["nc_note_tokens"] + rec["nc_graph_recall_tokens"])
+    rec["ratio_graph"] = (round(rec["nc_graph_memory_total"] / rec["baseline_memory_total"], 3)
+                          if rec["nc_graph_memory_total"] and rec["baseline_memory_total"]
+                          else None)
+    rec["kg_empty_rate"] = (round(sum(1 for v in graph_kg_empty.values() if v)
+                                  / len(graph_kg_empty), 3) if graph_kg_empty else None)
+    rec["graph_not_exercised"] = (None if rec["kg_empty_rate"] is None
+                                  else rec["kg_empty_rate"] > KG_EMPTY_DIAG_RATE)
     rec["nc_memory_total"] = (None if rec["nc_note_tokens"] is None
                               or rec["nc_recall_tokens"] is None
                               else rec["nc_note_tokens"] + rec["nc_recall_tokens"])
@@ -1973,6 +2176,16 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
         first = next(iter(sorted(bad_recall)))
         reasons.append(f"RECALL FAIL {len(bad_recall)}/{len(recall_failures)} nc recalls "
                        f"unusable (e.g. {first}: {'; '.join(bad_recall[first])})")
+    bad_graph = {q: w for q, w in (graph_failures or {}).items() if w}
+    rec["graph_recall_failed_qids"] = sorted(bad_graph)
+    if bad_graph:
+        first = next(iter(sorted(bad_graph)))
+        reasons.append(f"RECALL FAIL (nc-graph) {len(bad_graph)}/{len(graph_failures)} "
+                       f"graph recalls unusable (e.g. {first}: {'; '.join(bad_graph[first])})")
+    if rec["graph_not_exercised"]:
+        rec["warnings"].append(
+            f"nc-graph KG sections empty on {rec['kg_empty_rate']:.0%} of asks "
+            f"(> {KG_EMPTY_DIAG_RATE:.0%}): graph not exercised (diagnostic, chain kept)")
     degraded = {q: d for q, d in (recall_degraded_by_qid or {}).items() if d}
     allow_deg = bool(getattr(args, "allow_degraded", False))
     rec["recall_degraded_qids"] = sorted(degraded)
@@ -1987,7 +2200,7 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
         else:
             reasons.append(msg)
     if require_no_clip:
-        for arm in ("baseline", "nc"):
+        for arm in ("baseline", ARM_CHUNKS):
             n, k = counts[arm], clipped[arm]
             if n and k / n > CLIP_LIMIT:
                 reasons.append(f"CLIP FAIL arm={arm}: {k}/{n} unrepaired clipped "
@@ -2002,6 +2215,13 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
 # ---------------------------------------------------------------------------
 class ChainFailure(RuntimeError):
     pass
+
+
+def chain_dirkey(chain_id: str, args) -> str:
+    """Directory/label key of one chain: the chain id, plus `__b<B>` when the run sweeps
+    mem_budget (every B has its own sessions, logs and answers; visible_context.py mirrors
+    this)."""
+    return f"{chain_id}__b{int(args.mem_budget)}" if getattr(args, "b_tag", False) else chain_id
 
 
 def flush_comp_records(comps_f, comps_by_arm: dict, extra: dict | None = None) -> None:
@@ -2035,7 +2255,7 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
                     nc_session_id: str | None,
                     snapshot_before_c3: bool = False,
                     baseline_realized: int | None = None) -> dict:
-    """Replay -> 3 forced compactions (nc-note-only: fork check only).
+    """Replay -> 3 forced compactions (nc-note-only / nc-graph: fork check only).
 
     Questions are NOT asked here. The ask-time budget cannot be fixed until the
     C3 note (nc) and the C3 summary (baseline) exist, so the caller runs every
@@ -2044,11 +2264,13 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
     """
     chain_id = chain["chain_id"]
     tag = "".join(ch for ch in args.agent_model if ch.isalnum())[:20] or "model"
-    arm_dir = os.path.join(out_dir, "sessions", chain_id, arm)
+    dkey = chain_dirkey(chain_id, args)
+    arm_dir = os.path.join(out_dir, "sessions", dkey, arm)
     os.makedirs(arm_dir, exist_ok=True)
-    if arm == "nc-note-only":
+    if arm in FORK_ARMS:
         if not nc_post_dir or not nc_session_id:
-            raise ChainFailure("nc-note-only needs the nc post-C3 session but the nc arm did not run")
+            raise ChainFailure(f"{arm} needs the nc-chunks post-C3 session but the "
+                               "nc-chunks arm did not run")
         # The fork MUST keep the nc session id: pi resolves --session-id against
         # the copied session FILE, and the copy is the nc session. A fresh id
         # would silently create an empty session and the arm would measure
@@ -2058,13 +2280,14 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
         print(f"    [{arm}] fork of {os.path.relpath(nc_post_dir, out_dir)} as session "
               f"{sid} (cp -a, 0 replays, 0 compactions)", flush=True)
     else:
-        sid = f"cr-{tag}-{chain_id}-{arm}-{run_id}"
+        sid = (f"cr-{tag}-{chain_id}-{arm}-b{int(args.mem_budget)}-{run_id}"
+               if getattr(args, "b_tag", False) else f"cr-{tag}-{chain_id}-{arm}-{run_id}")
     cap = note_cap_for(arm, args)
     env = base_env(arm, args.agent_model, sid, args.mcp, args.sum_model, cap=cap)
     comp_records: list[dict] = []
     t0 = time.time()
 
-    if arm != "nc-note-only":
+    if arm not in FORK_ARMS:
         # ---- replay + 3 chained compactions ----
         for span in chain["spans"]:
             idx = int(span["span_idx"])
@@ -2097,7 +2320,7 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
             # the post-C2 session so each sweep point differs only in the cap.
             snap = ""
             if snapshot_before_c3 and arm == "baseline" and idx == 3:
-                snap = os.path.join(out_dir, "sessions", chain_id, "_pre-c3", arm)
+                snap = os.path.join(out_dir, "sessions", dkey, "_pre-c3", arm)
                 copy_session_dir(arm_dir, snap)
                 print(f"    [{arm}] snapshot of the post-C2 session -> "
                       f"{os.path.relpath(snap, out_dir)} (for the cap sweep)", flush=True)
@@ -2129,7 +2352,7 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
             m = r["metrics"][0]
             summary = ev.get("summary") or ""
             # audit trail: the extension's stderr ([nc-metrics]) and the artifact
-            log_dir = os.path.join(out_dir, "logs", chain_id)
+            log_dir = os.path.join(out_dir, "logs", dkey)
             os.makedirs(log_dir, exist_ok=True)
             err_path = os.path.join(log_dir, f"{arm}-span{idx}.stderr")
             sum_path = os.path.join(log_dir, f"{arm}-span{idx}.summary.txt")
@@ -2201,7 +2424,7 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
                 "summary_path": os.path.relpath(sum_path, out_dir),
                 "stderr_path": os.path.relpath(err_path, out_dir),
             }
-            if arm == "nc":
+            if arm == ARM_CHUNKS:
                 rc = recall_cap_for(ntok, args, baseline_realized)
                 rec.update({**{k: rc[k] for k in (
                     "mem_budget", "recall_uncapped_target", "recall_cap",
@@ -2214,10 +2437,10 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
             print(f"    [{arm}] C{idx}: stop={rec['finish_reason']} "
                   f"summary={len(summary)}ch/{ntok}tok cap={cap} persisted={persisted} "
                   f"before={rec['tokens_before']} after={rec['tokens_after']}", flush=True)
-            if arm == "nc" and not rec["persisted"]:
+            if arm == ARM_CHUNKS and not rec["persisted"]:
                 raise ChainFailure(f"span {idx}: memory_compact did not persist to HARS")
-        # ---- gate: 3 compactions for nc ----
-        if arm == "nc":
+        # ---- gate: 3 compactions for nc-chunks (the persisting arm) ----
+        if arm == ARM_CHUNKS:
             status = hars_status(args.mcp, sid)
             got = int(status.get("compactions") or 0)
             if status.get("unreachable"):
@@ -2260,11 +2483,11 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
 
     return {"arm": arm, "session_id": sid, "compactions": comp_records,
             "wall": round(time.time() - t0, 1), "arm_dir": arm_dir,
-            "fork_of": nc_session_id if arm == "nc-note-only" else None}
+            "fork_of": nc_session_id if arm in FORK_ARMS else None}
 
 
 def collect_recall(chain: dict, state: dict, args, recall_cap: int,
-                   cache: dict) -> list[int]:
+                   cache: dict, graph: bool = False) -> list[int]:
     """memory_recall + pack for every question at the C3-derived cap (no ask turn).
 
     Run once per chain, before any question is asked: the packed injection is
@@ -2273,11 +2496,13 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
     diverge. Costs HARS recall calls, no agent asks.
     """
     sid = state["session_id"]
+    label = ARM_GRAPH if graph else ARM_CHUNKS
     tokens: list[int] = []
     for q in chain["qa"]:
         qid = str(q["qid"])
         t_rec = time.time()
-        payload = hars_recall(args.mcp, sid, str(q["question"]), timeout=RECALL_TIMEOUT)
+        payload = hars_recall(args.mcp, sid, str(q["question"]), timeout=RECALL_TIMEOUT,
+                              graph=graph)
         recall_s = time.time() - t_rec
         raw = payload.get("context") or ""
         recall_error = str(payload.get("error") or "")
@@ -2286,6 +2511,10 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
             raise ChainFailure(f"recall for {qid} injected {packed['total_tokens']} tokens "
                                f"> the {recall_cap}-token cap derived from the C3 note")
         fail = recall_failure_reasons(payload, packed)
+        gsum = None
+        if graph:
+            fail = fail + graph_failure_reasons(payload)
+            gsum = graph_summary(payload)
         degraded = recall_degraded(payload)
         if degraded:
             print(f"    !!! RECALL DEGRADED {qid}: session channel {degraded} "
@@ -2304,9 +2533,14 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
                       "recall_degraded": degraded,
                       "recall_session_status": (payload.get("session") or {}).get("status")
                       if isinstance(payload.get("session"), dict) else None,
-                      "recall_error_kind": payload.get("error_kind")}
+                      "recall_error_kind": payload.get("error_kind"),
+                      "graph": gsum}
         tokens.append(packed["total_tokens"])
-        print(f"    [nc] {qid}: recall raw={len(raw)}ch ({count_tokens(raw)}tok) -> "
+        if gsum:
+            print(f"    [{label}] {qid}: session_graph status={gsum['session_graph_status']} "
+                  f"keyword_source={gsum['keyword_source']} kg_entities={gsum['kg_entities']} "
+                  f"kg_relations={gsum['kg_relations']}", flush=True)
+        print(f"    [{label}] {qid}: recall raw={len(raw)}ch ({count_tokens(raw)}tok) -> "
               f"packed body={packed['tokens']}tok injected={packed['total_tokens']}tok "
               f"(cap {recall_cap}) chunks={packed['chunks_kept']}/{packed['chunks']} "
               f"rels={packed['relations_kept']}/{packed['relations']} in {recall_s:.1f}s",
@@ -2333,18 +2567,18 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
     anchors_in_recall_total = 0
     for q in chain["qa"]:
         qid = str(q["qid"])
-        qdir = os.path.join(out_dir, "sessions", chain_id, "asks", arm, qid)
+        qdir = os.path.join(out_dir, "sessions", chain_dirkey(chain_id, args), "asks", arm, qid)
         copy_session_dir(arm_dir, qdir)   # question N's recall cannot leak into N+1
         injected = ""
         packed = {"tokens": 0, "raw_chars": 0, "packed_chars": 0}
         raw_tokens = 0
         recall_error = ""
         recall_s = 0.0
-        if arm == "nc":
+        if arm in RECALL_ARMS:
             cached = recall_cache.get(qid)
             if cached is None:
-                raise ChainFailure(f"nc ask {qid} has no measured recall (collect_recall did "
-                                   "not run for this chain)")
+                raise ChainFailure(f"{arm} ask {qid} has no measured recall (collect_recall "
+                                   "did not run for this chain)")
             packed = cached
             raw_tokens = packed["raw_tokens"]
             recall_error = packed.get("recall_error") or ""
@@ -2362,14 +2596,18 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
         answer = r["text"] or ""
         anchor_hit = None
         anchor_in_recall = None
+        anchor_in_kg = anchor_in_chunks = None
         if anchor:
             pat = re.compile(r"(?<![0-9A-Za-z_])" + re.escape(anchor) + r"(?![0-9A-Za-z_])", re.I)
             anchor_hit = bool(pat.search(answer))
-            if arm == "nc":
+            if arm in RECALL_ARMS:
                 anchor_in_recall = bool(pat.search(packed["text"]))
                 anchors_in_recall_total += 1 if anchor_in_recall else 0
+                kg_txt, chunk_txt = split_packed_sections(packed["text"])
+                anchor_in_kg = bool(pat.search(kg_txt))
+                anchor_in_chunks = bool(pat.search(chunk_txt))
         mem_tokens = count_tokens(injected) if injected else 0
-        if arm != "nc":
+        if arm not in RECALL_ARMS:
             if packed["packed_chars"] or mem_tokens:
                 raise ChainFailure(f"{arm} ask {qid} injected {mem_tokens} recall tokens "
                                    "(must be exactly 0)")
@@ -2378,9 +2616,9 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
         # the nc C3 note it was forked with (main() sets state["note_tokens"])
         note_tokens_this_arm = int((c3 or {}).get("realized_tokens")
                                    or state.get("note_tokens") or 0)
-        arm_memory_total = ((note_tokens_this_arm + mem_tokens) if arm == "nc"
+        arm_memory_total = ((note_tokens_this_arm + mem_tokens) if arm in RECALL_ARMS
                             else note_tokens_this_arm)
-        ans_path = os.path.join(out_dir, "answers", chain_id, arm, qid + ".json")
+        ans_path = os.path.join(out_dir, "answers", chain_dirkey(chain_id, args), arm, qid + ".json")
         os.makedirs(os.path.dirname(ans_path), exist_ok=True)
         with open(ans_path, "w") as f:
             f.write(r["out"])
@@ -2392,10 +2630,10 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
             "answer": answer, "latency_s": round(r["wall"], 2),
             "prompt_tokens": r["usage"]["input"], "completion_tokens": r["usage"]["output"],
             "memory_tokens_injected": mem_tokens,
-            "recall_raw_chars": packed["raw_chars"] if arm == "nc" else 0,
-            "recall_packed_tokens": packed["tokens"] if arm == "nc" else 0,
-            "recall_packed_chars": packed["packed_chars"] if arm == "nc" else 0,
-            "packed_loss_pct": loss if arm == "nc" else 0.0,
+            "recall_raw_chars": packed["raw_chars"] if arm in RECALL_ARMS else 0,
+            "recall_packed_tokens": packed["tokens"] if arm in RECALL_ARMS else 0,
+            "recall_packed_chars": packed["packed_chars"] if arm in RECALL_ARMS else 0,
+            "packed_loss_pct": loss if arm in RECALL_ARMS else 0.0,
             "anchor_hit": anchor_hit,
             "anchor_in_recall": anchor_in_recall,
             "answer_path": os.path.relpath(ans_path, out_dir),
@@ -2406,15 +2644,15 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
             "tokenizer": TOKENIZER, "ok": r["ok"],
             "recall_error": recall_error or None,
             "recall_failure_reasons": (packed.get("recall_failure_reasons") or [])
-                                      if arm == "nc" else [],
-            "recall_degraded": (packed.get("recall_degraded") if arm == "nc" else None),
+                                      if arm in RECALL_ARMS else [],
+            "recall_degraded": (packed.get("recall_degraded") if arm in RECALL_ARMS else None),
             "recall_session_status": (packed.get("recall_session_status")
-                                      if arm == "nc" else None),
-            "recall_error_kind": (packed.get("recall_error_kind") if arm == "nc" else None),
+                                      if arm in RECALL_ARMS else None),
+            "recall_error_kind": (packed.get("recall_error_kind") if arm in RECALL_ARMS else None),
             "allow_degraded": bool(getattr(args, "allow_degraded", False)),
             "agent_provider": getattr(args, "provider", PROVIDER),
             # recall wall time, separate from latency_s (= the ask turn only)
-            "recall_seconds": recall_s if arm == "nc" else 0.0,
+            "recall_seconds": recall_s if arm in RECALL_ARMS else 0.0,
             # ---- realized ask-time memory (this arm, this ask) ----
             "arm_note_tokens": note_tokens_this_arm if arm != "baseline" else 0,
             "arm_memory_total": arm_memory_total,
@@ -2424,10 +2662,27 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
             # did THIS arm's memory reach HARS: nc reaches phase D only after the
             # 3-persisted + entities gate; baseline must persist nothing; the
             # note-only fork persists nothing by design (not applicable)
-            "persisted_compaction": (all(bool(r.get("persisted")) for r in comps)
-                                     and len(comps) == 3) if arm == "nc"
-                                    else (False if arm == "baseline" else None),
+            "persisted_compaction": ((all(bool(r.get("persisted")) for r in comps)
+                                      and len(comps) == 3) if arm == ARM_CHUNKS
+                                     else state.get("persisted_ok") if arm == ARM_GRAPH
+                                     else (False if arm == "baseline" else None)),
+            # Amendment C: unique rid across the mem_budget sweep, item type for the
+            # multi-hop stratum, per-section anchor delivery
+            "rid": f"{qid}::{arm}::b{int(args.mem_budget)}",
+            "b_tag": bool(getattr(args, "b_tag", False)),
+            "qtype": q.get("qtype"),
+            "anchor_in_kg_recall": anchor_in_kg if arm in RECALL_ARMS else None,
+            "anchor_in_chunk_recall": anchor_in_chunks if arm in RECALL_ARMS else None,
+            "recall_kg_entities_kept": packed.get("entities_kept") if arm in RECALL_ARMS else None,
+            "recall_kg_relations_kept": packed.get("relations_kept") if arm in RECALL_ARMS else None,
         }
+        if arm == ARM_GRAPH:
+            g = packed.get("graph") or {}
+            rec.update(g)
+            rec["keyword_model"] = getattr(args, "extractor_model", EXTRACTOR_MODEL_DEFAULT)
+            rec["session_graph_mode"] = GRAPH_MODE
+            # the keyword call is part of the ask: counted in latency (recall_seconds is
+            # added by metrics_v2) and in cost/question (keyword tokens when reported)
         if bctx:
             rec.update({k: bctx.get(k) for k in (
                 "mem_budget", "nc_note_tokens", "nc_note_tokens_source", "nc_recall_tokens",
@@ -2435,7 +2690,9 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
                 "recall_cap", "recall_cap_arithmetic", "recall_cap_clamped_low",
                 "recall_uncapped_target", "baseline_sum_max_tokens", "note_sum_max_tokens",
                 "parity_window", "require_no_clip", "baseline_cap_advice",
-                "recall_degraded_n", "recall_degraded_qids")})
+                "recall_degraded_n", "recall_degraded_qids",
+                "nc_graph_recall_tokens", "nc_graph_memory_total", "ratio_graph",
+                "kg_empty_rate", "graph_not_exercised")})
             rec["clipped_compactions"] = bctx["clipped_compactions"]
             rec["compactions_per_arm"] = bctx["compactions_per_arm"]
             rec["valid"] = bctx["valid"]
@@ -2448,8 +2705,8 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
         print(f"    [{arm}] {qid} answer: {answer[:110]!r} anchor_hit={anchor_hit} "
               f"mem_inj={mem_tokens}tok loss={loss}%", flush=True)
 
-    if arm == "nc" and anchors_in_recall_total == 0:
-        print(f"    !!! nc recall for {chain_id} contained 0 gold anchors in any ask "
+    if arm in RECALL_ARMS and anchors_in_recall_total == 0:
+        print(f"    !!! {arm} recall for {chain_id} contained 0 gold anchors in any ask "
               "(recall supplied nothing anchorable; memory arm degenerate)", flush=True)
     return {"arm": arm, "session_id": sid, "asks": ask_rows,
             "wall": state.get("wall")}
@@ -2494,7 +2751,7 @@ def calibrate_table(rows: dict, args, sweep_rows: list[dict],
                     baseline_cap: int, note_cap: int) -> dict:
     """Print the realized-token table and the recommended baseline ceiling."""
     b = rows.get("baseline") or {}
-    n = rows.get("nc") or {}
+    n = rows.get(ARM_CHUNKS) or {}
     note = n.get("note_tokens")
     recall = n.get("recall_tokens")
     nc_total = (note + recall) if (note is not None and recall is not None) else None
@@ -2625,7 +2882,7 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
                                            st_b["session_id"], cap,
                                            int(b3.get("force_threshold") or FORCE_FLOOR),
                                            f"[sweep {cid}] C3 at cap {cap}"))
-        st_n = run_compactions(chain, "nc", args, args.out, args.run_id, comps_f,
+        st_n = run_compactions(chain, ARM_CHUNKS, args, args.out, args.run_id, comps_f,
                               None, None)
         n3 = next((r for r in st_n["compactions"] if int(r["span_idx"]) == 3), None)
         if not n3:
@@ -2635,20 +2892,20 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
         cache: dict = {}
         tokens = collect_recall(chain, st_n, args, rc["recall_cap"], cache)
         mean_tok = int(round(sum(tokens) / len(tokens))) if tokens else 0
-        rows["nc"] = {**rc, "cap": n3["cap"], "note_tokens": n3["realized_tokens"],
+        rows[ARM_CHUNKS] = {**rc, "cap": n3["cap"], "note_tokens": n3["realized_tokens"],
                       "note_tokens_source": n3["note_tokens_source"],
                       "recall_tokens": mean_tok, "stop": n3["stop"],
                       "recall_tokens_detail": tokens}
-        if "nc-note-only" in arms:
-            st_o = run_compactions(chain, "nc-note-only", args, args.out, args.run_id,
+        if ARM_NOTE in arms:
+            st_o = run_compactions(chain, ARM_NOTE, args, args.out, args.run_id,
                                    comps_f, st_n["arm_dir"], st_n["session_id"])
-            rows["nc-note-only"] = {"cap": None, "note_tokens": n3["realized_tokens"],
+            rows[ARM_NOTE] = {"cap": None, "note_tokens": n3["realized_tokens"],
                                     "note_tokens_source": "fork of the nc C3 note",
                                     "recall_tokens": 0, "stop": "reused",
                                     "session_id": st_o["session_id"]}
-        calib_comps = {"baseline": st_b["compactions"], "nc": st_n["compactions"]}
-        if "nc-note-only" in arms:
-            calib_comps["nc-note-only"] = st_o["compactions"]
+        calib_comps = {"baseline": st_b["compactions"], ARM_CHUNKS: st_n["compactions"]}
+        if ARM_NOTE in arms:
+            calib_comps[ARM_NOTE] = st_o["compactions"]
         flush_comp_records(comps_f, calib_comps,
                            {"mem_budget": args.mem_budget, "mode": "calibrate",
                             "valid": None})
@@ -2692,7 +2949,7 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
     # Measured fills (protocol run 2026-10-25): baseline realizes 43-63% of its
     # ceiling, the schema-matched nc note ~90% of its cap. Used for projection
     # ONLY — the runtime budget uses realized tokens, never these constants.
-    est_note_nc = int(round(CAPS["nc"] * 0.90))
+    est_note_nc = int(round(CAPS[ARM_CHUNKS] * 0.90))
     recall_cap_est = max(int(getattr(args, "recall_cap_min", RECALL_CAP_MIN)),
                          min(int(getattr(args, "recall_cap_max", RECALL_CAP_MAX)),
                              mem_budget - est_note_nc))
@@ -2726,16 +2983,21 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
                 est["comp_in"] += int(sum(span_tokens[:i + 1]) + 500)
                 est["comp_out"] += int(CAPS[arm] * 0.55)
                 est["comp_s"] += MICRO_BASELINE_S
-        elif arm == "nc":
+        elif arm == ARM_CHUNKS:
             est["compactions"] += 3
             for i in range(3):
                 est["comp_in"] += int(sum(span_tokens[:i + 1]) + 500)
                 est["comp_out"] += est_note_nc
                 est["comp_s"] += sum(HIST_NC_COMPACTION_S) / 2
             est["recall_s"] += asks * MICRO_RECALL_S
+        elif arm == ARM_GRAPH:
+            # fork: no compactions; recall also pays the keyword LLM call
+            est["recall_s"] += asks * (MICRO_RECALL_S + MICRO_KEYWORD_S)
+            est["keyword_in"] = est.get("keyword_in", 0) + asks * KEYWORD_IN
+            est["keyword_out"] = est.get("keyword_out", 0) + asks * KEYWORD_OUT
         # asks see: C3 note + kept tail + question (+ packed recall for nc)
         note_est = int(CAPS["baseline"] * 0.55) if arm == "baseline" else est_note_nc
-        post_ctx = note_est + KEEP_RECENT + (recall_cap_est if arm == "nc" else 0)
+        post_ctx = note_est + KEEP_RECENT + (recall_cap_est if arm in RECALL_ARMS else 0)
         for _ in range(asks):
             est["ask_in"] += int(post_ctx + 300)
             est["ask_out"] += 120
@@ -2743,9 +3005,11 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
     usd_agent = (est["replay_in"] + est["comp_in"] + est["ask_in"]) / 1e6 * pin + \
                 (est["replay_out"] + est["comp_out"] + est["ask_out"]) / 1e6 * pout
     usd_hars = 0.0
-    if "nc" in arms:
+    if ARM_CHUNKS in arms:
         n = 3
         usd_hars = n * (HARS_EXTRACT_IN / 1e6 * gin + HARS_EXTRACT_OUT / 1e6 * gout)
+    if ARM_GRAPH in arms:   # keyword calls go to the extractor model
+        usd_hars += (est.get("keyword_in", 0) / 1e6 * gin + est.get("keyword_out", 0) / 1e6 * gout)
     return {"seg_chars": seg_chars, "seg_count": seg_count, "span_tokens": span_tokens,
             "est": est, "usd_agent": usd_agent, "usd_hars": usd_hars,
             "usd_total": usd_agent + usd_hars, "pin": pin, "pout": pout,
@@ -2763,7 +3027,8 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
     if args.provider != DEFAULT_PROVIDER:
         print(f"agent provider: {args.provider} (pi --provider {args.provider} --model "
               f"{args.agent_model}; key env {provider_cfg(args.provider)['key_env']}; "
-              f"judge/QA-gen/HARS extractor stay on openrouter)")
+              f"judge/QA-gen stay on openrouter; the HARS extractor is the "
+              f"server's config, recorded as --extractor-model {args.extractor_model})")
     print(f"arms: {','.join(arms)} | HARS: {args.mcp} | tokenizer: {TOKENIZER}")
     print(f"ask-time memory budget: --mem-budget {args.mem_budget} realized tokens "
           f"(parity window [{PARITY_LO}, {PARITY_HI}] nc/baseline)")
@@ -2809,7 +3074,7 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
                   f"[{a['why']}] {a['evidence']}")
         pr = project(c, arms, args.agent_model, args.sum_model or args.agent_model,
                      args.qa_model or args.agent_model, args.mcp, args)
-        per_arm = {a: (3 if a in ("baseline", "nc") else 0) for a in arms}
+        per_arm = {a: (3 if a in ("baseline", ARM_CHUNKS) else 0) for a in arms}
         print(f"  qa per arm: " + ", ".join(f"{a}={len(c['qa'])}" for a in arms))
         print(f"  projected compactions per arm: " +
               ", ".join(f"{a}={per_arm[a]}" for a in arms))
@@ -2843,26 +3108,49 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
     print(f"TOTAL projected: {totals['compactions']} compactions, {totals['asks']} asks, "
           f"~{totals['wall'] / 60:.1f} min, ${totals['usd']:.4f}")
 
+    budgets = list(getattr(args, "budgets", None) or [])
+    if str(getattr(args, "mem_budgets", "")).strip():
+        n_b = len(budgets)
+        print()
+        print(f"BUDGET SWEEP (Amendment C): B in {budgets}, primary B={PRIMARY_BUDGET} runs first")
+        for b in budgets:
+            print(f"  B={b}: baseline trim {b} | note cap {note_cap_formula(b)} | recall cap = "
+                  f"clamp(B - realized note, {recall_floor_formula(b)}, {recall_ceil_formula(b)})")
+        n_comp = sum(1 for a in arms if a in ("baseline", ARM_CHUNKS)) * 3
+        print(f"  cost multiplier vs one 3-arm run at one B: compactions/replays x{n_b} "
+              f"({n_comp * n_b} per chain), ask turns x{n_b} x {len(arms)}/3 = "
+              f"x{n_b * len(arms) / 3:.1f}, memory_recall calls x{n_b} x "
+              f"{sum(1 for a in arms if a in RECALL_ARMS)} "
+              f"(nc-graph recalls add one keyword LLM call on {args.extractor_model})")
+        print(f"  TOTAL over the sweep: {totals['compactions'] * n_b} compactions, "
+              f"{totals['asks'] * n_b} asks, ~{totals['wall'] * n_b / 60:.1f} min, "
+              f"~${totals['usd'] * n_b:.4f} (single-B projection x {n_b}; list prices, "
+              "the caps differ per B so this is an upper-bound shape, not a quote)")
     print()
     print("exact env per arm (everything else comes from the parent environment):")
     for arm in arms:
         sid = f"cr-<tag>-<chain>-{arm}-<run_id>"
         env = base_env(arm, args.agent_model, sid, args.mcp, args.sum_model)
-        if arm == "nc-note-only":
-            # the fork reuses the nc session id at runtime: a fresh id would make
+        if arm in FORK_ARMS:
+            # the fork reuses the nc-chunks session id at runtime: a fresh id would make
             # pi create an empty session and the arm would measure nothing
-            env["NC_SESSION_ID"] = "cr-<tag>-<chain>-nc-<run_id> (the nc session id)"
+            env["NC_SESSION_ID"] = (f"cr-<tag>-<chain>-{ARM_CHUNKS}-<run_id> "
+                                    "(the nc-chunks session id)")
         extra = {
             "baseline": "ask: no recall, no memory tools (-nt --no-mcp)",
-            "nc": (f"ask: inject deterministic memory_recall packed to the derived cap "
-                   f"clamp({args.mem_budget} - realized_C3_note, {args.recall_cap_min}, "
-                   f"{args.recall_cap_max}) — not a fixed {RECALL_BUDGET_TOKENS}"),
-            "nc-note-only": "ask: forked nc post-C3 dir (cp -a), no recall, no memory tools",
+            ARM_CHUNKS: (f"ask: inject deterministic memory_recall packed to the derived cap "
+                         f"clamp({args.mem_budget} - realized_C3_note, {args.recall_cap_min}, "
+                         f"{args.recall_cap_max}) — not a fixed {RECALL_BUDGET_TOKENS}"),
+            ARM_GRAPH: (f"ask: fork of the nc-chunks post-C3 dir (cp -a); memory_recall "
+                        f"{json.dumps(recall_args('<sid>', '<question>', True))} — same "
+                        "note, same session dir, same packer, same cap; keywords resolved "
+                        "by the server (LLM -> question fallback)"),
+            ARM_NOTE: "ask: forked nc post-C3 dir (cp -a), no recall, no memory tools",
         }[arm]
         print(f"  [{arm}] {extra}")
         for k in NC_ENV_KEYS:
             print(f"    {k}={env[k]}")
-        if arm == "nc-note-only":
+        if arm == ARM_NOTE:
             print("    (fork keeps the nc session id; NC_PERSIST=0 means nothing is written)")
     print()
     print("settings.json (rewritten for the duration of a run, then restored):")
@@ -2894,7 +3182,10 @@ def main() -> int:
                     help="chains JSONL (one chain per line)")
     ap.add_argument("--pack-selftest", action="store_true",
                     help="run the offline packer selftest (3 fixtures, $0) and exit")
-    ap.add_argument("--arms", default="baseline,nc,nc-note-only")
+    ap.add_argument("--arms", default=DEFAULT_ARMS,
+                    help="comma list of baseline, nc-chunks, nc-graph, nc-note-only "
+                         "(`nc` is accepted as an alias of nc-chunks); nc-graph and "
+                         "nc-note-only are forks of nc-chunks and require it")
     ap.add_argument("--limit", type=int, default=0, help="chains to run (0 = all)")
     ap.add_argument("--dry-run", action="store_true",
                     help="zero API calls, zero HARS writes: print the projection only")
@@ -2937,6 +3228,18 @@ def main() -> int:
     ap.add_argument("--mcp", default=os.environ.get("NC_CHAIN_MCP", DEFAULT_MCP))
     ap.add_argument("--run-id", default=os.environ.get("NC_CHAIN_RUN_ID") or time.strftime("%H%M%S"))
     # ---- realized-token budget (see the module docstring) ----
+    ap.add_argument("--mem-budgets", default="",
+                    help="Amendment C budget sweep: comma list of mem_budget values (frozen "
+                         "protocol set 1536,1024,512). Each B re-runs the whole chain "
+                         "(baseline summary trimmed to B; note cap = round(640*B/1536); "
+                         "recall cap = clamp(B - realized note, round(256*B/1536), "
+                         "round(1024*B/1536))); the primary budget 1536 runs first. Overrides "
+                         "--mem-budget/--baseline-sum-max-tokens/--note-sum-max-tokens/"
+                         "--recall-cap-min/-max. Records carry mem_budget; empty = single "
+                         "--mem-budget run, byte-compatible with the pre-amendment runner")
+    ap.add_argument("--extractor-model", default=EXTRACTOR_MODEL_DEFAULT,
+                    help="HARS extractor / session-graph keyword model, RECORDED only (the "
+                         "server is configured separately); default %(default)s")
     ap.add_argument("--mem-budget", type=int, default=DEFAULT_MEM_BUDGET,
                     help="ask-time memory target in REALIZED tokens, both arms "
                          "(default %(default)s); the nc recall cap is derived from it")
@@ -2949,7 +3252,7 @@ def main() -> int:
                          "budget (mem_budget); NC_SUM_SECTION_TRIM=1 cuts an over-long "
                          "summary at section boundaries to this cap (default 1536 = "
                          "mem_budget parity by construction)")
-    ap.add_argument("--note-sum-max-tokens", type=int, default=CAPS["nc"],
+    ap.add_argument("--note-sum-max-tokens", type=int, default=CAPS[ARM_CHUNKS],
                     help="nc/note-only NC_SUM_MAX_TOKENS (default %(default)s)")
     ap.add_argument("--calibrate", action="store_true",
                     help="run ONE chain through both live arms with no QA asks and print "
@@ -2995,22 +3298,44 @@ def main() -> int:
     # caps are derived from the CLI; CAPS stays the single source for base_env/
     # the projector so nothing can drift between the printed env and the wire.
     CAPS["baseline"] = int(args.baseline_sum_max_tokens)
-    CAPS["nc"] = CAPS["nc-note-only"] = int(args.note_sum_max_tokens)
+    CAPS[ARM_CHUNKS] = CAPS[ARM_GRAPH] = CAPS[ARM_NOTE] = int(args.note_sum_max_tokens)
     # pi runs with cwd=WORKDIR, so a relative --out would put the session files
     # under WORKDIR while the runner writes records under its own cwd: the arm dir
     # would look empty and every gate would (correctly) refuse. Pin it absolute.
     args.out = os.path.abspath(args.out)
 
-    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    arms = [ARM_ALIASES.get(a.strip(), a.strip()) for a in args.arms.split(",") if a.strip()]
     unknown = [a for a in arms if a not in ARM_ORDER]
     if unknown:
-        print(f"unknown arm(s): {unknown}; valid: {list(ARM_ORDER)}", file=sys.stderr)
+        print(f"unknown arm(s): {unknown}; valid: {list(ARM_ORDER)} (+ alias nc)",
+              file=sys.stderr)
         return 2
-    if "nc-note-only" in arms and "nc" not in arms:
-        print("--arms nc-note-only requires nc: the fork is a copy of the nc post-C3 "
-              "session", file=sys.stderr)
+    if (ARM_NOTE in arms or ARM_GRAPH in arms) and ARM_CHUNKS not in arms:
+        print("--arms nc-note-only / nc-graph require nc-chunks: the fork is a copy of the "
+              "nc-chunks post-C3 session", file=sys.stderr)
         return 2
-    arms = [a for a in ARM_ORDER if a in arms]   # deterministic order (nc before fork)
+    arms = [a for a in ARM_ORDER if a in arms]   # deterministic order (nc-chunks before forks)
+
+    # ---- budget sweep (Amendment C) ----
+    args0 = args
+    sweep = bool(args.mem_budgets.strip())
+    try:
+        budgets = ([int(x) for x in args.mem_budgets.split(",") if x.strip()]
+                   if sweep else [int(args.mem_budget)])
+    except ValueError:
+        print(f"--mem-budgets must be a comma list of integers, got {args.mem_budgets!r}",
+              file=sys.stderr)
+        return 2
+    if not budgets or any(b <= 0 for b in budgets) or len(set(budgets)) != len(budgets):
+        print(f"--mem-budgets must be distinct positive integers, got {budgets}",
+              file=sys.stderr)
+        return 2
+    if sweep:
+        # primary budget first (an interrupted run still has the decision cell), then
+        # descending
+        budgets.sort(key=lambda b: (b != PRIMARY_BUDGET, -b))
+    per_budget_args = [args_for_budget(args, b, sweep) for b in budgets]
+    args.budgets = budgets
 
     chains, skipped = load_chains(args.chains)
     if args.limit:
@@ -3080,8 +3405,8 @@ def main() -> int:
               "any replay/compaction spend", file=sys.stderr)
         return 1
     if args.calibrate:
-        if "nc" not in arms or "baseline" not in arms:
-            print("--calibrate needs both live arms (baseline + nc)", file=sys.stderr)
+        if ARM_CHUNKS not in arms or "baseline" not in arms:
+            print("--calibrate needs both live arms (baseline + nc-chunks)", file=sys.stderr)
             return 2
         return run_calibrate(chains, args, arms)
 
@@ -3118,196 +3443,232 @@ def main() -> int:
     try:
         with open(rec_path, "w") as records_f, open(comp_path, "w") as comps_f, \
                 open(budget_path, "w") as budget_f:
-            for chain in chains:
-                cid = chain["chain_id"]
-                print(f"\n== chain {cid} (session {chain['session_id']}, "
-                      f"{len(chain['qa'])} questions)", flush=True)
-                align = check_alignment(chain)
-                bad = [a for a in align if not a["ok"]]
-                for a in align:
-                    print(f"   align q {a['qid']} span{a['span_idx']}: "
-                          f"{'PASS' if a['ok'] else 'FAIL'} [{a['why']}]", flush=True)
-                if bad:
-                    print(f"   !!! REFUSING {cid}: {len(bad)}/{len(align)} QA evidence "
-                          "excerpts are not substrings of their span (unanswerable by "
-                          "construction); no records written for this chain", flush=True)
-                    failures.append(cid)
-                    continue
-                states: dict[str, dict] = {}
-                comps_by_arm: dict[str, list] = {}
-                recall_cache: dict = {}
-                recall_tokens: list[int] = []
-                bctx: dict | None = None
-                nc_post_dir = None
-                nc_sid = None
-                abort_reason = ""
-                chain_rows: list[dict] = []     # this chain's ask rows, written at chain end
-                post_reasons: list[str] = []    # invalidating gates after the budget verdict
-                live_arms = [a for a in arms if a != "nc-note-only"]
-                try:
-                    # ---- phase A: every live arm's compactions (no asks yet) ----
-                    for arm in live_arms:
-                        # the nc recall cap is clamp(mem_budget - realized nc note);
-                        # the baseline's realized C3 summary is passed along as a
-                        # REPORTED number only (baseline replays first)
-                        b3r = None
-                        if arm == "nc" and comps_by_arm.get("baseline"):
-                            b3 = next((r for r in comps_by_arm["baseline"]
-                                       if int(r.get("span_idx") or 0) == 3), None)
-                            b3r = int(b3["realized_tokens"]) if b3 else None
-                        states[arm] = run_compactions(chain, arm, args, args.out,
-                                                      args.run_id, comps_f, None, None,
-                                                      baseline_realized=b3r)
-                        comps_by_arm[arm] = states[arm]["compactions"]
-                        if arm == "nc":
-                            nc_post_dir = states[arm]["arm_dir"]
-                            nc_sid = states[arm]["session_id"]
-                            # full note, not just the head: re-read the session file
-                            chain["_nc_c3_summary"] = last_compaction_summary(nc_post_dir)
-                            n3 = next((r for r in comps_by_arm["nc"]
-                                       if int(r["span_idx"]) == 3), None)
-                            if not n3:
-                                raise ChainFailure("nc arm produced no C3 record — the "
-                                                   "recall cap cannot be derived")
+            for args in per_budget_args:
+                ctx_budget_banner(args, args0)
+                for chain in chains:
+                    cid = chain["chain_id"]
+                    print(f"\n== chain {cid} (session {chain['session_id']}, "
+                          f"{len(chain['qa'])} questions)", flush=True)
+                    align = check_alignment(chain)
+                    bad = [a for a in align if not a["ok"]]
+                    for a in align:
+                        print(f"   align q {a['qid']} span{a['span_idx']}: "
+                              f"{'PASS' if a['ok'] else 'FAIL'} [{a['why']}]", flush=True)
+                    if bad:
+                        print(f"   !!! REFUSING {cid}: {len(bad)}/{len(align)} QA evidence "
+                              "excerpts are not substrings of their span (unanswerable by "
+                              "construction); no records written for this chain", flush=True)
+                        failures.append(cid)
+                        continue
+                    states: dict[str, dict] = {}
+                    comps_by_arm: dict[str, list] = {}
+                    recall_cache: dict = {}
+                    recall_cache_graph: dict = {}
+                    recall_tokens: list[int] = []
+                    recall_tokens_graph: list[int] = []
+                    bctx: dict | None = None
+                    nc_post_dir = None
+                    nc_sid = None
+                    abort_reason = ""
+                    chain_rows: list[dict] = []     # this chain's ask rows, written at chain end
+                    post_reasons: list[str] = []    # invalidating gates after the budget verdict
+                    live_arms = [a for a in arms if a not in FORK_ARMS]
+                    try:
+                        # ---- phase A: every live arm's compactions (no asks yet) ----
+                        for arm in live_arms:
+                            # the nc recall cap is clamp(mem_budget - realized nc note);
+                            # the baseline's realized C3 summary is passed along as a
+                            # REPORTED number only (baseline replays first)
                             b3r = None
-                            if comps_by_arm.get("baseline"):
+                            if arm == ARM_CHUNKS and comps_by_arm.get("baseline"):
                                 b3 = next((r for r in comps_by_arm["baseline"]
                                            if int(r.get("span_idx") or 0) == 3), None)
                                 b3r = int(b3["realized_tokens"]) if b3 else None
-                            rc = recall_cap_for(n3["realized_tokens"], args, b3r)
-                            print(f"   [nc] recall cap from the ACTUAL C3 note: "
-                                  f"{rc['recall_cap_arithmetic']} (note tokens from "
-                                  f"{n3['note_tokens_source']})", flush=True)
-                            if rc["recall_cap_clamped_low"]:
-                                print(f"   !!! BUDGET the C3 note alone ({n3['realized_tokens']} "
-                                      f"tok) leaves {rc['recall_uncapped_target']} tok < "
-                                      f"--recall-cap-min {args.recall_cap_min}: nc memory "
-                                      f"will be {n3['realized_tokens']} + "
-                                      f"{rc['recall_cap']} = "
-                                      f"{n3['realized_tokens'] + rc['recall_cap']} > "
-                                      f"mem_budget {args.mem_budget}", flush=True)
-                            if rc["recall_cap_clamped_high"]:
-                                print(f"   BUDGET recall cap clamped to "
-                                      f"--recall-cap-max {args.recall_cap_max} (the note "
-                                      f"leaves {rc['recall_uncapped_target']} tok)", flush=True)
-                            # measure recall BEFORE any ask: the packed text that
-                            # decides the verdict is the text the model will see
-                            recall_tokens = collect_recall(chain, states["nc"], args,
-                                                           rc["recall_cap"], recall_cache)
-                    # ---- phase B: realized-budget verdict ----
-                    if "baseline" in states and "nc" in states:
-                        bctx = chain_budget(cid, args, comps_by_arm, recall_tokens,
-                                            args.require_no_clip,
-                                            {q: c.get("recall_failure_reasons") or []
-                                             for q, c in recall_cache.items()},
-                                            {q: c.get("recall_degraded")
-                                             for q, c in recall_cache.items()})
-                        print(f"   BUDGET realized: baseline {bctx['baseline_memory_total']} tok "
-                              f"C3 note (of a {args.baseline_sum_max_tokens} ceiling) | nc "
-                              f"{bctx['nc_note_tokens']} note + "
-                              f"{bctx['nc_recall_tokens']} recall = "
-                              f"{bctx['nc_memory_total']} tok | clipped "
-                              f"baseline {bctx['clipped_compactions']['baseline']}/"
-                              f"{bctx['compactions_per_arm']['baseline']}, nc "
-                              f"{bctx['clipped_compactions']['nc']}/"
-                              f"{bctx['compactions_per_arm']['nc']}", flush=True)
-                        if bctx["ratio"] is not None:
-                            print(f"   BUDGET ratio nc/baseline = {bctx['ratio']} "
-                                  f"(window [{PARITY_LO}, {PARITY_HI}]) -> "
-                                  f"{'PASS' if bctx['ratio_in_window'] else 'FAIL'}",
-                                  flush=True)
-                        for why in bctx["invalid_reasons"]:
-                            print(f"   !!! {why}", flush=True)
-                        # chain_budget.jsonl is written at chain end (finally) with
-                        # the FINAL verdict, after the ask-phase gates
-                        budget_recs.append(bctx)
-                    # ---- phase C: the note-only fork (no compactions, no recall) ----
-                    if "nc-note-only" in arms:
-                        states["nc-note-only"] = run_compactions(
-                            chain, "nc-note-only", args, args.out, args.run_id, comps_f,
-                            nc_post_dir, nc_sid)
-                        comps_by_arm["nc-note-only"] = states["nc-note-only"]["compactions"]
-                        n3o = next((r for r in comps_by_arm.get("nc") or []
-                                    if int(r.get("span_idx") or 0) == 3), None)
-                        states["nc-note-only"]["note_tokens"] = (
-                            int(n3o["realized_tokens"]) if n3o else None)
-                    # ---- phase D: the ask phases (records carry the verdict) ----
-                    for arm in arms:
-                        states[arm]["asks"] = run_asks(
-                            chain, arm, args, args.out, args.run_id, states[arm],
-                            chain_rows, bctx, recall_cache)["asks"]
-                    # baseline must have written NOTHING to HARS
-                    if "baseline" in states:
-                        st = hars_status(args.mcp, states["baseline"]["session_id"])
-                        n = int(st.get("compactions") or 0)
-                        if st.get("unreachable"):
-                            print(f"   !!! HARS UNREACHABLE for the baseline gate "
-                                  f"({st.get('error')}) — 0-compaction check NOT verified",
-                                  flush=True)
-                            post_reasons.append("BASELINE HARS gate not verified (HARS "
-                                                f"unreachable: {st.get('error')})")
-                        elif n != 0:
-                            print(f"   !!! baseline persisted {n} compaction(s) to HARS "
-                                  "(NC_PERSIST=0 violated)", flush=True)
-                            post_reasons.append(f"BASELINE wrote {n} compaction(s) to HARS "
-                                                "(NC_PERSIST=0 violated)")
-                            failures.append(cid)
-                        else:
-                            print("   gate: baseline HARS compactions == 0 ✓", flush=True)
-                    print(f"   chain {cid} done: " + ", ".join(
-                        f"{a}={len(states[a].get('asks') or [])} asks"
-                        for a in arms), flush=True)
-                except ChainFailure as e:
-                    abort_reason = str(e)
-                    print(f"   !!! CHAIN {cid} ABORTED: {e}", flush=True)
-                    failures.append(cid)
-                finally:
-                    # buffered per chain, flushed here so every record (ask rows,
-                    # compactions, chain budget) carries the FINAL chain verdict:
-                    # budget/clip/recall gates + post-ask gates + abort reason
-                    aborted = bool(abort_reason)
-                    reasons = list(bctx["invalid_reasons"]) if bctx else []
-                    if not bctx:
-                        bad_rc = sorted(q for q, c in recall_cache.items()
-                                        if c.get("recall_failure_reasons"))
-                        if bad_rc:
-                            reasons.append(f"RECALL FAIL {len(bad_rc)}/{len(recall_cache)} "
-                                           f"nc recalls unusable (e.g. {bad_rc[0]})")
-                        deg_rc = sorted(q for q, c in recall_cache.items()
-                                        if c.get("recall_degraded"))
-                        if deg_rc and not args.allow_degraded:
-                            reasons.append(f"RECALL DEGRADED {len(deg_rc)}/{len(recall_cache)} "
-                                           f"nc recalls served by a degraded session channel "
-                                           f"(e.g. {deg_rc[0]})")
-                    reasons += post_reasons
-                    if aborted:
-                        reasons.append(f"chain aborted: {abort_reason}")
-                    final_valid = False if reasons else (True if bctx else None)
-                    if final_valid is False:
-                        print(f"   !!! chain {cid} marked valid=false ({len(reasons)} "
-                              f"reason(s)): {' | '.join(reasons)}", flush=True)
-                        invalid.append(cid)
-                    if bctx:
-                        bctx["invalid_reasons"] = reasons
-                        bctx["valid"] = final_valid
-                        budget_f.write(json.dumps(bctx, ensure_ascii=False) + "\n")
-                        budget_f.flush()
-                    for row in chain_rows:
-                        row["valid"] = final_valid
-                        row["chain_invalid_reasons"] = reasons
-                        records_f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    records_f.flush()
-                    extra = {"mem_budget": int(args.mem_budget),
-                             "mode": "run"}
-                    if bctx:
-                        extra.update({k: bctx.get(k) for k in (
-                            "nc_note_tokens", "nc_note_tokens_source", "nc_recall_tokens",
-                            "nc_memory_total", "baseline_memory_total", "ratio",
-                            "ratio_in_window", "recall_cap")})
-                        extra["clipped_compactions"] = bctx["clipped_compactions"]
-                    extra["valid"] = final_valid
-                    extra["chain_invalid_reasons"] = reasons
-                    flush_comp_records(comps_f, comps_by_arm, extra)
+                            states[arm] = run_compactions(chain, arm, args, args.out,
+                                                          args.run_id, comps_f, None, None,
+                                                          baseline_realized=b3r)
+                            comps_by_arm[arm] = states[arm]["compactions"]
+                            if arm == ARM_CHUNKS:
+                                nc_post_dir = states[arm]["arm_dir"]
+                                nc_sid = states[arm]["session_id"]
+                                # full note, not just the head: re-read the session file
+                                chain["_nc_c3_summary"] = last_compaction_summary(nc_post_dir)
+                                n3 = next((r for r in comps_by_arm[ARM_CHUNKS]
+                                           if int(r["span_idx"]) == 3), None)
+                                if not n3:
+                                    raise ChainFailure("nc arm produced no C3 record — the "
+                                                       "recall cap cannot be derived")
+                                b3r = None
+                                if comps_by_arm.get("baseline"):
+                                    b3 = next((r for r in comps_by_arm["baseline"]
+                                               if int(r.get("span_idx") or 0) == 3), None)
+                                    b3r = int(b3["realized_tokens"]) if b3 else None
+                                rc = recall_cap_for(n3["realized_tokens"], args, b3r)
+                                print(f"   [nc] recall cap from the ACTUAL C3 note: "
+                                      f"{rc['recall_cap_arithmetic']} (note tokens from "
+                                      f"{n3['note_tokens_source']})", flush=True)
+                                if rc["recall_cap_clamped_low"]:
+                                    print(f"   !!! BUDGET the C3 note alone ({n3['realized_tokens']} "
+                                          f"tok) leaves {rc['recall_uncapped_target']} tok < "
+                                          f"--recall-cap-min {args.recall_cap_min}: nc memory "
+                                          f"will be {n3['realized_tokens']} + "
+                                          f"{rc['recall_cap']} = "
+                                          f"{n3['realized_tokens'] + rc['recall_cap']} > "
+                                          f"mem_budget {args.mem_budget}", flush=True)
+                                if rc["recall_cap_clamped_high"]:
+                                    print(f"   BUDGET recall cap clamped to "
+                                          f"--recall-cap-max {args.recall_cap_max} (the note "
+                                          f"leaves {rc['recall_uncapped_target']} tok)", flush=True)
+                                # measure recall BEFORE any ask: the packed text that
+                                # decides the verdict is the text the model will see
+                                recall_tokens = collect_recall(chain, states[ARM_CHUNKS], args,
+                                                               rc["recall_cap"], recall_cache)
+                                if ARM_GRAPH in arms:
+                                    # same session, same cap, same packer: only the
+                                    # session_graph flag differs (Amendment C)
+                                    recall_tokens_graph = collect_recall(
+                                        chain, states[ARM_CHUNKS], args, rc["recall_cap"],
+                                        recall_cache_graph, graph=True)
+                        # ---- phase B: realized-budget verdict ----
+                        if "baseline" in states and ARM_CHUNKS in states:
+                            bctx = chain_budget(cid, args, comps_by_arm, recall_tokens,
+                                                args.require_no_clip,
+                                                {q: c.get("recall_failure_reasons") or []
+                                                 for q, c in recall_cache.items()},
+                                                {q: c.get("recall_degraded")
+                                                 for q, c in recall_cache.items()},
+                                                recall_tokens_graph or None,
+                                                {q: c.get("recall_failure_reasons") or []
+                                                 for q, c in recall_cache_graph.items()}
+                                                if recall_cache_graph else None,
+                                                {q: bool((c.get("graph") or {}).get("kg_empty"))
+                                                 for q, c in recall_cache_graph.items()}
+                                                if recall_cache_graph else None)
+                            print(f"   BUDGET realized: baseline {bctx['baseline_memory_total']} tok "
+                                  f"C3 note (of a {args.baseline_sum_max_tokens} ceiling) | nc "
+                                  f"{bctx['nc_note_tokens']} note + "
+                                  f"{bctx['nc_recall_tokens']} recall = "
+                                  f"{bctx['nc_memory_total']} tok | clipped "
+                                  f"baseline {bctx['clipped_compactions']['baseline']}/"
+                                  f"{bctx['compactions_per_arm']['baseline']}, nc "
+                                  f"{bctx['clipped_compactions'][ARM_CHUNKS]}/"
+                                  f"{bctx['compactions_per_arm'][ARM_CHUNKS]}", flush=True)
+                            if bctx.get("ratio_graph") is not None:
+                                print(f"   BUDGET ratio nc-graph/baseline = {bctx['ratio_graph']} "
+                                      f"(kg_empty_rate {bctx.get('kg_empty_rate')})", flush=True)
+                            if bctx["ratio"] is not None:
+                                print(f"   BUDGET ratio nc-chunks/baseline = {bctx['ratio']} "
+                                      f"(window [{PARITY_LO}, {PARITY_HI}]) -> "
+                                      f"{'PASS' if bctx['ratio_in_window'] else 'FAIL'}",
+                                      flush=True)
+                            for why in bctx["invalid_reasons"]:
+                                print(f"   !!! {why}", flush=True)
+                            # chain_budget.jsonl is written at chain end (finally) with
+                            # the FINAL verdict, after the ask-phase gates
+                            budget_recs.append(bctx)
+                        # ---- phase C: the forks of the nc-chunks post-C3 session
+                        # (nc-graph: recall with session_graph; nc-note-only: no recall) ----
+                        for farm in (ARM_GRAPH, ARM_NOTE):
+                            if farm not in arms:
+                                continue
+                            states[farm] = run_compactions(
+                                chain, farm, args, args.out, args.run_id, comps_f,
+                                nc_post_dir, nc_sid)
+                            comps_by_arm[farm] = states[farm]["compactions"]
+                            n3o = next((r for r in comps_by_arm.get(ARM_CHUNKS) or []
+                                        if int(r.get("span_idx") or 0) == 3), None)
+                            states[farm]["note_tokens"] = (
+                                int(n3o["realized_tokens"]) if n3o else None)
+                            states[farm]["persisted_ok"] = (
+                                all(bool(r.get("persisted"))
+                                    for r in comps_by_arm.get(ARM_CHUNKS) or [])
+                                and len(comps_by_arm.get(ARM_CHUNKS) or []) == 3)
+                        # ---- phase D: the ask phases (records carry the verdict) ----
+                        for arm in arms:
+                            states[arm]["asks"] = run_asks(
+                                chain, arm, args, args.out, args.run_id, states[arm],
+                                chain_rows, bctx,
+                                recall_cache_graph if arm == ARM_GRAPH else recall_cache
+                            )["asks"]
+                        # baseline must have written NOTHING to HARS
+                        if "baseline" in states:
+                            st = hars_status(args.mcp, states["baseline"]["session_id"])
+                            n = int(st.get("compactions") or 0)
+                            if st.get("unreachable"):
+                                print(f"   !!! HARS UNREACHABLE for the baseline gate "
+                                      f"({st.get('error')}) — 0-compaction check NOT verified",
+                                      flush=True)
+                                post_reasons.append("BASELINE HARS gate not verified (HARS "
+                                                    f"unreachable: {st.get('error')})")
+                            elif n != 0:
+                                print(f"   !!! baseline persisted {n} compaction(s) to HARS "
+                                      "(NC_PERSIST=0 violated)", flush=True)
+                                post_reasons.append(f"BASELINE wrote {n} compaction(s) to HARS "
+                                                    "(NC_PERSIST=0 violated)")
+                                failures.append(cid)
+                            else:
+                                print("   gate: baseline HARS compactions == 0 ✓", flush=True)
+                        print(f"   chain {cid} done: " + ", ".join(
+                            f"{a}={len(states[a].get('asks') or [])} asks"
+                            for a in arms), flush=True)
+                    except ChainFailure as e:
+                        abort_reason = str(e)
+                        print(f"   !!! CHAIN {cid} ABORTED: {e}", flush=True)
+                        failures.append(cid)
+                    finally:
+                        # buffered per chain, flushed here so every record (ask rows,
+                        # compactions, chain budget) carries the FINAL chain verdict:
+                        # budget/clip/recall gates + post-ask gates + abort reason
+                        aborted = bool(abort_reason)
+                        reasons = list(bctx["invalid_reasons"]) if bctx else []
+                        if not bctx:
+                            bad_g = sorted(q for q, c in recall_cache_graph.items()
+                                           if c.get("recall_failure_reasons"))
+                            if bad_g:
+                                reasons.append(f"RECALL FAIL (nc-graph) {len(bad_g)}/"
+                                               f"{len(recall_cache_graph)} graph recalls "
+                                               f"unusable (e.g. {bad_g[0]})")
+                            bad_rc = sorted(q for q, c in recall_cache.items()
+                                            if c.get("recall_failure_reasons"))
+                            if bad_rc:
+                                reasons.append(f"RECALL FAIL {len(bad_rc)}/{len(recall_cache)} "
+                                               f"nc recalls unusable (e.g. {bad_rc[0]})")
+                            deg_rc = sorted(q for q, c in recall_cache.items()
+                                            if c.get("recall_degraded"))
+                            if deg_rc and not args.allow_degraded:
+                                reasons.append(f"RECALL DEGRADED {len(deg_rc)}/{len(recall_cache)} "
+                                               f"nc recalls served by a degraded session channel "
+                                               f"(e.g. {deg_rc[0]})")
+                        reasons += post_reasons
+                        if aborted:
+                            reasons.append(f"chain aborted: {abort_reason}")
+                        final_valid = False if reasons else (True if bctx else None)
+                        if final_valid is False:
+                            print(f"   !!! chain {cid} marked valid=false ({len(reasons)} "
+                                  f"reason(s)): {' | '.join(reasons)}", flush=True)
+                            invalid.append(cid)
+                        if bctx:
+                            bctx["invalid_reasons"] = reasons
+                            bctx["valid"] = final_valid
+                            budget_f.write(json.dumps(bctx, ensure_ascii=False) + "\n")
+                            budget_f.flush()
+                        for row in chain_rows:
+                            row["valid"] = final_valid
+                            row["chain_invalid_reasons"] = reasons
+                            records_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        records_f.flush()
+                        extra = {"mem_budget": int(args.mem_budget),
+                                 "mode": "run"}
+                        if bctx:
+                            extra.update({k: bctx.get(k) for k in (
+                                "nc_note_tokens", "nc_note_tokens_source", "nc_recall_tokens",
+                                "nc_memory_total", "baseline_memory_total", "ratio",
+                                "ratio_in_window", "recall_cap", "ratio_graph",
+                                "kg_empty_rate")})
+                            extra["clipped_compactions"] = bctx["clipped_compactions"]
+                        extra["valid"] = final_valid
+                        extra["chain_invalid_reasons"] = reasons
+                        flush_comp_records(comps_f, comps_by_arm, extra)
     finally:
         restore(SETTINGS, settings_backup)
         restore(MCP_JSON, mcp_backup)
@@ -3318,35 +3679,54 @@ def main() -> int:
     print(f"chain budgets -> {budget_path}")
     # ---- run-level realized-budget verdict (this is what the pre-registered
     # gate checks: the MEAN ratio over chains, not per-chain values) ----
-    pairs = [(b["nc_memory_total"], b["baseline_memory_total"])
-             for b in budget_recs
-             if b.get("nc_memory_total") and b.get("baseline_memory_total")]
-    if pairs:
-        mean_nc = sum(p[0] for p in pairs) / len(pairs)
-        mean_base = sum(p[1] for p in pairs) / len(pairs)
-        run_ratio = round(mean_nc / mean_base, 3) if mean_base else None
-        in_win = run_ratio is not None and PARITY_LO <= run_ratio <= PARITY_HI
+    # Per mem_budget and per treatment (Amendment C item 6: the parity gate is evaluated
+    # separately for nc-chunks and nc-graph vs the baseline of the SAME B).
+    args = args0
+    by_b: dict[int, dict] = {}
+    for B in sorted({int(b["mem_budget"]) for b in budget_recs}, reverse=True):
+        recs_b = [b for b in budget_recs if int(b["mem_budget"]) == B]
+        entry: dict = {"mem_budget": B}
+        for label, key in (("nc_chunks", "nc_memory_total"), ("nc_graph", "nc_graph_memory_total")):
+            pairs = [(b[key], b["baseline_memory_total"]) for b in recs_b
+                     if b.get(key) and b.get("baseline_memory_total")]
+            if not pairs:
+                continue
+            mean_nc = sum(p[0] for p in pairs) / len(pairs)
+            mean_base = sum(p[1] for p in pairs) / len(pairs)
+            run_ratio = round(mean_nc / mean_base, 3) if mean_base else None
+            in_win = run_ratio is not None and PARITY_LO <= run_ratio <= PARITY_HI
+            entry[label] = {"chains": len(pairs), "mean_memory_tokens": round(mean_nc, 1),
+                            "mean_baseline_memory_tokens": round(mean_base, 1),
+                            "run_ratio": run_ratio, "in_window": in_win}
+            print(f"RUN BUDGET B={B} {label} (mean over {len(pairs)} chains): "
+                  f"{round(mean_nc, 1)} tok vs baseline {round(mean_base, 1)} tok -> ratio "
+                  f"{run_ratio} {'PASS' if in_win else 'FAIL'} "
+                  f"(window [{PARITY_LO}, {PARITY_HI}])", flush=True)
+            if not in_win:
+                print(f"!!! RUN BUDGET FAIL (B={B}, {label}): per-chain advice is in "
+                      f"chain_budget.jsonl (baseline_cap_advice)", flush=True)
+        by_b[B] = entry
+    if by_b:
+        prim = by_b.get(PRIMARY_BUDGET) or next(iter(by_b.values()))
+        main_entry = prim.get("nc_chunks") or prim.get("nc_graph") or {}
         run_budget = {
-            "chains": len(pairs), "mean_nc_memory_tokens": round(mean_nc, 1),
-            "mean_baseline_memory_tokens": round(mean_base, 1),
-            "run_ratio": run_ratio, "window": [PARITY_LO, PARITY_HI],
-            "in_window": in_win, "tokenizer": TOKENIZER,
+            # legacy single-B keys (first/primary B, nc-chunks) for old readers
+            "chains": main_entry.get("chains"),
+            "mean_nc_memory_tokens": main_entry.get("mean_memory_tokens"),
+            "mean_baseline_memory_tokens": main_entry.get("mean_baseline_memory_tokens"),
+            "run_ratio": main_entry.get("run_ratio"), "window": [PARITY_LO, PARITY_HI],
+            "in_window": main_entry.get("in_window"), "tokenizer": TOKENIZER,
             "agent_model": args.agent_model, "agent_provider": args.provider,
             "judge_model": args.judge_model,
             "baseline_cap": args.baseline_sum_max_tokens,
-            "note_cap": args.note_sum_max_tokens, "mem_budget": args.mem_budget,
+            "note_cap": args.note_sum_max_tokens, "mem_budget": prim["mem_budget"],
+            "by_budget": {str(k): v for k, v in by_b.items()},
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         rb_path = os.path.join(args.out, "run_budget.json")
         with open(rb_path, "w", encoding="utf-8") as f:
             json.dump(run_budget, f, ensure_ascii=False, indent=1)
-        print(f"RUN BUDGET (mean over {len(pairs)} chains): nc {run_budget['mean_nc_memory_tokens']} tok "
-              f"vs baseline {run_budget['mean_baseline_memory_tokens']} tok -> "
-              f"ratio {run_ratio} {'PASS' if in_win else 'FAIL'} "
-              f"(window [{PARITY_LO}, {PARITY_HI}]) -> {rb_path}", flush=True)
-        if not in_win:
-            print(f"!!! RUN BUDGET FAIL: adjust --baseline-sum-max-tokens and re-run; "
-                  f"per-chain advice is in chain_budget.jsonl (baseline_cap_advice)", flush=True)
+        print(f"run budget -> {rb_path}", flush=True)
     warn = [w for b in budget_recs for w in b.get("warnings", [])]
     for w in warn:
         print(f"   [budget warn] {w}", flush=True)
