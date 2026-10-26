@@ -65,7 +65,28 @@ SEED = 1337
 LAGS = (1, 2, 3)
 SLICES = ("HEAD", "TAIL")
 MIN_CHAINS = 8          # distinct SESSIONS; below this no WIN/FAIL is claimed (underpowered)
-REQUIRED_ARMS = ("baseline", "nc", "nc-note-only")
+# Amendment C (2026-10-26): four arms. Legacy `nc` records (chunk-RAG, exploratory only) are
+# read as `nc-chunks`. A run without any nc-graph row is a LEGACY run: three required arms,
+# treatment = nc-chunks, flagged exploratory in the report.
+ARM_ALIASES = {"nc": "nc-chunks"}
+REQUIRED_ARMS = ("baseline", "nc-chunks", "nc-graph", "nc-note-only")
+LEGACY_REQUIRED_ARMS = ("baseline", "nc-chunks", "nc-note-only")
+PRIMARY_B = 1536                 # the only budget with a WIN/FAIL verdict
+LEGACY_B = 1536                  # records without mem_budget
+MULTIHOP_TYPES = ("multihop", "multi_hop", "multi-hop", "cross_compaction",
+                  "cross-compaction", "xcompaction")
+KEYWORD_IN_EST, KEYWORD_OUT_EST = 450.0, 80.0   # nc-graph keyword call, used only when the
+                                                # server reported no usage (flagged)
+ALPHA_ONE_SIDED = 0.025          # family-wise, = the two-sided 95% CIs used everywhere
+NI_MARGIN_ANCHOR = 0.10          # non-inferiority margins (Amendment C, frozen)
+NI_MARGIN_SCORE = 0.15
+H_GRAPH_MIN_ANCHOR = 0.05        # "graph helps" practical threshold on clean_anchor_hit
+SECONDARY_IDS = ("S1_graph_vs_chunks", "S2_ni_1024", "S3_ni_512", "S4_multihop_vs_baseline",
+                 "S5_multihop_graph_vs_chunks")
+
+
+def canon_arm(arm):
+    return ARM_ALIASES.get(arm, arm)
 
 FIELD_ALIASES = {
     "qid": ("qid", "question_id"),
@@ -95,6 +116,8 @@ FIELD_ALIASES = {
     "gold_anchor": ("gold_anchor",),
     "visible_context": ("visible_context",),
     "primed_hit": ("primed_hit",),
+    "mem_budget": ("mem_budget",),
+    "qtype": ("qtype", "question_type"),
 }
 
 
@@ -156,7 +179,21 @@ def session_of(chain_id) -> str:
     return re.sub(r"_c\d+$", "", str(chain_id))
 
 
-def validate_rows(rows: list[dict], arms=REQUIRED_ARMS) -> tuple[list[dict], dict]:
+def row_budget(rec: dict) -> int:
+    """Budget cell of a raw record (legacy records without mem_budget = 1536)."""
+    try:
+        return int(pick(rec, "mem_budget", LEGACY_B))
+    except (TypeError, ValueError):
+        return LEGACY_B
+
+
+def required_arms_for(rows: list[dict]) -> tuple:
+    """4 arms when any nc-graph row exists, else the 3 legacy arms (exploratory)."""
+    has_graph = any(canon_arm(pick(r, "arm")) == "nc-graph" for r in rows)
+    return REQUIRED_ARMS if has_graph else LEGACY_REQUIRED_ARMS
+
+
+def validate_rows(rows: list[dict], arms=None) -> tuple[list[dict], dict]:
     """B2 data-validity filter, shared with export_judge_input.py.
 
     Hard-fails (SystemExit, exit 2) on duplicate (qid, arm) or duplicate rid across
@@ -164,18 +201,19 @@ def validate_rows(rows: list[dict], arms=REQUIRED_ARMS) -> tuple[list[dict], dic
     its re-run must be fixed at the merge, not silently resolved here). Then drops
     whole chains with any row whose ``valid`` is not True or that carries a
     recall_error, and finally every qid lacking the full arm triplet."""
-    keys = Counter((pick(r, "qid"), pick(r, "arm")) for r in rows)
+    arms = tuple(arms) if arms else required_arms_for(rows)
+    keys = Counter((pick(r, "qid"), canon_arm(pick(r, "arm")), row_budget(r)) for r in rows)
     rids = Counter(raw_rid(r) for r in rows)
-    dup_k = sorted(str(k) for k, v in keys.items() if v > 1)
+    dup_k = sorted(str(k) for k, v in keys.items() if v > 1)   # (qid, arm, mem_budget)
     dup_r = sorted(k for k, v in rids.items() if v > 1)
     if dup_k or dup_r:
         print(f"ERROR duplicate rows: {len(dup_k)} duplicate (qid, arm) {dup_k[:5]}; "
               f"{len(dup_r)} duplicate rid {dup_r[:5]} -- fix the merge (one row per "
               f"(qid, arm)); refusing to average or pick one", file=sys.stderr)
         raise SystemExit(2)
-    bad: dict[str, set] = defaultdict(set)
+    bad: dict[tuple, set] = defaultdict(set)
     for r in rows:
-        cid = str(pick(r, "chain_id"))
+        cid = (str(pick(r, "chain_id")), row_budget(r))   # a chain is valid PER budget cell
         v = r.get("valid")
         if v is not True:
             why = (r.get("chain_invalid_reasons") or []) if v is False else []
@@ -183,13 +221,14 @@ def validate_rows(rows: list[dict], arms=REQUIRED_ARMS) -> tuple[list[dict], dic
                                                       if why else ""))
         if r.get("recall_error"):
             bad[cid].add(f"recall_error={str(r['recall_error'])[:60]} ({pick(r, 'arm')})")
-    kept = [r for r in rows if str(pick(r, "chain_id")) not in bad]
+    kept = [r for r in rows if (str(pick(r, "chain_id")), row_budget(r)) not in bad]
     have: dict = defaultdict(set)
     for r in kept:
-        have[pick(r, "qid")].add(pick(r, "arm"))
+        have[(pick(r, "qid"), row_budget(r))].add(canon_arm(pick(r, "arm")))
     incomplete = {q: sorted(set(arms) - a) for q, a in have.items() if set(arms) - a}
-    final = [r for r in kept if pick(r, "qid") not in incomplete
-             and pick(r, "arm") in arms]
+    final = [r for r in kept if (pick(r, "qid"), row_budget(r)) not in incomplete
+             and canon_arm(pick(r, "arm")) in arms]
+    budgets_in = {row_budget(r) for r in rows}
     report = {
         "rows_in": len(rows), "rows_kept": len(final),
         "rows_dropped_invalid_chain": len(rows) - len(kept),
@@ -197,8 +236,14 @@ def validate_rows(rows: list[dict], arms=REQUIRED_ARMS) -> tuple[list[dict], dic
         "chains_in": len({str(pick(r, "chain_id")) for r in rows}),
         "chains_kept": len({str(pick(r, "chain_id")) for r in final}),
         "sessions_kept": len({session_of(pick(r, "chain_id")) for r in final}),
-        "dropped_chains": {c: sorted(w) for c, w in sorted(bad.items())},
-        "incomplete_qids": dict(sorted((str(q), m) for q, m in incomplete.items())),
+        "dropped_chains": {(c if b == LEGACY_B and len(budgets_in) == 1 else f"{c}@B{b}"): sorted(w)
+                           for (c, b), w in sorted(bad.items())},
+        "incomplete_qids": dict(sorted(
+            ((str(q) if b == LEGACY_B and len(budgets_in) == 1 else f"{q}@B{b}"), m)
+            for (q, b), m in incomplete.items())),
+        "required_arms": list(arms),
+        "legacy_arm_set": tuple(arms) == LEGACY_REQUIRED_ARMS,
+        "budgets": sorted(budgets_in),
     }
     return final, report
 
@@ -216,9 +261,10 @@ def validity_lines(rep: dict) -> list[str]:
 
 
 def normalize(rec: dict) -> dict:
-    arm = pick(rec, "arm", "unknown")
+    raw_arm = pick(rec, "arm", "unknown")
+    arm = canon_arm(raw_arm)
     qid = pick(rec, "qid")
-    rid = pick(rec, "rid") or f"{qid}::{arm}"
+    rid = pick(rec, "rid") or f"{qid}::{raw_arm}"
     # question-priming check (gate-212839 defect 2): a raw anchor_hit whose gold
     # anchor is provably absent from the arm's own visible_context is a primed
     # reconstruction (e.g. echoed from the question's phrasing), not a memory hit.
@@ -267,7 +313,32 @@ def normalize(rec: dict) -> dict:
         "tokens_in": as_float(pick(rec, "tokens_in")),
         "tokens_out": as_float(pick(rec, "tokens_out")),
         "cost_source": "usd" if as_float(pick(rec, "cost_usd")) is not None else None,
+        "mem_budget": row_budget(rec),
+        "qtype": (str(pick(rec, "qtype")).strip().lower() if pick(rec, "qtype") else None),
+        # nc-graph readout (None on the other arms)
+        "keyword_source": rec.get("keyword_source"),
+        "kg_empty": as_bool(rec.get("kg_empty")),
+        "session_graph_status": rec.get("session_graph_status"),
+        "anchor_in_recall": as_bool(rec.get("anchor_in_recall")),
+        "anchor_in_kg_recall": as_bool(rec.get("anchor_in_kg_recall")),
+        "anchor_in_chunk_recall": as_bool(rec.get("anchor_in_chunk_recall")),
     }
+    # the nc-graph keyword LLM call is part of the ask's cost (Amendment C item 13): add the
+    # server-reported usage; when the server reported none, add a flagged estimate so the
+    # cost/question of nc-graph is never silently understated.
+    if arm == "nc-graph":
+        kin, kout = as_float(rec.get("keyword_tokens_in")), as_float(rec.get("keyword_tokens_out"))
+        kusd = as_float(rec.get("keyword_cost_usd"))
+        sparse["keyword_cost_estimated"] = False
+        if rec.get("keyword_source") != "caller":
+            if kin is None and kout is None and kusd is None:
+                kin, kout = KEYWORD_IN_EST, KEYWORD_OUT_EST
+                sparse["keyword_cost_estimated"] = True
+        if sparse["cost_usd"] is not None and sparse["cost_source"] == "usd" and kusd:
+            sparse["cost_usd"] += kusd
+        elif kin or kout:
+            sparse["tokens_in"] = (sparse["tokens_in"] or 0) + (kin or 0)
+            sparse["tokens_out"] = (sparse["tokens_out"] or 0) + (kout or 0)
     if sparse["cost_usd"] is None and (sparse["tokens_in"] or sparse["tokens_out"]):
         # token-cost proxy so "cost per question" still works without $ fields
         # (agent prompt+completion tokens only; HARS compaction/extractor spend is
@@ -442,13 +513,21 @@ def paired(records: dict, arm_a: str, arm_b: str, cluster: str = "session",
         vbc = {c: m for c, m in vbc.items() if m is not None}
         if not vbc:
             continue
-        lo, hi, point = boot_ci(vbc, idx)
+        # the resample matrix is sized to THIS metric's cluster count (clusters without
+        # data for a metric, e.g. a stratum, must not index past the end); for equal
+        # counts it is identical to the shared matrix
+        if len(vbc) != len(per_chain):
+            idx_m = resample_indices(len(vbc), n_boot, seed)
+        else:
+            idx_m = idx
+        lo, hi, point = boot_ci(vbc, idx_m)
         w = wilcoxon_signed_rank(list(vbc.values()))
         out["metrics"][metric] = {
             "point": point, "ci_lo": lo, "ci_hi": hi,
             "n_chains": len(vbc), "wilcoxon_p": w["p"], "wilcoxon_W": w["W"],
             "wilcoxon_method": w["method"],
             "per_chain": {c: round(m, 4) for c, m in sorted(vbc.items())},
+            "values": dict(sorted(vbc.items())),     # unrounded, for contrast p-values
         }
     return out
 
@@ -535,21 +614,25 @@ def fmt(v, nd=3):
 
 def evaluate_gates(deltas: dict, summary: dict, arms: dict,
                    mem_ratio_pair: tuple[str, str], anchor_key: str = "anchor_hit",
-                   n_sessions: int | None = None, warnings: list | None = None) -> dict:
+                   n_sessions: int | None = None, warnings: list | None = None,
+                   treat: str = "nc") -> dict:
     """Every rule is printed with its observed value; FAIL wins over WIN.
 
     A rule whose inputs are missing evaluates to None ("n/a"): a WIN rule that is
     n/a cannot be met, a FAIL rule that is n/a does not fire, and any n/a FAIL rule
     also blocks WIN (FAIL cannot be excluded) -> INCONCLUSIVE, never FAIL."""
     warnings = list(warnings or [])
-    nb, nn, bn = "nc-baseline", "nc-nc-note-only", "baseline-nc-note-only"
+    # `treat` = the arm entering the WIN/FAIL rules against `baseline` and `nc-note-only`
+    # (Amendment C: nc-graph; legacy runs: nc-chunks / old name "nc")
+    nb, nn, bn = f"{treat}-baseline", f"{treat}-nc-note-only", "baseline-nc-note-only"
     d_score = deltas.get(nb, {}).get("metrics", {}).get("score", {})
     d_anchor = deltas.get(nb, {}).get("metrics", {}).get(anchor_key, {})
     d_halluc = deltas.get(nb, {}).get("metrics", {}).get("hallucination", {})
     d_false = deltas.get(nb, {}).get("metrics", {}).get("false_answer", {})
     s_score = deltas.get(nn, {}).get("metrics", {}).get("score", {})
     s_anchor = deltas.get(nn, {}).get("metrics", {}).get(anchor_key, {})
-    nc, base, note = arms.get("nc", {}), arms.get("baseline", {}), arms.get("nc-note-only", {})
+    nc, base, note = arms.get(treat, {}), arms.get("baseline", {}), arms.get("nc-note-only", {})
+    tn = treat
     al = "d_clean_anchor" if anchor_key == "clean_anchor_hit" else "d_anchor(raw)"
 
     def known(*xs):
@@ -591,26 +674,26 @@ def evaluate_gates(deltas: dict, summary: dict, arms: dict,
 
     win_rules = [
         gate("win_score_ci", cmp(lambda lo: lo >= -0.05, d_score.get("ci_lo")),
-             "CI lower of paired d_score(nc-baseline) >= -0.05",
+             f"CI lower of paired d_score({tn}-baseline) >= -0.05",
              f"ci_lo={fmt(d_score.get('ci_lo'))} point={fmt(d_score.get('point'))}"),
         gate("win_anchor_ci",
              cmp(lambda lo, p: lo >= -0.02 and p >= 0, d_anchor.get("ci_lo"),
                  d_anchor.get("point")),
-             f"CI lower of paired {al}(nc-baseline) >= -0.02 AND point >= 0",
+             f"CI lower of paired {al}({tn}-baseline) >= -0.02 AND point >= 0",
              f"ci_lo={fmt(d_anchor.get('ci_lo'))} point={fmt(d_anchor.get('point'))}"),
         gate("win_halluc_ci",
              cmp(lambda p, hi: p <= -0.10 and hi < 0, d_halluc.get("point"),
                  d_halluc.get("ci_hi")),
-             "d_halluc(nc-baseline) <= -0.10 with CI upper < 0",
+             f"d_halluc({tn}-baseline) <= -0.10 with CI upper < 0",
              f"point={fmt(d_halluc.get('point'))} ci_hi={fmt(d_halluc.get('ci_hi'))}"),
         gate("win_unanswerable_false_answer",
              cmp(lambda d, fb, fn: d <= -0.10 or (fb <= 0.30 and fn <= 0.25),
                  d_false.get("point"), fa_base, fa_nc),
-             "unanswerable false-answer d(nc-baseline) <= -0.10, or nc <= 0.25 "
+             f"unanswerable false-answer d({tn}-baseline) <= -0.10, or {tn} <= 0.25 "
              "absolute if baseline <= 0.30",
              f"d={fmt(d_false.get('point'))} nc={fmt(fa_nc)} baseline={fmt(fa_base)}"),
         gate("win_vs_note_only", win_vs_note(),
-             f"(d_score(nc-nc-note-only) >= +0.15 or {al} >= +0.10) with CI lower > 0",
+             f"(d_score({tn}-nc-note-only) >= +0.15 or {al} >= +0.10) with CI lower > 0",
              f"score point={fmt(s_score.get('point'))} ci_lo={fmt(s_score.get('ci_lo'))}; "
              f"anchor point={fmt(s_anchor.get('point'))} ci_lo={fmt(s_anchor.get('ci_lo'))}"),
         gate("win_mem_token_ratio",
@@ -618,26 +701,26 @@ def evaluate_gates(deltas: dict, summary: dict, arms: dict,
              f"realized mem-token ratio run-mean({a})/run-mean({b}) within [0.80, 1.05]",
              f"ratio={fmt(mem_ratio)} ({fmt(mem_a, 1)}/{fmt(mem_b, 1)})"),
         gate("win_persisted_rate", cmp(lambda x: x >= 0.95, persisted),
-             "persisted_compaction_rate(nc) >= 0.95", f"rate={fmt(persisted)}"),
+             f"persisted_compaction_rate({tn}) >= 0.95", f"rate={fmt(persisted)}"),
         gate("win_latency", cmp(lambda x: x <= 20, med_lat),
-             "median ask latency(nc, incl. recall) <= 20 s", f"median={fmt(med_lat, 1)} s"),
+             f"median ask latency({tn}, incl. recall + keyword call) <= 20 s", f"median={fmt(med_lat, 1)} s"),
     ]
     fail_rules = [
         gate("fail_score_bad", cmp(lambda p: p < -0.10, d_score.get("point")),
-             "d_score(nc-baseline) < -0.10", f"point={fmt(d_score.get('point'))}"),
+             f"d_score({tn}-baseline) < -0.10", f"point={fmt(d_score.get('point'))}"),
         gate("fail_anchor_bad", cmp(lambda p: p < -0.05, d_anchor.get("point")),
-             f"{al}(nc-baseline) < -0.05", f"point={fmt(d_anchor.get('point'))}"),
+             f"{al}({tn}-baseline) < -0.05", f"point={fmt(d_anchor.get('point'))}"),
         gate("fail_halluc_bad", cmp(lambda p: p > -0.05, d_halluc.get("point")),
-             "d_halluc(nc-baseline) > -0.05", f"point={fmt(d_halluc.get('point'))}"),
+             f"d_halluc({tn}-baseline) > -0.05", f"point={fmt(d_halluc.get('point'))}"),
         gate("fail_dead_memory",
              cmp(lambda ps, pa: abs(ps) < 0.05 and abs(pa) < 0.03,
                  s_score.get("point"), s_anchor.get("point")),
-             f"dead memory: |d_score(nc-nc-note-only)| < 0.05 AND |{al}| < 0.03",
+             f"dead memory: |d_score({tn}-nc-note-only)| < 0.05 AND |{al}| < 0.03",
              f"score={fmt(s_score.get('point'))} anchor={fmt(s_anchor.get('point'))}"),
         gate("fail_latency_bad", cmp(lambda x: x > 30, med_lat),
-             "median ask latency(nc, incl. recall) > 30 s", f"median={fmt(med_lat, 1)} s"),
+             f"median ask latency({tn}, incl. recall + keyword call) > 30 s", f"median={fmt(med_lat, 1)} s"),
         gate("fail_cost", cmp(lambda x: x > 3, cost_ratio),
-             "cost per question(nc) > 3x baseline",
+             f"cost per question({tn}, incl. keyword call) > 3x baseline",
              f"ratio={fmt(cost_ratio)} ({fmt(c_nc, 5)}/{fmt(c_base, 5)}; "
              f"source nc={','.join(src_nc) or 'n/a'} baseline={','.join(src_base) or 'n/a'})"),
     ]
@@ -680,6 +763,199 @@ def evaluate_gates(deltas: dict, summary: dict, arms: dict,
             "median_latency_s": med_lat}
 
 
+# ------------------------------------------------- Amendment C: secondaries, sweep
+
+def boot_p_le(values_by_cluster: dict, theta0: float, n_boot: int = BOOT_N,
+              seed: int = SEED) -> float | None:
+    """One-sided cluster-bootstrap p-value for H0: delta <= theta0 (H1: delta > theta0):
+    (1 + #{bootstrap means <= theta0}) / (n_boot + 1), on the SAME resample matrix as the
+    CIs (so p <= 0.025 iff the 95% two-sided CI lower bound is above theta0, up to the
+    +1 smoothing)."""
+    vals = [values_by_cluster[c] for c in sorted(values_by_cluster)]
+    if not vals:
+        return None
+    idx = resample_indices(len(vals), n_boot, seed)
+    k = sum(1 for draw in idx if mean([vals[i] for i in draw]) <= theta0 + 1e-12)
+    return (1 + k) / (n_boot + 1)
+
+
+def holm_adjust(pvals: dict) -> dict:
+    """Holm step-down adjusted p-values over the FIXED family (n/a counts as p = 1:
+    the family size never shrinks because a cell is missing)."""
+    m = len(pvals)
+    order = sorted(pvals, key=lambda k: (1.0 if pvals[k] is None else pvals[k], k))
+    adj, running = {}, 0.0
+    for i, k in enumerate(order):
+        p = 1.0 if pvals[k] is None else pvals[k]
+        running = max(running, min(1.0, (m - i) * p))
+        adj[k] = None if pvals[k] is None else running
+    return adj
+
+
+def cell(recs: list[dict], arm: str, budget: int, qtypes=None) -> dict:
+    """qid -> record for one (arm, mem_budget) cell, optionally a question-type stratum."""
+    out = {}
+    for r in recs:
+        if r["arm"] == arm and r["mem_budget"] == budget and r["qid"] is not None:
+            if qtypes is None or (r.get("qtype") in qtypes):
+                out[r["qid"]] = r
+    return out
+
+
+def paired_cells(recs: list[dict], a: tuple, b: tuple, cluster: str = "session",
+                 n_boot: int = BOOT_N, seed: int = SEED, qtypes=None) -> dict:
+    """paired() between two (arm, budget) cells (possibly different budgets), via relabelled
+    copies so the cells never collide on (qid, arm)."""
+    synth = {}
+    ca, cb = cell(recs, a[0], a[1], qtypes), cell(recs, b[0], b[1], qtypes)
+    for tag, c in (("A", ca), ("B", cb)):
+        for qid, r in c.items():
+            synth[f"{qid}::{tag}"] = {**r, "arm": tag, "rid": f"{qid}::{tag}"}
+    out = paired(synth, "A", "B", cluster, n_boot, seed)
+    out["cells"] = {"A": list(a), "B": list(b)}
+    out["n_a"], out["n_b"] = len(ca), len(cb)
+    return out
+
+
+def h_graph_label(d_anchor: dict, d_score: dict) -> str:
+    """Descriptive label of the nc-graph - nc-chunks contrast (plan thresholds)."""
+    pa, la, ha = d_anchor.get("point"), d_anchor.get("ci_lo"), d_anchor.get("ci_hi")
+    ps, ls = d_score.get("point"), d_score.get("ci_lo")
+    if pa is None and ps is None:
+        return "n/a"
+    helps = ((pa is not None and la is not None and pa >= H_GRAPH_MIN_ANCHOR and la > 0)
+             or (ps is not None and ls is not None and ps >= 0.10 and ls > 0))
+    if helps:
+        return "graph helps"
+    if ha is not None and ha < 0:
+        return "graph harms"
+    if pa is not None and ps is not None and abs(pa) < 0.03 and abs(ps) < 0.05:
+        return "graph dead"
+    return "indeterminate"
+
+
+def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: int,
+                     seed: int, n_sessions: int, primary_b: int = PRIMARY_B) -> dict:
+    """The pre-registered secondary family (m = 5), Holm-corrected at one-sided
+    ALPHA_ONE_SIDED. All tests use cluster bootstrap over sessions and the SAME metric
+    (clean_anchor_hit; raw anchor_hit only on the loud fallback), except the
+    non-inferiority tests, which are intersection-union over anchor AND score
+    (p = max of the two)."""
+    G, C, Bz = "nc-graph", "nc-chunks", "baseline"
+    tests: dict[str, dict] = {}
+
+    def sup(tid, desc, a, b, qtypes=None, metric=None, theta0=0.0):
+        metric = metric or anchor_key
+        d = paired_cells(recs, a, b, cluster, n_boot, seed, qtypes)
+        m = d["metrics"].get(metric)
+        sc = d["metrics"].get("score")
+        tests[tid] = {
+            "id": tid, "kind": "superiority", "desc": desc, "contrast": f"{a[0]}@{a[1]} - {b[0]}@{b[1]}",
+            "metric": metric, "theta0": theta0,
+            "point": m and m["point"], "ci_lo": m and m["ci_lo"], "ci_hi": m and m["ci_hi"],
+            "n_clusters": m["n_chains"] if m else 0, "n_pairs": d["n_questions"],
+            "score_point": sc and sc["point"], "score_ci_lo": sc and sc["ci_lo"],
+            "p": boot_p_le(m["values"], theta0, n_boot, seed) if m else None,
+            "label": h_graph_label(d["metrics"].get(anchor_key, {}), d["metrics"].get("score", {}))
+            if tid == "S1_graph_vs_chunks" else None,
+        }
+
+    def ni(tid, desc, a, b):
+        d = paired_cells(recs, a, b, cluster, n_boot, seed)
+        legs, ps = {}, []
+        for metric, margin in (("clean_anchor_hit" if anchor_key == "clean_anchor_hit"
+                                else "anchor_hit", NI_MARGIN_ANCHOR), ("score", NI_MARGIN_SCORE)):
+            m = d["metrics"].get(metric)
+            if not m:
+                legs[metric] = None
+                ps.append(None)
+                continue
+            p = boot_p_le(m["values"], -margin, n_boot, seed)
+            legs[metric] = {"point": m["point"], "ci_lo": m["ci_lo"], "margin": margin, "p": p}
+            ps.append(p)
+        tests[tid] = {
+            "id": tid, "kind": "non-inferiority", "desc": desc,
+            "contrast": f"{a[0]}@{a[1]} - {b[0]}@{b[1]}",
+            "legs": legs, "n_pairs": d["n_questions"],
+            "p": (None if any(x is None for x in ps) else max(ps)),
+            "margins": {"anchor": NI_MARGIN_ANCHOR, "score": NI_MARGIN_SCORE},
+        }
+
+    sup("S1_graph_vs_chunks", "H-graph: nc-graph - nc-chunks, B=1536, anchor, H0 delta<=0",
+        (G, primary_b), (C, primary_b))
+    ni("S2_ni_1024", "token saving: nc-graph@1024 non-inferior to baseline@1536",
+       (G, 1024), (Bz, primary_b))
+    ni("S3_ni_512", "token saving: nc-graph@512 non-inferior to baseline@1536",
+       (G, 512), (Bz, primary_b))
+    sup("S4_multihop_vs_baseline", "multi-hop stratum: nc-graph - baseline, B=1536, anchor",
+        (G, primary_b), (Bz, primary_b), qtypes=MULTIHOP_TYPES)
+    sup("S5_multihop_graph_vs_chunks", "multi-hop stratum: nc-graph - nc-chunks, B=1536, anchor",
+        (G, primary_b), (C, primary_b), qtypes=MULTIHOP_TYPES)
+    adj = holm_adjust({k: tests[k]["p"] for k in SECONDARY_IDS})
+    under = n_sessions < MIN_CHAINS
+    for k in SECONDARY_IDS:
+        t = tests[k]
+        t["p_holm"] = adj[k]
+        if t["p"] is None:
+            t["decision"] = "n/a (no data for this cell)"
+        elif under:
+            t["decision"] = f"INCONCLUSIVE (underpowered: {n_sessions} < {MIN_CHAINS} sessions)"
+        else:
+            t["decision"] = ("SUPPORTED" if adj[k] <= ALPHA_ONE_SIDED
+                             else "not supported")
+    return {"family": list(SECONDARY_IDS), "alpha_one_sided": ALPHA_ONE_SIDED,
+            "correction": "Holm step-down over the fixed family of 5", "tests": tests,
+            "underpowered": under, "anchor_metric": anchor_key}
+
+
+def graph_diag(recs: list[dict], budget: int) -> dict:
+    """nc-graph mechanism readout for one budget cell."""
+    g = [r for r in recs if r["arm"] == "nc-graph" and r["mem_budget"] == budget]
+    if not g:
+        return {}
+    ks = Counter(str(r.get("keyword_source")) for r in g)
+    st = Counter(str(r.get("session_graph_status")) for r in g)
+    ans = [r for r in g if r["answerable"] is not False]
+
+    def rate(xs):
+        xs = [x for x in xs if x is not None]
+        return (sum(1 for x in xs if x) / len(xs)) if xs else None
+
+    kg_only = [r for r in ans if r.get("anchor_in_kg_recall") and not r.get("anchor_in_chunk_recall")]
+    return {
+        "n": len(g), "keyword_source": dict(ks), "session_graph_status": dict(st),
+        "kg_empty_rate": rate([r.get("kg_empty") for r in g]),
+        "graph_not_exercised": (rate([r.get("kg_empty") for r in g]) or 0.0) > 0.30,
+        "anchor_in_recall": rate([r.get("anchor_in_recall") for r in ans]),
+        "anchor_in_kg_recall": rate([r.get("anchor_in_kg_recall") for r in ans]),
+        "anchor_in_chunk_recall": rate([r.get("anchor_in_chunk_recall") for r in ans]),
+        "anchor_only_in_kg": len(kg_only),
+        "p_hit_given_anchor_only_in_kg": rate([r.get("anchor_hit") for r in kg_only]),
+        "cost_estimated_rows": sum(1 for r in g if r.get("keyword_cost_estimated")),
+    }
+
+
+def budget_views(recs: list[dict], treat: str, legacy: bool, cluster: str, n_boot: int,
+                 seed: int) -> dict:
+    """Per-budget analysis cells: arm summary, slices and paired deltas (always within the
+    same B). Gates are evaluated only on the primary cell by the caller."""
+    views = {}
+    for B in sorted({r["mem_budget"] for r in recs}, reverse=True):
+        rb = [r for r in recs if r["mem_budget"] == B]
+        final = {r["rid"]: r for r in rb}
+        present = {r["arm"] for r in rb}
+        pair_defs = [(treat, "baseline"), (treat, "nc-note-only"), ("baseline", "nc-note-only")]
+        if not legacy:
+            pair_defs += [(treat, "nc-chunks"), ("nc-chunks", "baseline")]
+        deltas = {}
+        for a, b in pair_defs:
+            if a in present and b in present:
+                deltas[f"{a}-{b}"] = paired(final, a, b, cluster, n_boot, seed)
+        views[B] = {"records": rb, "summary": arm_summary(rb), "slices": slices(rb),
+                    "deltas": deltas}
+    return views
+
+
 # ---------------------------------------------------------------------- render
 
 def table(headers: list[str], rows: list[list[str]]) -> list[str]:
@@ -693,6 +969,13 @@ def table(headers: list[str], rows: list[list[str]]) -> list[str]:
 def render(summary: dict, deltas: dict, slice_data: dict, gates: dict,
            meta: dict, suspicious: list | None = None) -> str:
     L = [f"# Chained-compaction metrics (v2)", ""]
+    if meta.get("legacy"):
+        L += ["> **LEGACY / EXPLORATORY**: no nc-graph rows. `nc` is chunk-RAG over the "
+              "compaction documents (M2) and, per Protocol Amendment C, is excluded from "
+              "the decision set.", ""]
+    L.append(f"analysis cell: mem_budget B={meta.get('primary_b')} (budgets present: "
+             f"{meta.get('budgets')}); treatment arm: {meta.get('treatment')}")
+    L.append("")
     L.append(f"records: {meta['records']} | chains: {meta['chains']} | "
              f"sessions: {meta['sessions']} | "
              f"questions: {meta['questions']} | seed: {meta['seed']} | "
@@ -797,6 +1080,85 @@ def render(summary: dict, deltas: dict, slice_data: dict, gates: dict,
     return "\n".join(L) + "\n"
 
 
+def render_extra(views: dict, primary_b: int, sec: dict | None, diag: dict, treat: str,
+                 legacy: bool, meta: dict) -> str:
+    L = []
+    if len(views) > 1 or not legacy:
+        L.append("## Budget sweep (descriptive; the verdict above is B=%d only)" % primary_b)
+        L.append("")
+        rows = []
+        for B in sorted(views, reverse=True):
+            for arm, v in sorted(views[B]["summary"].items()):
+                rows.append([B, arm, v["n_answerable"], fmt(v["score"]),
+                             fmt(v["clean_anchor_hit"]), fmt(v["hallucination"]),
+                             fmt(v["abstain_on_unanswerable"]), fmt(v["memory_tokens_mean"], 0),
+                             fmt(v["latency_median"], 2), fmt(v["cost_per_question"], 5)])
+        L += table(["B", "arm", "n_ans", "score", "clean_anchor_hit", "halluc",
+                    "abstain@UNANS", "mem_tok_mean", "lat_med_s", "cost/q"], rows)
+        L.append("")
+        rows = []
+        for B in sorted(views, reverse=True):
+            for pair, d in views[B]["deltas"].items():
+                for metric in ("clean_anchor_hit", "anchor_hit", "score", "hallucination"):
+                    m = d["metrics"].get(metric)
+                    if m:
+                        rows.append([B, pair, metric, fmt(m["point"]), fmt(m["ci_lo"]),
+                                     fmt(m["ci_hi"]), m["n_chains"]])
+        L += table(["B", "pair (A-B, same B)", "metric", "delta", "CI2.5", "CI97.5",
+                    "sessions"], rows)
+        L.append("")
+    if sec:
+        L.append("## Secondary hypotheses (pre-registered family of 5, Holm-corrected)")
+        L.append("")
+        L.append(f"Cluster bootstrap over sessions; one-sided p for H0 delta <= theta0 "
+                 f"(non-inferiority: theta0 = -margin; intersection-union over anchor and "
+                 f"score, p = max); Holm step-down at one-sided alpha {sec['alpha_one_sided']} "
+                 f"(= the two-sided 95% CIs). A cell with no data counts as p = 1 in the "
+                 f"correction. Anchor metric: {sec['anchor_metric']}. Margins: anchor "
+                 f"{NI_MARGIN_ANCHOR:.2f}, score {NI_MARGIN_SCORE:.2f}.")
+        L.append("")
+        rows = []
+        for tid in sec["family"]:
+            t = sec["tests"][tid]
+            if t["kind"] == "superiority":
+                obs = (f"d={fmt(t['point'])} CI[{fmt(t['ci_lo'])}, {fmt(t['ci_hi'])}] "
+                       f"score d={fmt(t['score_point'])}"
+                       + (f" | {t['label']}" if t.get("label") else ""))
+            else:
+                obs = "; ".join(
+                    f"{k}: d={fmt(v['point'])} lo={fmt(v['ci_lo'])} (margin -{v['margin']})"
+                    for k, v in t["legs"].items() if v) or "n/a"
+            rows.append([tid, t["contrast"], obs, fmt(t["p"], 4), fmt(t["p_holm"], 4),
+                         t["decision"]])
+        L += table(["id", "contrast", "observed", "p", "p_holm", "decision"], rows)
+        L.append("")
+    if diag:
+        L.append("## nc-graph diagnostics (mechanism, descriptive)")
+        L.append("")
+        rows = []
+        for B in sorted(diag, reverse=True):
+            d = diag[B]
+            if d:
+                rows.append([B, d["n"], json.dumps(d["keyword_source"]),
+                             json.dumps(d["session_graph_status"]), fmt(d["kg_empty_rate"]),
+                             "YES" if d["graph_not_exercised"] else "no",
+                             fmt(d["anchor_in_recall"]), fmt(d["anchor_in_kg_recall"]),
+                             fmt(d["anchor_in_chunk_recall"]), d["anchor_only_in_kg"],
+                             fmt(d["p_hit_given_anchor_only_in_kg"]),
+                             d["cost_estimated_rows"]])
+        L += table(["B", "n", "keyword_source", "status", "kg_empty_rate", "not exercised",
+                    "anchor_in_recall", "in KG", "in chunks", "KG-only n",
+                    "P(hit|KG-only)", "kw cost estimated rows"], rows)
+        L.append("")
+    mh = [r for r in views[primary_b]["records"]
+          if r.get("qtype") in MULTIHOP_TYPES and r["arm"] == treat]
+    L.append(f"multi-hop stratum at B={primary_b}: {len(mh)} {treat} items "
+             f"({len({r['cluster_session'] for r in mh})} sessions) tagged "
+             f"{'/'.join(MULTIHOP_TYPES[:2])}; secondary endpoints S4/S5.")
+    L.append("")
+    return "\n".join(L) + "\n"
+
+
 # ---------------------------------------------------------------------- driver
 
 def main() -> int:
@@ -809,7 +1171,7 @@ def main() -> int:
     ap.add_argument("--judge-input", dest="judge_input", default="",
                     help="export_judge_input output (joined on rid; supplies "
                          "visible_context for the deterministic primed_hit / "
-                         "clean_anchor_hit flags)")
+                         "clean_anchor_hit flags, and qtype when the records lack it)")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "metrics_v2.md"))
     ap.add_argument("--json", default="", help="also write the summary as JSON")
@@ -819,9 +1181,10 @@ def main() -> int:
                     help="bootstrap cluster unit (default session: c0/c1 chains of one "
                          "session share 2 of 3 spans); 'chain' is for comparison only -- "
                          "the power check always counts distinct sessions")
-    ap.add_argument("--mem-ratio-arms", default="nc,baseline",
+    ap.add_argument("--mem-ratio-arms", default="",
                     help="arms whose run-mean memory_tokens form the realized mem-token "
-                         "ratio (RUNBOOK: nc/baseline)")
+                         "ratio, 'treatment,baseline' (default: nc-graph,baseline; legacy "
+                         "3-arm runs: nc-chunks,baseline)")
     args = ap.parse_args()
 
     raw = []
@@ -834,20 +1197,24 @@ def main() -> int:
         print(f"[validity] {line}", file=sys.stderr)
     if not raw:
         raise SystemExit("no valid records left after the validity filter")
-    # attach visible_context from the export file (joined on rid) so primed_hit /
-    # clean_anchor_hit can be computed deterministically
+    legacy = bool(validity.get("legacy_arm_set"))
+    # attach visible_context (and a missing qtype) from the export file (joined on rid)
     if args.judge_input:
-        ctx_by_rid = {}
+        ctx_by_rid, qtype_by_rid = {}, {}
         for r in load_json_records(args.judge_input):
             rid = r.get("rid") or f"{r.get('qid')}::{r.get('arm')}"
             if isinstance(r.get("visible_context"), str) and r["visible_context"].strip():
                 ctx_by_rid[rid] = r["visible_context"]
+            if r.get("qtype"):
+                qtype_by_rid[rid] = r["qtype"]
         joined = 0
         for r in raw:
             rid = r.get("rid") or f"{r.get('qid')}::{r.get('arm')}"
             if rid in ctx_by_rid and not r.get("visible_context"):
                 r["visible_context"] = ctx_by_rid[rid]
                 joined += 1
+            if rid in qtype_by_rid and not r.get("qtype"):
+                r["qtype"] = qtype_by_rid[rid]
         print(f"[judge-input] visible_context joined on rid: {joined}/{len(raw)} records")
     records = [normalize(r) for r in raw]
     judged = load_json_records(args.judge) if args.judge else []
@@ -855,25 +1222,29 @@ def main() -> int:
     merged = merge_judge(records, judged, mapping)
     recs = list(merged.values())
 
-    final = {r["rid"]: r for r in recs}
     arms_present = sorted({r["arm"] for r in recs})
-    for need in ("baseline", "nc"):
+    for need in ("baseline", "nc-chunks"):
         if need not in arms_present:
             raise SystemExit(f"arm '{need}' missing (have: {arms_present})")
-    pair_defs = [("nc", "baseline", "nc-baseline"),
-                 ("nc", "nc-note-only", "nc-nc-note-only"),
-                 ("baseline", "nc-note-only", "baseline-nc-note-only")]
-    deltas = {}
-    for a, b, name in pair_defs:
-        if a in arms_present and b in arms_present:
-            deltas[name] = paired(final, a, b, args.cluster, args.boot, args.seed)
-    summary = arm_summary(recs)
-    mem_pair = tuple(x.strip() for x in args.mem_ratio_arms.split(","))
+    treat = "nc-chunks" if legacy else "nc-graph"
+    views = budget_views(recs, treat, legacy, args.cluster, args.boot, args.seed)
+    primary_b = PRIMARY_B if PRIMARY_B in views else max(views)
+    pv = views[primary_b]
+    prec = pv["records"]
+    mem_pair = (tuple(canon_arm(x.strip()) for x in args.mem_ratio_arms.split(","))
+                if args.mem_ratio_arms else (treat, "baseline"))
     # anchor gates use clean_anchor_hit (question-primed hits excluded) when it is
     # defined on EVERY answerable record with an anchor verdict; partial coverage
     # would drop exactly the hits, so it falls back to raw anchor_hit -- loudly.
     warn = []
-    undefined = sum(1 for r in recs if r["answerable"] is not False
+    if legacy:
+        warn.append("LEGACY ARM SET (no nc-graph rows): nc-chunks is chunk-RAG over the "
+                    "compaction documents (M2); exploratory only, excluded from the decision "
+                    "set by Amendment C")
+    if primary_b != PRIMARY_B:
+        warn.append(f"no B={PRIMARY_B} cell: gates evaluated on B={primary_b} (not the "
+                    "pre-registered decision cell)")
+    undefined = sum(1 for r in prec if r["answerable"] is not False
                     and r["anchor_hit"] is not None and r.get("clean_anchor_hit") is None)
     anchor_key = "clean_anchor_hit"
     if undefined:
@@ -882,28 +1253,39 @@ def main() -> int:
                     f"(no visible_context; pass --judge-input) -> anchor gates FELL BACK "
                     f"to raw anchor_hit (may count question-primed reconstructions)")
         print(f"WARNING {warn[-1]}", file=sys.stderr)
-    n_sessions = len({r["cluster_session"] for r in recs})
-    gates = evaluate_gates(deltas, summary, summary, mem_pair, anchor_key,
-                           n_sessions, warn)
+    n_sessions = len({r["cluster_session"] for r in prec})
+    gates = evaluate_gates(pv["deltas"], pv["summary"], pv["summary"], mem_pair, anchor_key,
+                           n_sessions, warn, treat=treat)
+    sec = None
+    if not legacy:
+        sec = secondary_family(recs, anchor_key, args.cluster, args.boot, args.seed,
+                               n_sessions, primary_b)
+    diag = {B: graph_diag(recs, B) for B in views} if not legacy else {}
     suspicious = [
         {"qid": r["qid"], "arm": r["arm"], "chain_id": r["chain_id"],
          "anchor": r.get("gold_anchor") or "", "hallucinated": r["hallucination"]}
-        for r in recs
+        for r in prec
         if r.get("primed_hit") is True and r["hallucination"] is not None
         and not r["hallucination"]]
-    meta = {"records": len(recs), "chains": len({r["chain_id"] for r in recs}),
+    meta = {"records": len(prec), "chains": len({r["chain_id"] for r in prec}),
             "sessions": n_sessions, "cluster": args.cluster, "seed": args.seed,
-            "questions": len({r["qid"] for r in recs}), "boot_n": args.boot,
+            "questions": len({r["qid"] for r in prec}), "boot_n": args.boot,
             "mem_ratio_pair": mem_pair, "validity": validity,
-            "ctx_records": sum(1 for r in recs if r.get("ctx_present"))}
-    md = render(summary, deltas, slices(recs), gates, meta, suspicious)
+            "ctx_records": sum(1 for r in prec if r.get("ctx_present")),
+            "treatment": treat, "primary_b": primary_b, "legacy": legacy,
+            "budgets": sorted(views, reverse=True)}
+    md = render(pv["summary"], pv["deltas"], pv["slices"], gates, meta, suspicious)
+    md += "\n" + render_extra(views, primary_b, sec, diag, treat, legacy, meta)
     print(md)
     with open(args.out, "w") as w:
         w.write(md)
     if args.json:
-        json.dump({"meta": meta, "summary": summary, "deltas": deltas,
-                   "gates": gates, "slices": slices(recs)}, open(args.json, "w"),
-                  indent=1, default=str)
+        json.dump({"meta": meta,
+                   "by_budget": {str(B): {"summary": v["summary"], "deltas": v["deltas"],
+                                          "slices": v["slices"]} for B, v in views.items()},
+                   "summary": pv["summary"], "deltas": pv["deltas"], "gates": gates,
+                   "slices": pv["slices"], "secondary": sec, "graph_diag": diag},
+                  open(args.json, "w"), indent=1, default=str)
     print(f"\n[written] {args.out}" + (f" and {args.json}" if args.json else ""))
     return 0
 

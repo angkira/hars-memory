@@ -21,8 +21,10 @@ session exists the record still exports, with `visible_context` null.
 Data validity (B2, same filter as metrics_v2.validate_rows): only rows with
 ``valid is True`` are exported; a chain with any invalid row or any recall_error is
 dropped whole; qids without the full (baseline, nc, nc-note-only) triplet are
-dropped; duplicate (qid, arm) or duplicate rid across ALL input files is a hard
-error (exit 2). Drop counts and reasons are printed.
+dropped (Amendment C: four arms baseline / nc-chunks / nc-graph / nc-note-only, per
+mem_budget cell; a run with no nc-graph row is a legacy 3-arm run and `nc` reads as
+nc-chunks); duplicate (qid, arm, mem_budget) or duplicate rid across ALL input files is a
+hard error (exit 2). Drop counts and reasons are printed.
 
 Usage:
   python3 export_judge_input.py --records "runs/gate-*/records.jsonl" \
@@ -36,7 +38,7 @@ import json
 import os
 import sys
 
-from metrics_v2 import validate_rows, validity_lines
+from metrics_v2 import canon_arm, raw_rid, validate_rows, validity_lines
 from visible_context import DEFAULT_CAP, build_visible_context
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -86,8 +88,8 @@ def main() -> int:
 
     n_in, n_out, missing = 0, 0, set()
     ctx_stats = {"present": 0, "missing_session": 0, "recall_in_ctx": 0,
-                 "recall_possible": 0, "nc": 0, "nc-note-only": 0, "baseline": 0,
-                 "compaction_summary": 0, "truncated": 0}
+                 "recall_possible": 0, "nc-chunks": 0, "nc-graph": 0, "nc-note-only": 0,
+                 "baseline": 0, "compaction_summary": 0, "truncated": 0}
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as fo:
         for r in rows:
@@ -108,24 +110,27 @@ def main() -> int:
             # role-tagged join is the canonical span text (same shape as
             # make_chains.seg_text and run_chainreplay.span_text).
             r["question"] = qa["question"]
+            if qa.get("qtype") and not r.get("qtype"):
+                r["qtype"] = qa["qtype"]       # multi-hop stratum tag (Amendment C)
             r["span_text"] = "".join(
                 f"[{s.get('role', '')}] {str(s.get('text') or '').strip()}\n\n"
                 for s in span["segments"])
-            r.setdefault("rid", f"{r.get('qid')}::{r.get('arm')}")
+            r.setdefault("rid", raw_rid(r))
             # answer-arm visible context (post-C3 state the model answered from)
             ctx, meta = build_visible_context(
                 sessions_root, r.get("chain_id"), r.get("arm"), r.get("qid"),
-                cap=args.context_cap)
+                cap=args.context_cap,
+                budget=(r.get("mem_budget") if r.get("b_tag") else None))
             r["visible_context"] = ctx
             r["visible_context_meta"] = meta
             ctx_stats["present"] += ctx is not None
             ctx_stats["missing_session"] += ctx is None
             ctx_stats["truncated"] += bool(meta.get("truncated"))
             ctx_stats["compaction_summary"] += bool(meta.get("has_compaction_summary"))
-            arm = str(r.get("arm"))
-            if arm in ("baseline", "nc", "nc-note-only"):
+            arm = canon_arm(str(r.get("arm")))
+            if arm in ("baseline", "nc-chunks", "nc-graph", "nc-note-only"):
                 ctx_stats[arm] += 1
-                if arm == "nc":
+                if arm in ("nc-chunks", "nc-graph"):
                     ctx_stats["recall_possible"] += 1
                     ctx_stats["recall_in_ctx"] += bool(meta.get("recall_in_context"))
             fo.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -138,9 +143,10 @@ def main() -> int:
           f"missing_ask_session={ctx_stats['missing_session']} "
           f"compaction_summary={ctx_stats['compaction_summary']} "
           f"truncated={ctx_stats['truncated']} | arms: "
-          f"baseline={ctx_stats['baseline']} nc={ctx_stats['nc']} "
+          f"baseline={ctx_stats['baseline']} nc-chunks={ctx_stats['nc-chunks']} "
+          f"nc-graph={ctx_stats['nc-graph']} "
           f"nc-note-only={ctx_stats['nc-note-only']} | "
-          f"recall-in-context(nc): "
+          f"recall-in-context(nc-chunks+nc-graph): "
           f"{ctx_stats['recall_in_ctx']}/{ctx_stats['recall_possible']}")
     return 0 if n_out == n_in and n_out else 1
 
