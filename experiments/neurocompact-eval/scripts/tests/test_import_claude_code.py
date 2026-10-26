@@ -202,7 +202,7 @@ class ImportTests(unittest.TestCase):
 
     def test_redaction_default_on_with_counts_and_opt_out(self):
         key = "s" + "k-ant-" + "api03-" + "Z9y8X7w6" * 5
-        es = [U("u1", None, f"my key is {key} ok"), A("a1", "u1", [T("password=hunter2xyz stored")])]
+        es = [U("u1", None, f"my key is {key} ok"), A("a1", "u1", [T("password=Zx9fQ2mK7pLw4RtY8vNb stored")])]
         (s,) = run(self.tmp, es)
         self.assertNotIn(key, s["messages"][0]["text"])
         self.assertIn("[REDACTED:sk_ant]", s["messages"][0]["text"])
