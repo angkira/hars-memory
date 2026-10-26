@@ -910,9 +910,13 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
     tests: dict[str, dict] = {}
     ls = track == "longsession"
     msr = QT.GENUINE_MULTIHOP
+    # C.2: only ~10% of BEAM items carry a deterministic gold_anchor (and 1 of 70 multi_session_reasoning
+    # items), so the long-session family tests the rubric-graded judge SCORE (non-inferiority: the
+    # score leg only); the chain family keeps clean_anchor_hit
+    test_metric = "score" if ls else anchor_key
 
     def sup(tid, desc, a, b, qtypes=None, metric=None, theta0=0.0):
-        metric = metric or anchor_key
+        metric = metric or test_metric
         d = paired_cells(recs, a, b, cluster, n_boot, seed, qtypes)
         m = d["metrics"].get(metric)
         sc = d["metrics"].get("score")
@@ -930,8 +934,11 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
     def ni(tid, desc, a, b):
         d = paired_cells(recs, a, b, cluster, n_boot, seed)
         legs, ps = {}, []
-        for metric, margin in (("clean_anchor_hit" if anchor_key == "clean_anchor_hit"
-                                else "anchor_hit", NI_MARGIN_ANCHOR), ("score", NI_MARGIN_SCORE)):
+        legs_def = [("clean_anchor_hit" if anchor_key == "clean_anchor_hit"
+                     else "anchor_hit", NI_MARGIN_ANCHOR), ("score", NI_MARGIN_SCORE)]
+        if ls:
+            legs_def = legs_def[1:]
+        for metric, margin in legs_def:
             m = d["metrics"].get(metric)
             if not m:
                 legs[metric] = None
@@ -945,7 +952,8 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
             "contrast": f"{a[0]}@{a[1]} - {b[0]}@{b[1]}",
             "legs": legs, "n_pairs": d["n_questions"],
             "p": (None if any(x is None for x in ps) else max(ps)),
-            "margins": {"anchor": NI_MARGIN_ANCHOR, "score": NI_MARGIN_SCORE},
+            "margins": ({"score": NI_MARGIN_SCORE} if ls else
+                        {"anchor": NI_MARGIN_ANCHOR, "score": NI_MARGIN_SCORE}),
         }
 
     ids = LS_SECONDARY_IDS if ls else SECONDARY_IDS
@@ -992,7 +1000,7 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
     return {"family": list(ids), "descriptive": descriptive, "track": track,
             "alpha_one_sided": ALPHA_ONE_SIDED,
             "correction": f"Holm step-down over the fixed family of {len(ids)}", "tests": tests,
-            "underpowered": under, "anchor_metric": anchor_key}
+            "underpowered": under, "anchor_metric": anchor_key, "metric": test_metric}
 
 
 def graph_diag(recs: list[dict], budget: int) -> dict:
@@ -1381,8 +1389,9 @@ def render_extra(views: dict, primary_b: int, sec: dict | None, diag: dict, trea
                  f"(non-inferiority: theta0 = -margin; intersection-union over anchor and "
                  f"score, p = max); Holm step-down at one-sided alpha {sec['alpha_one_sided']} "
                  f"(= the two-sided 95% CIs). A cell with no data counts as p = 1 in the "
-                 f"correction. Anchor metric: {sec['anchor_metric']}. Margins: anchor "
-                 f"{NI_MARGIN_ANCHOR:.2f}, score {NI_MARGIN_SCORE:.2f}.")
+                 f"correction. Test metric: {sec.get('metric', sec['anchor_metric'])}. Margins: "
+                 + (f"score {NI_MARGIN_SCORE:.2f} only (long-session track)" if sec.get("track") == "longsession"
+                    else f"anchor {NI_MARGIN_ANCHOR:.2f}, score {NI_MARGIN_SCORE:.2f}") + ".")
         L.append("")
         rows = []
         for tid in list(sec["family"]) + list(sec.get("descriptive") or []):

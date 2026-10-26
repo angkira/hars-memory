@@ -421,14 +421,19 @@ BEAM types are exploratory.
   `gold_anchor` (BEAM answers are mostly sentences, so this is a minority subset: its size and the
   number of chats contributing are printed with the verdict); a rule whose input is missing is n/a and
   cannot be met, exactly as in C4 (verdict INCONCLUSIVE, never FAIL or WIN by default).
-- *SECONDARY family L1-L5, fixed (m = 5), Holm step-down at one-sided alpha 0.025,* tests and
-  metric as in C4 (cluster bootstrap over chats, `clean_anchor_hit`, non-inferiority margins 0.10 /
-  0.15, cells without data count as p = 1):
-  L1 `nc-graph - nc-chunks` @1536; L2 `nc-graph@1024` non-inferior to `baseline@1536`; L3
+- *SECONDARY family L1-L5, fixed (m = 5), Holm step-down at one-sided alpha 0.025.* Test metric: the
+  rubric-graded judge SCORE (0-2, answerable items), NOT `clean_anchor_hit`: the BEAM import shows that
+  only 34 of 350 BEAM-1M items carry a deterministic `gold_anchor` (31 of them `knowledge_update`; 1 of
+  70 `multi_session_reasoning` items), so an anchor test of L4 / L5 would be empty by construction.
+  Non-inferiority (L2, L3) therefore has ONE leg, score margin 0.15 (the anchor leg of C4a is dropped
+  for this track only, for that reason). Everything else as in C4: cluster bootstrap over chats, one-sided
+  p on the same resamples as the CIs, cells without data count as p = 1, underpowered (< 8 chats) =
+  INCONCLUSIVE: L1 `nc-graph - nc-chunks` @1536; L2 `nc-graph@1024` non-inferior to `baseline@1536`; L3
   `nc-graph@512` non-inferior to `baseline@1536`; L4 `nc-graph - baseline` @1536 on
   `multi_session_reasoning`; L5 `nc-graph - nc-chunks` @1536 on `multi_session_reasoning`. L2 and L3
   need the B sweep (`--mem-budgets 1536,1024,512`); if the sweep is not run they are n/a (p = 1) and
-  the family stays at five. `nc-chunks`, `nc-note-only` and every other contrast are descriptive.
+  the family stays at five. `nc-chunks`, `nc-note-only`, the anchor-based readouts and every other
+  contrast are descriptive.
 - *Claude Code sessions (owner's transcripts): DESCRIPTIVE ONLY.* Their questions are generated
   (`gen_longsession_qa.py`, verbatim-evidence gates, generator `claude-sonnet-5-5`), the sample is
   small and selected by the owner, and the real summary (`orig` arm) exists only at real boundaries

@@ -144,6 +144,9 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(d["meta"]["sessions"], 3)                     # sid, not _cN-stripped chain
         self.assertEqual(d["secondary"]["family"], list(M.LS_SECONDARY_IDS))
         self.assertIn("L4_msr_vs_baseline", d["secondary"]["tests"])
+        self.assertEqual(d["secondary"]["metric"], "score")                 # C.2: rubric-graded score
+        self.assertEqual(list(d["secondary"]["tests"]["L2_ni_1024"]["legs"]), ["score"])
+        self.assertEqual(d["secondary"]["tests"]["L1_graph_vs_chunks"]["metric"], "score")
         # genuine multihop = multi_session_reasoning; the stored 'multihop' label is NOT the stratum
         ls = d["longsession"]
         self.assertIn("multi_session_reasoning", ls["strata"])

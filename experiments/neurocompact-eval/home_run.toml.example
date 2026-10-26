@@ -1,0 +1,63 @@
+# home_run.toml - copy to home_run.toml and fill in. Used by scripts/home_run.py (HOME-RUNBOOK.md).
+# Paths may use ~ ; nothing secret goes in here (API keys live in the environment).
+
+[general]
+profile       = "anthropic"                 # FROZEN per decision set (Amendment C.1-4)
+mcp           = "http://127.0.0.1:8307/mcp" # your HARS MCP server (see `home_run.py hars-env`)
+artifact_root = "/mnt/datasets/ft/artifacts"  # campaigns land in <root>/<UTC>-homerun-<name>/ (never /tmp)
+name          = "home"
+embedder_id   = ""      # your real embedder id; recorded when the server reports none / checked against it
+key_env       = ""      # e.g. "EVAL_API_KEY" to read the key from another variable than ANTHROPIC_API_KEY
+min_free_gb   = 30
+
+# HARD USD caps. 0 = NOT FILLED IN: every paid step refuses to start until you set it.
+# `home_run.py dry-run` prints the estimate per track to choose from.
+#   gen   = QA generation (Claude Code track)
+#   run   = replays / compactions / answers + the flagged estimate of HARS extraction
+#   judge = the blind judge
+[caps]
+gen   = 0.0        # <GEN_CAP_USD>
+run   = 0.0        # <RUN_CAP_USD>
+judge = 0.0        # <JUDGE_CAP_USD>
+# per-track overrides (optional), same keys:
+# [caps.beam]
+# run = 40.0
+# judge = 10.0
+
+[oh]                                  # OpenHands chain track (14 chains, single + xspan_locator + unanswerable)
+artifact_dir = "~/hars-data/20261026T144511Z-oh-multihop-qa"   # the copied artifact dir (holds chains.jsonl)
+batch_chains = 4                      # chains per run_chainreplay invocation (the host has an OOM history)
+retries      = 1                      # re-run invalid / missing (chain, B) cells this many times
+budgets      = [1536, 1024, 512]      # the protocol sweep; 1536 is the primary cell and runs first
+graph_store  = ""                     # <HARS sessions dir> for the funnel's anchor_in_graph stage (optional)
+
+[beam]                                # Amendment C.2 long-session track: primary = BEAM-1M
+repo        = "~/data/BEAM"           # git clone https://github.com/mohammadtavakoli78/BEAM
+size        = "1M"
+chats       = "all"                   # all 35 chats of BEAM-1M (the primary is defined on all of them)
+limit       = 0
+checkpoints = "end"
+budgets     = [1536, 1024, 512]       # 1536 alone is enough for the primary; 1024/512 feed L2/L3
+session_concurrency = 1
+extra_args  = []                      # appended to run_longsession.py (a protocol change if you alter window/keep-tail!)
+
+[cc]                                  # your Claude Code transcripts: DESCRIPTIVE only (C.2)
+paths       = ["~/.claude/projects/-home-you-project"]
+min_tokens  = 300000
+limit       = 0
+n_single    = 20
+n_multihop  = 8
+session_budget_usd = 5.0
+checkpoints = "every:3"
+budgets     = [1536]
+max_questions = 0
+extra_args  = []
+
+[smoke]                               # caps of `home_run.py smoke` (cents-level; hard)
+run_cap_oh  = 0.60
+run_cap_ls  = 0.25
+judge_cap   = 0.25
+
+[hars]
+data_dir = "~/hars-data/nc-eval"      # used by `hars-env` only
+port     = 8307
