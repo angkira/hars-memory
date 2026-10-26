@@ -352,6 +352,13 @@ def generate(session: dict, llm, *, window: int, keep_tail: int, reserve: int, u
     def call(prompt: str, kind: str) -> list[dict]:
         if stats["calls"] >= max_calls or llm.cost - cost0 >= budget_usd:
             return []
+        worst = llm.worst_case(prompt, 4096) if hasattr(llm, "worst_case") else None
+        if worst is not None and llm.cost - cost0 + worst > budget_usd + 1e-12:
+            print(f"  [qa] session cap ${budget_usd:.4f}: skipping a call with worst-case ${worst:.4f} "
+                  f"(spent ${llm.cost - cost0:.4f})", flush=True)
+            stats["cap_refused"] = stats.get("cap_refused", 0) + 1
+            stats["calls"] = max_calls          # the cap is the stop: every generation loop ends
+            return []
         stats["calls"] += 1
         try:
             r = llm.complete(prompt, max_tokens=4096)

@@ -72,6 +72,8 @@ SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 # tokens (identical rule to run_chainreplay: tiktoken cl100k_base, else chars/3.6)
 # ---------------------------------------------------------------------------
 try:  # pragma: no cover - depends on the interpreter
+    if os.environ.get("NC_TOKENIZER") == "estimator":       # tests / reproducible runs: never tiktoken
+        raise ImportError("tiktoken disabled by NC_TOKENIZER=estimator")
     import tiktoken  # noqa: F401
 
     _ENC = tiktoken.get_encoding("cl100k_base")
@@ -529,13 +531,35 @@ class LLM:
             with self._lock:
                 self.calls += 1
             return mock_complete(user, system, max_tokens, self.model)
-        if self.budget is not None:
-            try:
-                self.budget.check()
-            except P.BudgetExceeded as e:
-                raise LLMError(str(e)) from None
         msgs = ([{"role": "system", "content": system}] if system else []) \
             + [{"role": "user", "content": user}]
+        reserved = 0.0
+        if self.budget is not None:
+            # refuse BEFORE the call when its worst case would exceed the remaining cap
+            try:
+                self.budget.check()
+                reserved = self.budget.reserve(self.worst_case(msgs, max_tokens))
+            except P.BudgetExceeded as e:
+                raise LLMError(str(e)) from None
+        try:
+            return self._complete(msgs, max_tokens, cache_prefix_chars)
+        finally:
+            if self.budget is not None:
+                self.budget.release(reserved)
+
+    def worst_case(self, msgs_or_user, max_tokens: int) -> float | None:
+        """Worst-case USD of one call (prompt estimate x in price + max_tokens x out price,
+        cache-aware); None for the mock / an unpriced model."""
+        if self.provider == MOCK:
+            return 0.0
+        msgs = ([{"role": "user", "content": msgs_or_user}] if isinstance(msgs_or_user, str)
+                else msgs_or_user)
+        use_cache = self.profile.cache_enabled and any(
+            m.get("role") == "system" for m in msgs) if self.profile else False
+        return P.worst_case_cost(self.profile, self.model, msgs, int(max_tokens), use_cache=use_cache,
+                                 price_override=self.price_override)
+
+    def _complete(self, msgs: list, max_tokens: int, cache_prefix_chars) -> dict:
         extra = {"reasoning": {"effort": self.reasoning_effort}} if self.reasoning_effort else None
         try:
             res = P.chat(self.role, msgs, profile=self.profile, model=self.model,

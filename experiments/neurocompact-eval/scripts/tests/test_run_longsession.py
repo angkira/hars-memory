@@ -130,7 +130,7 @@ class DryRunTests(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.TemporaryDirectory()
         self.sd = os.path.join(self.d.name, "in")
-        F.write_session(self.sd, F.make_session("syn-1"))
+        F.write_session(self.sd, F.make_session("syn-1", n=160))   # enough text for >=5 boundaries under any tokenizer
         F.write_session(self.sd, F.make_session("syn-2", n=90))
 
     def tearDown(self):

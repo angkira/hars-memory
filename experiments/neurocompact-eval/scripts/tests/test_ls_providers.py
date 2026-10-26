@@ -78,17 +78,57 @@ class LLMOverProviders(unittest.TestCase):
         log = []
         b = P.Budget(0.0005)
         llm = L.LLM("anthropic", "claude-haiku-5-5", budget=b, key_env="LS_FAKE_KEY", transport=fake(log))
-        llm.complete("x")                                      # 0.0002 spent
-        llm.complete("x")
-        llm.complete("x")                                      # 0.0006 >= cap now
+        llm.complete("x", max_tokens=16)                       # 0.0002 spent
+        llm.complete("x", max_tokens=16)
+        llm.complete("x", max_tokens=16)                       # 0.0006 >= cap now
         with self.assertRaises(L.LLMError):
-            llm.complete("x")
+            llm.complete("x", max_tokens=16)
         self.assertEqual(len(log), 3)                          # the 4th never hit the wire
         u = L.LLM("anthropic", "some-unpriced-model", budget=P.Budget(1.0), key_env="LS_FAKE_KEY",
                   transport=fake([]))
         with self.assertRaises(L.LLMError) as cm:
             u.complete("x")
         self.assertIn("no price entry", str(cm.exception))
+
+    def test_preflight_refuses_a_call_whose_worst_case_exceeds_the_remaining_cap(self):
+        # cc QA generation overshot its $1.00 gen cap ($1.0131): the check ran only after the call
+        log = []
+        b = P.Budget(1.00)
+        llm = L.LLM("anthropic", "claude-sonnet-5-5", role="qa_generator", budget=b, key_env="LS_FAKE_KEY",
+                    transport=fake(log))
+        b.charge(0.99)                                         # $0.01 left
+        prompt = "x" * 3000                                    # ~1000 tok x $2 + 4096 x $10 per MTok = ~$0.043
+        w = llm.worst_case([{"role": "user", "content": prompt}], 4096)
+        self.assertGreater(w, 0.04)
+        self.assertGreater(w, b.remaining)
+        with self.assertRaises(L.LLMError) as cm:
+            llm.complete(prompt, max_tokens=4096)
+        self.assertIn("refusing", str(cm.exception))
+        self.assertEqual(log, [])                              # never reached the wire
+        self.assertEqual(b.reserved, 0.0)
+        llm.complete("x", max_tokens=100)                      # a small call still fits ($0.00104)
+        self.assertEqual(len(log), 1)
+        self.assertEqual(b.reserved, 0.0)
+
+    def test_worst_case_is_cache_aware_and_tiered(self):
+        prof = P.load_profile("anthropic")
+        msgs = [{"role": "system", "content": "s" * 30000}, {"role": "user", "content": "q"}]
+        plain = P.worst_case_cost(prof, "claude-sonnet-5-5", msgs, 1000, use_cache=False)
+        cached = P.worst_case_cost(prof, "claude-sonnet-5-5", msgs, 1000, use_cache=True)
+        self.assertGreaterEqual(cached, plain)                 # cache write is dearer than plain input
+        pt = P.estimate_prompt_tokens(msgs)
+        self.assertAlmostEqual(plain, prof.cost_usd("claude-sonnet-5-5", pt, 1000))
+        self.assertIsNone(P.worst_case_cost(prof, "no-such-model", msgs, 10))
+        self.assertAlmostEqual(P.worst_case_cost(prof, "m", msgs, 10, price_override=(1.0, 2.0)),
+                               (pt * 1.0 + 10 * 2.0) / 1e6)
+
+    def test_chat_reserves_in_flight_worst_case(self):
+        b = P.Budget(0.01)
+        b.reserve(0.008)
+        with self.assertRaises(P.BudgetExceeded):
+            b.reserve(0.003)
+        b.release(0.008)
+        b.reserve(0.003)
 
     def test_price_override_and_single_source(self):
         llm = L.LLM("anthropic", "claude-haiku-5-5", key_env="LS_FAKE_KEY", price=(1.0, 2.0),

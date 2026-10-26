@@ -179,10 +179,10 @@ class BudgetAndChat(unittest.TestCase):
     def test_budget_exhaustion_stops_before_the_call(self):
         p = P.load_profile("anthropic")
         tr = FakeTransport()
-        b = P.Budget(0.001)           # one judge call costs 0.003
-        P.chat("judge", [], profile=p, budget=b, environ=self.env, transport=tr)
+        b = P.Budget(0.0011)          # worst case of a 100-token call ~0.00104 passes; the fake reply costs 0.003
+        P.chat("judge", [], profile=p, budget=b, max_tokens=100, environ=self.env, transport=tr)
         with self.assertRaises(P.BudgetExceeded):
-            P.chat("judge", [], profile=p, budget=b, environ=self.env, transport=tr)
+            P.chat("judge", [], profile=p, budget=b, max_tokens=100, environ=self.env, transport=tr)
         self.assertEqual(len(tr.calls), 1)
 
     def test_unpriced_model_cannot_be_budgeted(self):
@@ -354,12 +354,12 @@ class JudgeCli(unittest.TestCase):
     def test_budget_is_mandatory_and_hard(self):
         rcode, _, _, _ = self._run(["--profile", "anthropic", "--allow-same-family-judge"], FakeTransport())
         self.assertIn("budget-usd", str(rcode))
-        # one Sonnet call costs 0.003; a 0.004 cap allows two calls then stops
+        # a cap below the worst case of the very first call refuses it BEFORE the wire (pre-flight)
         tr = FakeTransport()
         rcode, log, _, _ = self._run(["--profile", "anthropic", "--allow-same-family-judge",
                                       "--budget-usd", "0.0001"], tr)
-        self.assertIn("exhausted", str(rcode))
-        self.assertEqual(len(tr.calls), 1)
+        self.assertIn("refusing", str(rcode))
+        self.assertEqual(len(tr.calls), 0)
 
     def test_openrouter_cross_family_needs_no_flag(self):
         tr = FakeTransport()

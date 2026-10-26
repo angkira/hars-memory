@@ -108,6 +108,20 @@ class QATests(unittest.TestCase):
         qs, st = G.generate(self.s, llm, **{**KW, "max_calls": 2})
         self.assertLessEqual(llm.calls, 2)
 
+    def test_session_cap_refuses_a_call_whose_worst_case_would_overshoot(self):
+        class Priced(ScriptedLLM):
+            def worst_case(self, prompt, max_tokens):
+                return 0.40                      # every call could cost $0.40
+            def complete(self, prompt, **kw):
+                r = super().complete(prompt, **kw)
+                self.cost += 0.40                # and does
+                return r
+        llm = Priced()
+        qs, st = G.generate(self.s, llm, **{**KW, "budget_usd": 1.00, "max_calls": 40})
+        self.assertEqual(llm.calls, 2)           # 0.40 + 0.40 fit; a third could reach $1.20 > $1.00
+        self.assertLessEqual(llm.cost, 1.00)
+        self.assertEqual(st["cap_refused"], 1)
+
     def test_validate_single_rules(self):
         wins = G.windows_for(self.s, 14000, 3000, 500, False)
         lo, hi = wins[0]

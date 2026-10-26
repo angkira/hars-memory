@@ -37,6 +37,7 @@ import argparse
 import copy
 import dataclasses
 import json
+import math
 import os
 import sys
 import threading
@@ -357,6 +358,7 @@ class Budget:
             raise ProviderError("a positive --budget-usd is required for every paid run")
         self.limit = float(limit_usd)
         self.spent = 0.0
+        self.reserved = 0.0          # worst-case cost of calls in flight
         self.calls = 0
         self.unpriced_calls = 0
         self._lock = threading.Lock()
@@ -370,13 +372,58 @@ class Budget:
                 self.spent += float(usd)
 
     def check(self) -> None:
-        if self.spent >= self.limit:
+        if self.spent + self.reserved >= self.limit:
             raise BudgetExceeded(f"budget ${self.limit:.4f} exhausted (spent ${self.spent:.4f} "
                                  f"over {self.calls} calls)")
 
+    def reserve(self, worst_usd: float | None) -> float:
+        """Pre-flight: refuse a call whose WORST-CASE cost would push spent + in-flight
+        reservations over the cap (the after-the-fact check alone lets a call overshoot).
+        Returns the reserved amount to hand back to release(); None = cannot be estimated."""
+        w = float(worst_usd or 0.0)
+        with self._lock:
+            if self.spent + self.reserved >= self.limit or self.spent + self.reserved + w > self.limit + 1e-12:
+                raise BudgetExceeded(
+                    f"budget ${self.limit:.4f}: refusing a call with worst-case cost ${w:.4f} "
+                    f"(spent ${self.spent:.4f} + in flight ${self.reserved:.4f}, remaining "
+                    f"${max(0.0, self.limit - self.spent - self.reserved):.4f}, {self.calls} calls)")
+            self.reserved += w
+        return w
+
+    def release(self, reserved_usd: float) -> None:
+        with self._lock:
+            self.reserved = max(0.0, self.reserved - float(reserved_usd or 0.0))
+
     @property
     def remaining(self) -> float:
-        return max(0.0, self.limit - self.spent)
+        return max(0.0, self.limit - self.spent - self.reserved)
+
+
+PROMPT_CHARS_PER_TOKEN_WORST = 3.0     # deliberately below the usual 3.6-4: over-estimates tokens
+
+
+def estimate_prompt_tokens(messages: list) -> int:
+    """Conservative (high) prompt-token estimate for the pre-flight cap check."""
+    chars = sum(len(_msg_text(m.get("content"))) for m in messages)
+    return int(math.ceil(chars / PROMPT_CHARS_PER_TOKEN_WORST)) + 16 + 8 * len(messages)
+
+
+def worst_case_cost(profile: "Profile", model: str, messages: list, max_tokens: int, *,
+                    use_cache: bool = False, price_override: tuple | None = None) -> float | None:
+    """Upper bound of one call: prompt estimate x input price + max_tokens x output price.
+    Cache-aware: with caching on the whole prompt is priced as a cache WRITE (the dearest case,
+    reads are cheaper). None when the model has no price (cannot be bounded)."""
+    pt = estimate_prompt_tokens(messages)
+    if price_override is not None and price_override[0] is not None:
+        return (pt * price_override[0] + int(max_tokens) * price_override[1]) / 1e6
+    plain = profile.cost_usd(model, pt, int(max_tokens))
+    if plain is None:
+        return None
+    if use_cache:
+        ttl = str(profile.cache_cfg.get("ttl") or "5m")
+        w = profile.cost_usd(model, 0, int(max_tokens), cache_write=pt, cache_ttl=ttl)
+        return max(plain, w or 0.0)
+    return plain
 
 
 def add_budget_arg(ap: argparse.ArgumentParser, required: bool = False) -> None:
@@ -529,8 +576,6 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
     mid = model or (models or {}).get(role) or profile.default_model(role)
     if not mid:
         raise ProviderError(f"no model for role {role!r} in profile {profile.name}")
-    if budget is not None:
-        budget.check()
     key = resolve_key(profile, key_env, environ)
     eb = dict(extra_body or {})
     eb.update(soft_extra_body or {})
@@ -538,6 +583,22 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
     # only when there is a stable prefix to mark (a system prompt or an explicit prefix): a call
     # with nothing to cache stays on the plain endpoint, byte-identical to the uncached run
     use_cache = use_cache and bool(cache_prefix_chars or any(m.get("role") == "system" for m in messages))
+    reserved = 0.0
+    if budget is not None:
+        # refuse BEFORE the request when its worst case would exceed the remaining cap
+        budget.check()
+        reserved = budget.reserve(worst_case_cost(profile, mid, messages, max_tokens, use_cache=use_cache))
+    try:
+        return _chat_send(role, messages, profile, mid, max_tokens, temperature, top_p, budget, key,
+                          timeout, retries, eb, soft_extra_body, transport, sleep, use_cache,
+                          cache_prefix_chars)
+    finally:
+        if budget is not None:
+            budget.release(reserved)
+
+
+def _chat_send(role, messages, profile, mid, max_tokens, temperature, top_p, budget, key, timeout,
+               retries, eb, soft_extra_body, transport, sleep, use_cache, cache_prefix_chars):
     if use_cache:
         url, headers, body = build_native_request(profile, mid, messages, max_tokens=max_tokens,
                                                   key=key, extra_body=eb,
