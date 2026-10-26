@@ -78,7 +78,7 @@ document, whether to call ``ainsert()`` at all this call:
 A fingerprint is only ever persisted (``store.save()``) for a doc_id once
 BOTH of the following hold: the delete+insert call for its batch completed
 without raising, AND that specific doc_id's ``doc_status`` -- queried
-afterwards via ``rag.doc_status.get_docs_by_status(DocStatus.PROCESSED)``
+afterwards via ``rag.doc_status.get_docs_by_statuses([DocStatus.PROCESSED])``
 (mirroring the doc-selection pattern
 ``LightRAG.apipeline_process_enqueue_documents`` itself uses internally) --
 came back ``PROCESSED``. The insert call not raising is necessary but NOT
@@ -269,11 +269,11 @@ async def _ingest_documents_async(
             # ``doc_status.get_by_id()``, which actually returns raw
             # ``dict[str, Any]`` records (confirmed against
             # ``JsonDocStatusStorage.get_by_ids()``), while
-            # ``get_docs_by_status(es)`` reliably normalises into typed
+            # ``get_docs_by_statuses`` reliably normalises into typed
             # ``DocProcessingStatus`` objects for every backend, per the
             # ``DocStatusStorage`` ABC's own contract.
-            processed_docs = await rag.doc_status.get_docs_by_status(  # type: ignore[attr-defined]
-                DocStatus.PROCESSED
+            processed_docs = await rag.doc_status.get_docs_by_statuses(
+                [DocStatus.PROCESSED]
             )
             processed_ids = set(processed_docs)
             for doc_id in inserted_ids:

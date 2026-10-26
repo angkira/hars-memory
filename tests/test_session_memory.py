@@ -76,12 +76,14 @@ def _write_graphml(path: Path, nodes: list[str]) -> None:
 
 def _make_fake_rag() -> AsyncMock:
     """Minimal LightRAG double for exercising the REAL ingest_documents path."""
-    from lightrag.base import DocStatus
+    from lightrag.base import DocStatus, DocStatusStorage
 
     known: set[str] = set()
 
-    async def fake_get_docs_by_status(status: DocStatus) -> dict[str, Any]:
-        if status is not DocStatus.PROCESSED:
+    async def fake_get_docs_by_statuses(
+        statuses: list[DocStatus], strict: bool = False
+    ) -> dict[str, Any]:
+        if DocStatus.PROCESSED not in statuses:
             return {}
         return {doc_id: object() for doc_id in known}
 
@@ -89,8 +91,8 @@ def _make_fake_rag() -> AsyncMock:
     rag.initialize_storages = AsyncMock(return_value=None)
     rag.finalize_storages = AsyncMock(return_value=None)
     rag.adelete_by_doc_id = AsyncMock(return_value=None)
-    rag.doc_status = AsyncMock()
-    rag.doc_status.get_docs_by_status = AsyncMock(side_effect=fake_get_docs_by_status)
+    rag.doc_status = AsyncMock(spec=DocStatusStorage)
+    rag.doc_status.get_docs_by_statuses = AsyncMock(side_effect=fake_get_docs_by_statuses)
     rag._known_doc_ids = known
     return rag
 
