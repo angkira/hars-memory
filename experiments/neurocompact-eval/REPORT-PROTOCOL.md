@@ -257,7 +257,7 @@ session-graph keyword model: `claude-haiku-5-5` via Anthropic. This DIFFERS from
 glm extractor (`z-ai/glm-5.3-flash`), so graphs are not comparable with any earlier run.
 Gleaning (`HARS_MEMORY_MAX_GLEANING`), chunk size/overlap, `HARS_MEMORY_SESSION_INDEX_BS` and the
 server revision are recorded in the MANIFEST at launch and may not change within the run.
-**Embedder: only the hash bag-of-words shim exists in this environment (HuggingFace is blocked);
+**[Superseded by C.1-3: the owner's real embedder is used for the decision runs.] Embedder: only the hash bag-of-words shim exists in this environment (HuggingFace is blocked);
 it is a frozen configuration and a limitation: retrieval quality of both recall arms (and the
 vector part of the graph arm) is lexical, a real embedding model may change every recall number.**
 
@@ -284,7 +284,7 @@ is the only stratum with inferential endpoints (S4, S5).
 
 **C14. Judge.** One fixed judge for all arms, blind and evidence-grounded as in section 3, with
 the runner's family-refusal intact: the judge must be of a different model family than the agent
-(`claude-haiku-5-5`, family anthropic). **OPEN ISSUE, not resolved here:** in the build
+(`claude-haiku-5-5`, family anthropic). **[Resolved by C.1-2: same-family, different-model judge via the explicit flag, limitation stated.] OPEN ISSUE, not resolved here:** in the build
 environment only `api.anthropic.com` is reachable (`openrouter.ai` is blocked), so every reachable
 judge is the agent's family and `run_chainreplay.py` refuses it by design; `judge_v2.py` also only
 speaks to OpenRouter. The check is not weakened. A non-anthropic judge route (or an explicit
@@ -295,6 +295,68 @@ and be judged later from the archived artifacts.
 recall payload summaries, keyword sources, usage and the exact command line are archived under
 `/mnt/datasets/ft/artifacts/<UTC>-<name>/`. Retrieval is nondeterministic across calls (section
 6): run-time records are authoritative, never offline refetches.
+
+### 4a.1 PROTOCOL AMENDMENT C.1 (2026-10-26, written before any result of the amended design was seen)
+
+Provenance: owner decisions of 2026-10-26 (home runs, vendor-agnostic tooling). Nothing here changes a
+metric, threshold, arm, budget formula or decision rule of C1-C13; it fixes the run configuration
+(C10, C14), the judge-independence exception and the cost rule. Like C, it may not be edited after the
+first amended record exists; a deviation is Amendment D.
+
+**C.1-1. Home-run configuration (supersedes the model lines of C10 and the "only Anthropic is
+reachable" premise of C14).** Profile `anthropic` (`experiments/neurocompact-eval/profiles/anthropic.json`):
+agent / replay / compactor / answer model `claude-haiku-5-5`; HARS extractor and session-graph keyword
+(query) model `claude-haiku-5-5`; judge `claude-sonnet-5-5`. The runs are made by the owner at home on
+the owner's machine. Run with `run_chainreplay.py --profile anthropic --allow-same-family-judge
+--budget-usd <cap>`; the HARS server is started from the output of `providers.py hars-env --profile
+anthropic` (extractor + query endpoint `https://api.anthropic.com/v1`, `HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS=1`
+because Anthropic 5.x rejects temperature/top_p).
+
+**C.1-2. Judge: same family, different model, limitation stated.** The judge `claude-sonnet-5-5` is
+a different MODEL from the agent `claude-haiku-5-5` but the SAME family. The C14 rule (judge family !=
+agent family, refused by default) is NOT weakened: it still refuses by default in `run_chainreplay.py`
+and `judge_v2.py`. The exception is the explicit flag `--allow-same-family-judge`, which (a) requires
+judge model != every agent-side model (agent, answer, summarizer; checked across router id spellings,
+e.g. `claude-haiku-5-5` == `anthropic/claude-haiku-5.5`), (b) prints a loud warning, (c) records
+`judge_same_family: true` and the reason in `run_manifest.json`, the judge `mapping` file and every judged row,
+and (d) makes `metrics_v2.py` print "LIMITATION - SAME-FAMILY JUDGE" in the report header. Consequence,
+to be repeated in the final report: self-preference / shared-bias of the judge toward Haiku-written
+answers is NOT controlled; the evidence-grounded blind design (C14, section 3) and the deterministic
+`clean_anchor_hit` (not judge-dependent) are the mitigations, and the anchor-based endpoints (primary
+rules on `clean_anchor_hit`, S1-S5) are the headline; judge-scored endpoints (score, hallucination) are
+read as "same-family judged". The judge is fixed for the whole decision set.
+
+**C.1-3. Embedder (supersedes the hash-shim line of C10).** The owner's real embedder is used; the
+hash bag-of-words shim was this build container's debugging setup only and is not a valid decision
+configuration. The embedder is independent of the chat profile (Anthropic has no embeddings API) and
+is configured on the HARS server (`HARS_MEMORY_EMBED_*`, see `config/.env.example`). `run_chainreplay.py`
+records the ACTUAL embedder id in `run_manifest.json`: the id the server reports
+(`memory_status.configured_models.embedder`) wins, else `--embedder-id`, else the runner's own env
+(flagged "not verified against the server"); an unknown or hash/shim embedder is flagged loudly and a
+run whose manifest has no real embedder id is not a decision run. The embedder is frozen for the
+decision set (a different id in two merged runs is refused by `merge_runs.py`).
+
+**C.1-4. Vendor-switch rule.** A profile is FROZEN per decision set. Changing the profile (any
+role's vendor or model: agent, extractor, keyword, judge) or the embedder in the middle of a decision
+set is forbidden. A decision set = all runs merged into one `metrics_v2` input; `merge_runs.py` refuses
+to merge runs whose `run_manifest.json` disagree on profile, role models or embedder id, or whose
+`chain_budget` rows disagree on agent model/provider/judge model/tokenizer/per-B caps. Switching to
+`openrouter` or `gemini` (`--profile`, `--model-<role>`; no code change) means a NEW decision set from
+scratch; results across profiles are separate descriptive replications, never pooled. Mixing legacy
+(`nc`) rows with amended rows stays forbidden (C1).
+
+**C.1-5. Cost ceiling.** Every paid script (`run_chainreplay.py`, `judge_v2.py`, and any script that
+adopts `providers.chat`) requires a hard `--budget-usd` cap and refuses to start a live run without
+it. The runner charges measured agent-side usage per assistant turn (profile price table) plus flagged
+ESTIMATES for the server-side HARS extraction and keyword calls (constants `HARS_EXTRACT_IN/OUT`,
+`KEYWORD_IN/OUT`), checks the cap before every pi call and stops at the cap ("BUDGET STOP": no new chain or
+budget cell starts; the aborted chain is written valid=false). B-major order (C6) means a stop still
+leaves the primary B = 1536 cell first. The judge stops before the call that would exceed the cap. The
+cap values are **TBD by the owner** (placeholders: generation run `<GEN_CAP_USD>`, judge run
+`<JUDGE_CAP_USD>`; to be written into the MANIFEST at launch, not into this document after the fact).
+`--dry-run` prints the projection and a BUDGET CHECK against `--budget-usd`. Prices come from the profile
+tables; each entry carries `status` (`confirmed` = web sources and the pi-ai 1.4.0 catalog agree,
+`catalog_only`, `unverified`), source and date, and the status is recorded in the manifest.
 
 ## 5. Measurement stack
 

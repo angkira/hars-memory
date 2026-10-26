@@ -6,6 +6,9 @@
 > nc-graph vs baseline at B=1536. The commands and numbers below this banner are the
 > pre-amendment record; where the two differ, Amendment C wins. All earlier runs are
 > exploratory chunk-RAG and are not in the decision set.
+> **AMENDMENT C.1 (2026-10-26, owner home runs) governs the run configuration: provider profile
+> `anthropic`, judge via `--allow-same-family-judge`, real embedder recorded in the manifest, hard
+> `--budget-usd`. See the last section of this file.**
 
 Protocol owner notes, 2026-10-25. Design follows the external review (argon_answer_r1.md):
 10 chains x C=3 chained compactions, ask only after C3, arms `baseline` / `nc` / `nc-note-only`,
@@ -253,9 +256,9 @@ Full text and rationale: REPORT-PROTOCOL.md section 4a (C1-C15). Operational for
 - Dataset: OpenHands SWE-bench Verified rebuild, 14 independent sessions, <= 3 per repo, QA on
   transcript specifics (never the SWE-bench fix), `qtype = multihop` secondary stratum.
   `MIN_CHAINS = 8` distinct sessions.
-- Judge: different family from the agent, enforced by the runner. **OPEN: no non-anthropic judge is
-  reachable from the build environment (see REPORT-PROTOCOL.md C14); do not run the judge until
-  resolved; do not weaken the check.**
+- Judge: different family from the agent, enforced by the runner. **RESOLVED by Amendment C.1 (below):
+  same-family but different-model judge only through the explicit `--allow-same-family-judge` flag; the
+  default refusal is unchanged.**
 
 ## Launch (after the owner sets the cost ceiling; every command preceded by `--dry-run`)
 
@@ -289,3 +292,57 @@ first third of the run (B-major order), so a budget stop still leaves a decision
   baseline` @1536; S5 multi-hop `nc-graph - nc-chunks` @1536. Non-inferiority margins: clean
   anchor 0.10 AND score 0.15 (both must hold; p = max). Underpowered (< 8 sessions) = INCONCLUSIVE.
 - `nc-chunks` is a descriptive ablation; legacy runs are exploratory.
+
+
+# AMENDMENT C.1 (2026-10-26) — vendor-agnostic home runs
+
+Full text: REPORT-PROTOCOL.md section 4a.1. Tooling: `scripts/providers.py` + `profiles/*.json`.
+
+## One flag switches the vendor (frozen per decision set)
+
+| profile | agent / answer / summarizer / extractor / keyword | judge | key env | pi provider |
+|---|---|---|---|---|
+| `anthropic` (first runs) | `claude-haiku-5-5` | `claude-sonnet-5-5` (same family: needs the flag) | `ANTHROPIC_API_KEY` | `anthropic` |
+| `openrouter` | `anthropic/claude-haiku-5.5` | `openai/gpt-6-luna` (cross-family) | `OPENROUTER_API_KEY` | `openrouter` |
+| `gemini` | `gemini-3.7-flash` | `gemini-3.1-pro-preview` (same family: needs the flag) | `GEMINI_API_KEY` | `google` |
+| `custom` | `--model-<role>` for every role | `--model-judge` | `--key-env VAR` (default `EVAL_API_KEY`) | `--pi-provider` |
+
+Per-role override on `run_chainreplay.py` / `judge_v2.py`: `--model-agent|answer|summarizer|judge|extractor|keyword ID`
+(legacy `--agent-model/--qa-model/--sum-model/--judge-model/--extractor-model` are aliases);
+`--key-env VAR` reads the key from VAR (value never printed); `--provider NAME` is the legacy alias
+(agent side only, role defaults as before). `providers.py show --profile NAME` prints the table with prices.
+
+## Launch (owner, home machine)
+
+```
+# 1. HARS server env for the SAME profile (extractor + keyword/query LLM), then start/reconnect the server
+python3 scripts/providers.py hars-env --profile anthropic      # prints export lines (key as "$ANTHROPIC_API_KEY")
+#    + your real embedder: HARS_MEMORY_EMBED_MODEL=... (record is taken from the server, see manifest)
+export ANTHROPIC_API_KEY=...                                    # never print or log it
+# 2. projection and cap check (zero spend)
+python3 scripts/run_chainreplay.py --dry-run --profile anthropic --allow-same-family-judge \
+  --chains chains.jsonl --mem-budgets 1536,1024,512 --budget-usd <GEN_CAP_USD> --mcp http://127.0.0.1:<port>/mcp
+# 3. generation run (archive dir per CLAUDE.md)
+python3 scripts/run_chainreplay.py --profile anthropic --allow-same-family-judge --budget-usd <GEN_CAP_USD> \
+  --chains chains.jsonl --mem-budgets 1536,1024,512 --out /mnt/datasets/ft/artifacts/<UTC>-nc-amC1/run \
+  --mcp http://127.0.0.1:<port>/mcp --require-no-clip
+# 4. merge (refuses mixed profile/embedder/legacy), export, judge, metrics, funnel
+python3 scripts/merge_runs.py --out <merged> --chains chains.jsonl <run1> [<run2> ...]
+python3 scripts/export_judge_input.py --records "<merged>/records.jsonl" --chains chains.jsonl --out <merged>/judge-input.jsonl
+python3 scripts/judge_v2.py --in <merged>/judge-input.jsonl --profile anthropic --allow-same-family-judge \
+  --budget-usd <JUDGE_CAP_USD> --out <merged>/judged.jsonl --mapping <merged>/judge-mapping.json
+python3 scripts/metrics_v2.py --records <merged>/records.jsonl --judge <merged>/judged.jsonl \
+  --mapping <merged>/judge-mapping.json --judge-input <merged>/judge-input.jsonl \
+  --json <merged>/metrics.json --out REPORT-chains.md          # header prints the same-family limitation
+python3 scripts/funnel_chains.py --run <merged> --chains chains.jsonl --graph-store <hars-data>/sessions
+```
+
+- `--budget-usd` is mandatory for a live run (values TBD by the owner). The runner stops at the cap
+  (BUDGET STOP); spend (measured pi usage + flagged estimates of server-side extraction / keyword
+  calls) is in `run_manifest.json`.
+- `run_manifest.json` (per run, copied by `merge_runs.py`): profile, per-role models, price entries with
+  status, `judge_same_family` + reason, embedder id (server-reported wins), HARS mcp url, arms, budgets, cap, spend.
+- A different profile or embedder = a new decision set (C.1-4); `merge_runs.py` refuses the mix.
+- Gemini via its OpenAI-compatible endpoint (`https://generativelanguage.googleapis.com/v1beta/openai`,
+  plain chat/completions, Bearer key) for `judge_v2.py` / `providers.chat`; the pi agent uses pi's native
+  `google` provider (`GEMINI_API_KEY`). Not exercised live here (no key).

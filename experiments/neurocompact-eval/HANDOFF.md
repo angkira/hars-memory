@@ -23,10 +23,20 @@ RUNBOOK-gate.md "AMENDMENT C". Consequences for everything below this section:
   `scripts/m3_anchor_report.py`, tests in `scripts/tests/test_amendment_c.py`. The server side
   (`session_graph` flag, `keyword_source`) is `hars_memory/mcp_server.py` (other agent); the
   dataset side (`import_openhands.py`, `select_openhands.py`, `oh_pipeline.py`) is another agent.
-- Environment facts of the amended run: agent/answer/extractor `claude-haiku-5-5` via Anthropic
-  (`pi --provider anthropic`); embedder = hash bag-of-words shim (HF blocked) — frozen limitation;
-  only `api.anthropic.com` is reachable (openrouter.ai blocked).
-- **OPEN ISSUES (owner):** (1) JUDGE FAMILY: every reachable judge is anthropic = the agent's
+- Environment facts of the amended run: agent/answer/extractor/keyword `claude-haiku-5-5` via Anthropic
+  (`--profile anthropic`, `pi --provider anthropic`); judge `claude-sonnet-5-5` (same family, flag).
+  Build container: only `api.anthropic.com` reachable, hash-shim embedder = debugging only. DECISION
+  runs are the owner's, at home, with the real embedder (recorded in run_manifest.json; C.1-3).
+- **UPDATE 2026-10-26 (Amendment C.1, owner decisions):** (1) JUDGE FAMILY resolved: judge
+  `claude-sonnet-5-5` (same family, different model) via `--allow-same-family-judge`, default refusal
+  unchanged, limitation printed by metrics_v2; `judge_v2.py` is provider-profile driven now. (2)
+  `merge_runs.py` / `funnel_chains.py` updated for the 4-arm, per-B shape. (3) Cost ceiling: hard
+  `--budget-usd` on every paid script, VALUE STILL TBD BY THE OWNER. Vendor-agnostic tooling:
+  `scripts/providers.py` + `profiles/{anthropic,openrouter,gemini,custom}.json`, `--profile`,
+  `--model-<role>`, `providers.py hars-env --profile NAME` for the server. Owner runs at home with the
+  real embedder (hash shim = container debugging only); runner writes `run_manifest.json`. A profile
+  is frozen per decision set. See RUNBOOK-gate.md "AMENDMENT C.1". Remaining items below.
+- **OPEN ISSUES (owner), original list (1)-(3) now resolved as above:** (1) JUDGE FAMILY: every reachable judge is anthropic = the agent's
   family and the runner refuses it (not weakened); `judge_v2.py` only speaks OpenRouter. Need a
   non-anthropic judge route or an explicit amendment. (2) `merge_runs.py` and `funnel_chains.py`
   still hard-code arms `nc` / dir `nc` and the 3-arm shape: they need the nc-chunks/nc-graph
