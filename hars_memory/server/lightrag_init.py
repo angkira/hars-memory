@@ -288,6 +288,16 @@ def make_llm_func(
             part.strip() for part in _stop_env.split(",") if part.strip()
         ] or None
 
+    # HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS (1/true/yes/on; default off): leave
+    # ``temperature`` and ``top_p`` out of every request. Anthropic's
+    # OpenAI-compatible endpoint answers 400 for ``temperature`` on
+    # claude-haiku-5-5 / claude-sonnet-5-5. Applies to the configured value, to
+    # per-call values forwarded by LightRAG and to static extra_body entries.
+    omit_sampling_params = os.environ.get(
+        "HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    _SAMPLING_PARAMS = ("temperature", "top_p")
+
     # llama-server (llama.cpp) does not check bearer auth at all, but
     # create_openai_async_client falls back to os.environ["OPENAI_API_KEY"]
     # (raising KeyError if unset) whenever api_key is falsy, so this must
@@ -366,15 +376,20 @@ def make_llm_func(
             **{k: v for k, v in forwarded.items() if k not in _NAMED_PARAMS},
         }
 
+        request_kwargs: dict[str, object] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": call_max_tokens,
+            "stop": call_stop,
+        }
+        if omit_sampling_params:
+            extra_body = {k: v for k, v in extra_body.items() if k not in _SAMPLING_PARAMS}
+        else:
+            request_kwargs["temperature"] = call_temperature
+        request_kwargs["extra_body"] = extra_body or None
+
         async def _complete_once() -> str:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=call_max_tokens,
-                temperature=call_temperature,
-                stop=call_stop,
-                extra_body=extra_body or None,
-            )
+            response = await client.chat.completions.create(**request_kwargs)
             message = response.choices[0].message
             usage = getattr(response, "usage", None)
             LLM_USAGE["calls"] += 1
