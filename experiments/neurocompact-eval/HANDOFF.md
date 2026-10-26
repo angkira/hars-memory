@@ -31,8 +31,8 @@ RUNBOOK-gate.md "AMENDMENT C". Consequences for everything below this section:
   non-anthropic judge route or an explicit amendment. (2) `merge_runs.py` and `funnel_chains.py`
   still hard-code arms `nc` / dir `nc` and the 3-arm shape: they need the nc-chunks/nc-graph
   update (C11) before use on amended runs. (3) Cost ceiling for the ~30x run (RUNBOOK). (4)
-  `evidence_spans` schema for multi-hop items is an interface assumption (runner checks each leg)
-  until the dataset agent fixes it. (5) M3 deviation: one memory_compact call per compaction (not
+  multi-hop items: the runner's `check_alignment` verifies every `evidence_spans` leg
+  (`{span_idx, evidence}`), matching `scripts/multihop.py` (`qtype="multihop"`). (5) M3 deviation: one memory_compact call per compaction (not
   per piece) — see C9; confirm. (6) Keyword token usage is only counted if the server reports it
   (`session_graph.keyword_usage`); otherwise a flagged estimate is used.
 - Run-artifact rule (CLAUDE.md): archive every amended run under
