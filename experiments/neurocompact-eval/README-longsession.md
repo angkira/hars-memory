@@ -17,8 +17,8 @@ Claude Code *.jsonl --import_claude_code.py ---+--> longsession/1 sessions --gen
 | `longsession.py` | the format (docstring = spec), IO/validation, token counting, arm-independent boundary computation, provider-agnostic LLM client (openrouter / anthropic / mock), lazy shim to `run_chainreplay.py` |
 | `import_beam.py` | BEAM `chats/<size>/<n>/chat.json` + `probing_questions.json` -> sessions. json only (never pickles), run with `python3 -I`. Keeps information_extraction (-> `single`), knowledge_update, temporal_reasoning, multi_session_reasoning (-> `multihop`), contradiction_resolution; other types dropped and counted (`--types all` keeps them). Evidence = `source_chat_ids` mapped to message indices |
 | `import_claude_code.py` | Claude Code transcripts -> sessions: user/assistant text, tool_use+tool_result merged into one `tool` message (import_opencode format), `compact_boundary` + compact-summary user line -> `compactions[{at_idx, original_summary}]`, sidechains excluded (flag to include), parentUuid ordering with dead-branch and parallel-tool-result handling, resumed files merged, **secret redaction on by default** with a count report |
-| `ls_redact.py` | the redaction pass (sk-, sk-ant-, sk-or-v1, ghp_/github_pat_, glpat-, AWS keys, PEM private keys, JWT, bearer, `password=`/`token=` assignments) |
-| `gen_longsession_qa.py` | single + multihop QA across compaction windows for sessions without questions; verbatim-evidence gates (reuses `multihop.validate_multihop` + `make_chains` helpers); full prompt/answer log in `qa-raw.jsonl` |
+| `ls_redact.py` | the redaction pass (sk-, sk-ant-, sk-or-v1, ghp_/github_pat_, glpat-, AWS keys, PEM private keys, JWT, bearer; `NAME=value` assignments only when NAME has a secret-like word segment (token/secret/password/api_key/auth/bearer/credential...) AND the value looks like a secret: >= 12 chars, mixed classes, entropy; `tokenizer=tiktoken:cl100k_base`, model ids, paths, URLs stay). Per-pattern counts are reported; `home_run bundle` uses the same module |
+| `gen_longsession_qa.py` | QA for sessions without questions. Default `--mode menu`: per compaction window the code pre-extracts window-unique anchors with verbatim >= 8-word evidence, the model only phrases questions (~2 single per window up to 40, ~10 multihop via a code-verified shared entity, a few unanswerable probes verified absent); worst-case budget pre-check before every call. `--mode legacy`: free-text excerpts + post-hoc gates. Full prompt/answer log in `qa-raw.jsonl` |
 | `run_longsession.py` | the runner (below) |
 | `export_longsession_judge.py` | run_longsession records + the session files -> `judge_v2` input: blind, one +-500-char evidence window per hop, BEAM `rubric` reaches the judge, `visible_context` (memory + recall + verbatim tail, question/answer excluded), memory channel fields dropped, `metrics_v2.validate_rows` filter |
 | `home_run.py` | the owner's single entry point (HOME-RUNBOOK.md): doctor / dry-run / smoke / oh / beam / cc / bundle |
@@ -128,7 +128,7 @@ python3 scripts/metrics_v2.py --records <run>/records.jsonl --judge <run>/judged
 # your own Claude Code sessions (redacted), QA generated, real compactions, orig arm, lag analysis (descriptive)
 python3 -I scripts/import_claude_code.py ~/.claude/projects/<proj> --out data/cc --min-tokens 300000
 ANTHROPIC_API_KEY=... python3 scripts/gen_longsession_qa.py --sessions data/cc --out data/cc-qa --profile anthropic \
-    --use-real-compactions --n-single 20 --n-multihop 8 --budget-usd 10
+    --use-real-compactions --n-single 40 --n-multihop 10 --budget-usd 3   # menu mode; --dry-run first
 python3 scripts/run_longsession.py --sessions data/cc-qa --use-real-compactions --checkpoints every:3 --dry-run
 ```
 

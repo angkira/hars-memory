@@ -38,8 +38,8 @@ Mapping to longsession/1
   * compactions: one per compact_boundary; ``at_idx`` = number of messages before it,
     ``original_summary`` = the following isCompactSummary text (kept in full), ``auto`` and
     ``pre_tokens`` from compactMetadata.
-  * REDACTION is ON by default (ls_redact.py: sk-, sk-ant-, sk-or-v1, ghp_, glpat-, AWS keys,
-    PRIVATE KEY blocks, password=/token= assignments). The per-kind count report is printed and
+  * REDACTION is ON by default (ls_redact.py: sk-, sk-ant-, sk-or-v1, ghp_, glpat-, AWS keys, secret-keyed high-entropy assignments,
+    PRIVATE KEY blocks). The per-kind count report is printed and
     stored in meta.redaction. ``--no-redact`` turns it off (the output is then as private as the
     transcript). Review the report, keep the output out of git.
   * No questions: run gen_longsession_qa.py on the output.
