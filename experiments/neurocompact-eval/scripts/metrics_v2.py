@@ -41,6 +41,20 @@ anchor_hit is reported two ways (gate-212839 forensics, defect 2):
 
 Deltas are always ``first arm minus second arm`` in the pair name.
 
+LONG-SESSION TRACK (Amendment C.2; records of run_longsession.py, auto-detected through
+``base_qid`` or forced with ``--track longsession``): the same machinery, plus
+  * arms may include ``orig`` (the session's own real summary; real boundaries only, reference
+    B only): kept as a descriptive side arm, never required for a complete arm set;
+  * clustering by the record's ``cluster_session`` (the sid; no ``_cN`` stripping);
+  * mid-run checkpoints carry ``qid = <qid>@c<j>``: ``checkpoint`` / ``base_qid`` are recovered
+    from the qid when the record lacks them; per-lag-bucket and end-vs-mid tables;
+  * strata by question type (BEAM ``source_qtype`` names; ``multi_session_reasoning`` is the
+    genuine multi-hop stratum) with paired nc-graph - baseline contrasts;
+  * secondary family L1-L5 (Holm, m = 5) instead of S1-S3; ``--include-sid/--exclude-sid``
+    select the analysis set (e.g. ``^beam-1M-`` : BEAM sizes are never pooled);
+  * ``--legacy-qtypes`` restores the pre-C.2 reading of ``qtype = "multihop"`` (OpenHands items
+    are otherwise analysed as ``xspan_locator``, see qtypes.py).
+
 Usage:
   python3 metrics_v2.py --records fixtures_metrics_win.jsonl --out win.md
   python3 metrics_v2.py --records runs/R/records.jsonl --judge runs/R/judged.jsonl \
@@ -59,6 +73,7 @@ import sys
 from collections import Counter, defaultdict
 
 from judge_v2 import anchor_re as token_bounded_re   # identical anchor semantics
+import qtypes as QT                                   # Amendment C.2 relabel (analysis-time)
 
 BOOT_N = 10000
 SEED = 1337
@@ -73,16 +88,25 @@ REQUIRED_ARMS = ("baseline", "nc-chunks", "nc-graph", "nc-note-only")
 LEGACY_REQUIRED_ARMS = ("baseline", "nc-chunks", "nc-note-only")
 PRIMARY_B = 1536                 # the only budget with a WIN/FAIL verdict
 LEGACY_B = 1536                  # records without mem_budget
-MULTIHOP_TYPES = ("multihop", "multi_hop", "multi-hop", "cross_compaction",
-                  "cross-compaction", "xcompaction")
+MULTIHOP_TYPES = QT.LEGACY_MULTIHOP        # stored (pre-C.2) labels; analysed as xspan_locator
+SIDE_ARMS = ("orig",)             # descriptive arms: kept when present, never required
+QTYPE_LEGACY = False              # --legacy-qtypes: read stored "multihop" as multihop (pre-C.2)
+LS_LAG_BUCKETS = ((0, 0, "0"), (1, 1, "1"), (2, 3, "2-3"), (4, 7, "4-7"), (8, 15, "8-15"),
+                  (16, 10 ** 9, "16+"))
 KEYWORD_IN_EST, KEYWORD_OUT_EST = 450.0, 80.0   # nc-graph keyword call, used only when the
                                                 # server reported no usage (flagged)
 ALPHA_ONE_SIDED = 0.025          # family-wise, = the two-sided 95% CIs used everywhere
 NI_MARGIN_ANCHOR = 0.10          # non-inferiority margins (Amendment C, frozen)
 NI_MARGIN_SCORE = 0.15
 H_GRAPH_MIN_ANCHOR = 0.05        # "graph helps" practical threshold on clean_anchor_hit
-SECONDARY_IDS = ("S1_graph_vs_chunks", "S2_ni_1024", "S3_ni_512", "S4_multihop_vs_baseline",
-                 "S5_multihop_graph_vs_chunks")
+# Amendment C.2: the chain track's Holm family is S1-S3 (m = 3); S4/S5 on the OpenHands
+# "multihop" (= xspan_locator) items are DESCRIPTIVE. The long-session track has its own
+# fixed family L1-L5 (m = 5), genuine multi-hop = BEAM multi_session_reasoning.
+SECONDARY_IDS = ("S1_graph_vs_chunks", "S2_ni_1024", "S3_ni_512")
+DESCRIPTIVE_IDS = ("S4d_xspan_locator_vs_baseline", "S5d_xspan_locator_graph_vs_chunks")
+LS_SECONDARY_IDS = ("L1_graph_vs_chunks", "L2_ni_1024", "L3_ni_512", "L4_msr_vs_baseline",
+                    "L5_msr_graph_vs_chunks")
+LS_DESCRIPTIVE_STRATA = ("knowledge_update", "temporal_reasoning", "contradiction_resolution")
 
 
 def canon_arm(arm):
@@ -118,6 +142,8 @@ FIELD_ALIASES = {
     "primed_hit": ("primed_hit",),
     "mem_budget": ("mem_budget",),
     "qtype": ("qtype", "question_type"),
+    "base_qid": ("base_qid",),
+    "checkpoint": ("checkpoint",),
 }
 
 
@@ -227,7 +253,7 @@ def validate_rows(rows: list[dict], arms=None) -> tuple[list[dict], dict]:
         have[(pick(r, "qid"), row_budget(r))].add(canon_arm(pick(r, "arm")))
     incomplete = {q: sorted(set(arms) - a) for q, a in have.items() if set(arms) - a}
     final = [r for r in kept if (pick(r, "qid"), row_budget(r)) not in incomplete
-             and canon_arm(pick(r, "arm")) in arms]
+             and canon_arm(pick(r, "arm")) in tuple(arms) + SIDE_ARMS]
     budgets_in = {row_budget(r) for r in rows}
     report = {
         "rows_in": len(rows), "rows_kept": len(final),
@@ -242,6 +268,7 @@ def validate_rows(rows: list[dict], arms=None) -> tuple[list[dict], dict]:
             ((str(q) if b == LEGACY_B and len(budgets_in) == 1 else f"{q}@B{b}"), m)
             for (q, b), m in incomplete.items())),
         "required_arms": list(arms),
+        "side_arms_kept": sorted({canon_arm(pick(r, "arm")) for r in final} & set(SIDE_ARMS)),
         "legacy_arm_set": tuple(arms) == LEGACY_REQUIRED_ARMS,
         "budgets": sorted(budgets_in),
     }
@@ -258,6 +285,26 @@ def validity_lines(rep: dict) -> list[str]:
     for q, missing in rep["incomplete_qids"].items():
         out.append(f"  dropped qid {q}: missing arm(s) {', '.join(map(str, missing))}")
     return out
+
+
+_CP_RE = re.compile(r"@c(\d+)$")
+
+
+def split_qid(qid, rec: dict | None = None) -> tuple[str | None, int | None]:
+    """(base_qid, checkpoint j) of a long-session qid: ``<qid>@c<j>`` is a mid-run checkpoint
+    row; a plain qid is the end row (checkpoint taken from the record, else None)."""
+    rec = rec or {}
+    q = None if qid is None else str(qid)
+    m = _CP_RE.search(q) if q else None
+    base = pick(rec, "base_qid") or (q[:m.start()] if m else q)
+    cp = pick(rec, "checkpoint")
+    if cp is None and m:
+        cp = int(m.group(1))
+    try:
+        cp = None if cp is None else int(cp)
+    except (TypeError, ValueError):
+        cp = None
+    return base, cp
 
 
 def normalize(rec: dict) -> dict:
@@ -289,10 +336,20 @@ def normalize(rec: dict) -> dict:
     ask_lat = as_float(pick(rec, "ask_latency_s"))
     if ask_lat is None and lat is not None:
         ask_lat = lat + (rsec or 0.0)
+    base_qid, checkpoint = split_qid(qid, rec)
+    nb = rec.get("n_boundaries")
     sparse = {
         "rid": rid, "qid": qid, "arm": arm,
         "chain_id": chain_id,
-        "cluster_session": session_of(chain_id),
+        # long-session records name their cluster explicitly (the sid); chain records strip _cN
+        "cluster_session": (str(rec["cluster_session"]) if rec.get("cluster_session")
+                            else (str(chain_id) if "base_qid" in rec else session_of(chain_id))),
+        "base_qid": base_qid, "checkpoint": checkpoint,
+        "n_boundaries": int(nb) if isinstance(nb, (int, float)) else None,
+        "is_end": (as_bool(rec.get("is_end")) if rec.get("is_end") is not None
+                   else ((not _CP_RE.search(str(qid))) if "base_qid" in rec else None)),
+        "source": rec.get("source"),
+        "rubric_hit_frac": as_float(rec.get("rubric_hit_frac")),
         "session_id": pick(rec, "session_id"),
         "span_idx": pick(rec, "span_idx"), "lag": pick(rec, "lag"),
         "slice": (pick(rec, "slice") or "").upper() or None,
@@ -314,7 +371,10 @@ def normalize(rec: dict) -> dict:
         "tokens_out": as_float(pick(rec, "tokens_out")),
         "cost_source": "usd" if as_float(pick(rec, "cost_usd")) is not None else None,
         "mem_budget": row_budget(rec),
-        "qtype": (str(pick(rec, "qtype")).strip().lower() if pick(rec, "qtype") else None),
+        # Amendment C.2: stored "multihop" (OpenHands) is analysed as xspan_locator; BEAM items
+        # carry their source_qtype as the stratum; --legacy-qtypes restores the stored label
+        "qtype": QT.canon_qtype(pick(rec, "qtype"), rec.get("source_qtype"), QTYPE_LEGACY),
+        "qtype_stored": (str(pick(rec, "qtype")).strip().lower() if pick(rec, "qtype") else None),
         # nc-graph readout (None on the other arms)
         "keyword_source": rec.get("keyword_source"),
         "kg_empty": as_bool(rec.get("kg_empty")),
@@ -835,14 +895,21 @@ def h_graph_label(d_anchor: dict, d_score: dict) -> str:
 
 
 def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: int,
-                     seed: int, n_sessions: int, primary_b: int = PRIMARY_B) -> dict:
-    """The pre-registered secondary family (m = 5), Holm-corrected at one-sided
-    ALPHA_ONE_SIDED. All tests use cluster bootstrap over sessions and the SAME metric
-    (clean_anchor_hit; raw anchor_hit only on the loud fallback), except the
-    non-inferiority tests, which are intersection-union over anchor AND score
-    (p = max of the two)."""
+                     seed: int, n_sessions: int, primary_b: int = PRIMARY_B,
+                     track: str = "chains") -> dict:
+    """The pre-registered secondary family, Holm-corrected at one-sided ALPHA_ONE_SIDED.
+    All tests use cluster bootstrap over sessions and the SAME metric (clean_anchor_hit; raw
+    anchor_hit only on the loud fallback), except the non-inferiority tests, which are
+    intersection-union over anchor AND score (p = max of the two).
+
+    track "chains" (Amendment C + C.2): S1-S3 (m = 3); S4d/S5d are DESCRIPTIVE contrasts on the
+    xspan_locator stratum (the OpenHands "multihop" items) and never enter the correction.
+    track "longsession" (C.2): L1-L5 (m = 5), genuine multi-hop = multi_session_reasoning;
+    knowledge_update / temporal_reasoning / contradiction_resolution strata are descriptive."""
     G, C, Bz = "nc-graph", "nc-chunks", "baseline"
     tests: dict[str, dict] = {}
+    ls = track == "longsession"
+    msr = QT.GENUINE_MULTIHOP
 
     def sup(tid, desc, a, b, qtypes=None, metric=None, theta0=0.0):
         metric = metric or anchor_key
@@ -857,7 +924,7 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
             "score_point": sc and sc["point"], "score_ci_lo": sc and sc["ci_lo"],
             "p": boot_p_le(m["values"], theta0, n_boot, seed) if m else None,
             "label": h_graph_label(d["metrics"].get(anchor_key, {}), d["metrics"].get("score", {}))
-            if tid == "S1_graph_vs_chunks" else None,
+            if tid in ("S1_graph_vs_chunks", "L1_graph_vs_chunks") else None,
         }
 
     def ni(tid, desc, a, b):
@@ -881,19 +948,35 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
             "margins": {"anchor": NI_MARGIN_ANCHOR, "score": NI_MARGIN_SCORE},
         }
 
-    sup("S1_graph_vs_chunks", "H-graph: nc-graph - nc-chunks, B=1536, anchor, H0 delta<=0",
+    ids = LS_SECONDARY_IDS if ls else SECONDARY_IDS
+    p1 = ids[0]
+    sup(p1, "H-graph: nc-graph - nc-chunks, B=1536, anchor, H0 delta<=0",
         (G, primary_b), (C, primary_b))
-    ni("S2_ni_1024", "token saving: nc-graph@1024 non-inferior to baseline@1536",
+    ni(ids[1], "token saving: nc-graph@1024 non-inferior to baseline@1536",
        (G, 1024), (Bz, primary_b))
-    ni("S3_ni_512", "token saving: nc-graph@512 non-inferior to baseline@1536",
+    ni(ids[2], "token saving: nc-graph@512 non-inferior to baseline@1536",
        (G, 512), (Bz, primary_b))
-    sup("S4_multihop_vs_baseline", "multi-hop stratum: nc-graph - baseline, B=1536, anchor",
-        (G, primary_b), (Bz, primary_b), qtypes=MULTIHOP_TYPES)
-    sup("S5_multihop_graph_vs_chunks", "multi-hop stratum: nc-graph - nc-chunks, B=1536, anchor",
-        (G, primary_b), (C, primary_b), qtypes=MULTIHOP_TYPES)
-    adj = holm_adjust({k: tests[k]["p"] for k in SECONDARY_IDS})
+    descriptive: list[str] = []
+    if ls:
+        sup(ids[3], "genuine multi-hop (multi_session_reasoning): nc-graph - baseline, B=1536, anchor",
+            (G, primary_b), (Bz, primary_b), qtypes=msr)
+        sup(ids[4], "genuine multi-hop (multi_session_reasoning): nc-graph - nc-chunks, B=1536, anchor",
+            (G, primary_b), (C, primary_b), qtypes=msr)
+        for qt in LS_DESCRIPTIVE_STRATA:
+            tid = f"D_{qt}_vs_baseline"
+            sup(tid, f"descriptive stratum {qt}: nc-graph - baseline, B=1536, anchor",
+                (G, primary_b), (Bz, primary_b), qtypes=(qt,))
+            descriptive.append(tid)
+    else:
+        sup(DESCRIPTIVE_IDS[0], "DESCRIPTIVE xspan_locator stratum (OpenHands 'multihop'): "
+            "nc-graph - baseline, B=1536, anchor", (G, primary_b), (Bz, primary_b),
+            qtypes=(QT.XSPAN_LOCATOR,))
+        sup(DESCRIPTIVE_IDS[1], "DESCRIPTIVE xspan_locator stratum: nc-graph - nc-chunks, B=1536, "
+            "anchor", (G, primary_b), (C, primary_b), qtypes=(QT.XSPAN_LOCATOR,))
+        descriptive += list(DESCRIPTIVE_IDS)
+    adj = holm_adjust({k: tests[k]["p"] for k in ids})
     under = n_sessions < MIN_CHAINS
-    for k in SECONDARY_IDS:
+    for k in ids:
         t = tests[k]
         t["p_holm"] = adj[k]
         if t["p"] is None:
@@ -903,8 +986,12 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
         else:
             t["decision"] = ("SUPPORTED" if adj[k] <= ALPHA_ONE_SIDED
                              else "not supported")
-    return {"family": list(SECONDARY_IDS), "alpha_one_sided": ALPHA_ONE_SIDED,
-            "correction": "Holm step-down over the fixed family of 5", "tests": tests,
+    for k in descriptive:
+        tests[k]["p_holm"] = None
+        tests[k]["decision"] = "descriptive (outside the Holm family; no inference claimed)"
+    return {"family": list(ids), "descriptive": descriptive, "track": track,
+            "alpha_one_sided": ALPHA_ONE_SIDED,
+            "correction": f"Holm step-down over the fixed family of {len(ids)}", "tests": tests,
             "underpowered": under, "anchor_metric": anchor_key}
 
 
@@ -947,6 +1034,8 @@ def budget_views(recs: list[dict], treat: str, legacy: bool, cluster: str, n_boo
         pair_defs = [(treat, "baseline"), (treat, "nc-note-only"), ("baseline", "nc-note-only")]
         if not legacy:
             pair_defs += [(treat, "nc-chunks"), ("nc-chunks", "baseline")]
+        if "orig" in present:       # descriptive side arm (real summary, long-session only)
+            pair_defs += [(treat, "orig"), ("baseline", "orig")]
         deltas = {}
         for a, b in pair_defs:
             if a in present and b in present:
@@ -954,6 +1043,164 @@ def budget_views(recs: list[dict], treat: str, legacy: bool, cluster: str, n_boo
         views[B] = {"records": rb, "summary": arm_summary(rb), "slices": slices(rb),
                     "deltas": deltas}
     return views
+
+
+# ------------------------------------------------------- long-session analysis (C.2)
+
+def lag_bucket(lag) -> str:
+    if lag is None:
+        return "n/a"
+    try:
+        v = int(lag)
+    except (TypeError, ValueError):
+        return "n/a"
+    for lo, hi, name in LS_LAG_BUCKETS:
+        if lo <= v <= hi:
+            return name
+    return "n/a"
+
+
+def _group_stats(rs: list[dict]) -> dict:
+    ans = [r for r in rs if r["answerable"] is not False]
+    return {"n": len(rs), "n_answerable": len(ans),
+            "score": mean([r["score"] for r in ans if r["score"] is not None]),
+            "anchor_hit": mean([float(r["anchor_hit"]) for r in ans if r["anchor_hit"] is not None]),
+            "clean_anchor_hit": mean([float(r["clean_anchor_hit"]) for r in ans
+                                      if r.get("clean_anchor_hit") is not None]),
+            "rubric_hit_frac": mean([r["rubric_hit_frac"] for r in ans
+                                     if r.get("rubric_hit_frac") is not None])}
+
+
+def longsession_views(recs: list[dict], treat: str, primary_b: int, cluster: str, n_boot: int,
+                      seed: int) -> dict:
+    """Long-session readouts at the primary budget: strata by question type, lag buckets,
+    end-vs-mid checkpoints, checkpoint counts. Descriptive except where the family L4/L5 says
+    otherwise; `paired` deltas carry the same cluster-bootstrap CIs as everywhere."""
+    rb = [r for r in recs if r["mem_budget"] == primary_b]
+    arms = sorted({r["arm"] for r in rb})
+    pairs = [(treat, "baseline"), (treat, "nc-chunks"), ("nc-chunks", "baseline")]
+
+    def deltas_of(sub: list[dict]) -> dict:
+        final = {r["rid"]: r for r in sub}
+        present = {r["arm"] for r in sub}
+        return {f"{a}-{b}": paired(final, a, b, cluster, n_boot, seed)
+                for a, b in pairs if a in present and b in present}
+
+    out: dict = {"primary_b": primary_b, "arms": arms, "strata": {}, "lag": {}, "position": {}}
+    for qt in sorted({r.get("qtype") for r in rb if r.get("qtype")}):
+        sub = [r for r in rb if r.get("qtype") == qt]
+        out["strata"][qt] = {
+            "n_items": len({r["qid"] for r in sub if r["arm"] == treat}),
+            "n_sessions": len({r["cluster_session"] for r in sub}),
+            "per_arm": {a: _group_stats([r for r in sub if r["arm"] == a]) for a in arms},
+            "deltas": deltas_of(sub),
+            "declared": ("genuine multi-hop (L4/L5)" if qt in QT.GENUINE_MULTIHOP else
+                         "declared stratum (descriptive)" if qt in QT.DECLARED_STRATA else
+                         "descriptive")}
+    for _, _, name in LS_LAG_BUCKETS + ((None, None, "n/a"),):
+        sub = [r for r in rb if lag_bucket(r.get("lag")) == name]
+        if sub:
+            out["lag"][name] = {"per_arm": {a: _group_stats([r for r in sub if r["arm"] == a])
+                                            for a in arms},
+                                "deltas": deltas_of(sub)}
+    for name, sel in (("end", lambda r: r.get("is_end") is True),
+                      ("mid", lambda r: r.get("is_end") is False)):
+        sub = [r for r in rb if sel(r)]
+        if sub:
+            out["position"][name] = {"per_arm": {a: _group_stats([r for r in sub if r["arm"] == a])
+                                                 for a in arms},
+                                     "deltas": deltas_of(sub)}
+    base_ids = {r["base_qid"] for r in rb if r.get("base_qid")}
+    cps = Counter(r["base_qid"] for r in rb if r["arm"] == treat and r.get("base_qid"))
+    out["checkpoints"] = {"distinct_questions": len(base_ids),
+                          "questions_asked_at_multiple_checkpoints": sum(1 for v in cps.values() if v > 1),
+                          "treatment_rows": sum(cps.values())}
+    return out
+
+
+def render_longsession(ls: dict, treat: str, meta: dict) -> str:
+    L = ["## Long-session track (Amendment C.2)", ""]
+    L.append(f"analysis set: {meta.get('sid_filter') or 'all sessions in the records'} | "
+             f"sessions {meta['sessions']} | cluster unit: session (sid) | primary cell B={ls['primary_b']} | "
+             f"treatment {treat}. Questions asked at several checkpoints appear once per checkpoint "
+             f"(qid = <qid>@c<j>); a session's questions are averaged within the session first, so "
+             f"every session has equal weight. Checkpoints: {json.dumps(ls['checkpoints'])}.")
+    L.append("")
+    if "orig" in ls["arms"]:
+        L += ["`orig` (the session's own real summary) is a DESCRIPTIVE side arm: real boundaries, "
+              "reference B only, never part of an inference.", ""]
+    L.append("### Strata by question type (B=%d)" % ls["primary_b"])
+    L.append("")
+    rows = []
+    for qt, v in ls["strata"].items():
+        for arm in ls["arms"]:
+            g = v["per_arm"].get(arm)
+            if g and g["n"]:
+                rows.append([qt, v["declared"], arm, g["n"], fmt(g["score"]), fmt(g["clean_anchor_hit"]),
+                             fmt(g["anchor_hit"]), fmt(g["rubric_hit_frac"])])
+    L += table(["stratum", "status", "arm", "n", "score", "clean_anchor_hit", "anchor_hit (raw)",
+                "rubric proxy"], rows)
+    L.append("")
+    rows = []
+    for qt, v in ls["strata"].items():
+        for pair, d in v["deltas"].items():
+            for metric in ("score", "clean_anchor_hit", "anchor_hit"):
+                m = d["metrics"].get(metric)
+                if m:
+                    rows.append([qt, pair, metric, fmt(m["point"]), fmt(m["ci_lo"]), fmt(m["ci_hi"]),
+                                 m["n_chains"], d["n_questions"]])
+    L += table(["stratum", "pair (A-B)", "metric", "delta", "CI2.5", "CI97.5", "sessions", "paired q"], rows)
+    L.append("")
+    L.append("### By lag (boundaries between the oldest evidence and the ask; 0 = still in the tail)")
+    L.append("")
+    rows = []
+    for name, v in ls["lag"].items():
+        for arm in ls["arms"]:
+            g = v["per_arm"].get(arm)
+            if g and g["n"]:
+                rows.append([name, arm, g["n"], fmt(g["score"]), fmt(g["clean_anchor_hit"]),
+                             fmt(g["rubric_hit_frac"])])
+    L += table(["lag", "arm", "n", "score", "clean_anchor_hit", "rubric proxy"], rows)
+    L.append("")
+    rows = []
+    for name, v in ls["lag"].items():
+        d = v["deltas"].get(f"{treat}-baseline")
+        for metric in ("score", "clean_anchor_hit"):
+            m = d and d["metrics"].get(metric)
+            if m:
+                rows.append([name, f"{treat}-baseline", metric, fmt(m["point"]), fmt(m["ci_lo"]),
+                             fmt(m["ci_hi"]), m["n_chains"]])
+    L += table(["lag", "pair", "metric", "delta", "CI2.5", "CI97.5", "sessions"], rows)
+    L.append("")
+    L.append("### Checkpoint position (end = the final boundary, mid = earlier checkpoints)")
+    L.append("")
+    rows = []
+    for name, v in ls["position"].items():
+        for arm in ls["arms"]:
+            g = v["per_arm"].get(arm)
+            if g and g["n"]:
+                rows.append([name, arm, g["n"], fmt(g["score"]), fmt(g["clean_anchor_hit"]),
+                             fmt(g["rubric_hit_frac"])])
+    L += table(["position", "arm", "n", "score", "clean_anchor_hit", "rubric proxy"], rows)
+    L.append("")
+    return "\n".join(L) + "\n"
+
+
+def filter_sids(rows: list[dict], include: str, exclude: str) -> tuple[list[dict], dict]:
+    """Analysis-set selection by chain_id / sid regex (BEAM sizes and Claude Code sessions are
+    never pooled by accident). Applied BEFORE the validity filter."""
+    inc = re.compile(include) if include else None
+    exc = re.compile(exclude) if exclude else None
+    keep = []
+    for r in rows:
+        sid = str(pick(r, "chain_id") or pick(r, "session_id") or "")
+        if inc and not inc.search(sid):
+            continue
+        if exc and exc.search(sid):
+            continue
+        keep.append(r)
+    return keep, {"include": include or None, "exclude": exclude or None,
+                  "rows_in": len(rows), "rows_kept": len(keep)}
 
 
 # ---------------------------------------------------------------------- render
@@ -1127,7 +1374,8 @@ def render_extra(views: dict, primary_b: int, sec: dict | None, diag: dict, trea
                     "sessions"], rows)
         L.append("")
     if sec:
-        L.append("## Secondary hypotheses (pre-registered family of 5, Holm-corrected)")
+        L.append("## Secondary hypotheses (pre-registered family of %d, Holm-corrected%s)"
+                 % (len(sec["family"]), "; long-session track" if sec.get("track") == "longsession" else ""))
         L.append("")
         L.append(f"Cluster bootstrap over sessions; one-sided p for H0 delta <= theta0 "
                  f"(non-inferiority: theta0 = -margin; intersection-union over anchor and "
@@ -1137,7 +1385,7 @@ def render_extra(views: dict, primary_b: int, sec: dict | None, diag: dict, trea
                  f"{NI_MARGIN_ANCHOR:.2f}, score {NI_MARGIN_SCORE:.2f}.")
         L.append("")
         rows = []
-        for tid in sec["family"]:
+        for tid in list(sec["family"]) + list(sec.get("descriptive") or []):
             t = sec["tests"][tid]
             if t["kind"] == "superiority":
                 obs = (f"d={fmt(t['point'])} CI[{fmt(t['ci_lo'])}, {fmt(t['ci_hi'])}] "
@@ -1169,11 +1417,15 @@ def render_extra(views: dict, primary_b: int, sec: dict | None, diag: dict, trea
                     "anchor_in_recall", "in KG", "in chunks", "KG-only n",
                     "P(hit|KG-only)", "kw cost estimated rows"], rows)
         L.append("")
-    mh = [r for r in views[primary_b]["records"]
-          if r.get("qtype") in MULTIHOP_TYPES and r["arm"] == treat]
-    L.append(f"multi-hop stratum at B={primary_b}: {len(mh)} {treat} items "
-             f"({len({r['cluster_session'] for r in mh})} sessions) tagged "
-             f"{'/'.join(MULTIHOP_TYPES[:2])}; secondary endpoints S4/S5.")
+    xs = [r for r in views[primary_b]["records"]
+          if r.get("qtype") == QT.XSPAN_LOCATOR and r["arm"] == treat]
+    gm = [r for r in views[primary_b]["records"]
+          if r.get("qtype") in QT.GENUINE_MULTIHOP and r["arm"] == treat]
+    L.append(f"xspan_locator stratum at B={primary_b} (OpenHands items stored as 'multihop'; Amendment "
+             f"C.2: a locator in an old span + a fact in a newer one, NOT cross-compaction reasoning): "
+             f"{len(xs)} {treat} items ({len({r['cluster_session'] for r in xs})} sessions), "
+             f"descriptive only. Genuine multi-hop (multi_session_reasoning): {len(gm)} {treat} items "
+             f"({len({r['cluster_session'] for r in gm})} sessions).")
     L.append("")
     return "\n".join(L) + "\n"
 
@@ -1181,6 +1433,15 @@ def render_extra(views: dict, primary_b: int, sec: dict | None, diag: dict, trea
 # ---------------------------------------------------------------------- driver
 
 def main() -> int:
+    global QTYPE_LEGACY
+    saved = QTYPE_LEGACY
+    try:
+        return _main()
+    finally:
+        QTYPE_LEGACY = saved          # --legacy-qtypes must not leak into later in-process calls
+
+
+def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--records", nargs="+", required=True,
@@ -1200,6 +1461,15 @@ def main() -> int:
                     help="bootstrap cluster unit (default session: c0/c1 chains of one "
                          "session share 2 of 3 spans); 'chain' is for comparison only -- "
                          "the power check always counts distinct sessions")
+    ap.add_argument("--track", choices=("auto", "chains", "longsession"), default="auto",
+                    help="chains = run_chainreplay records; longsession = run_longsession records "
+                         "(auto: longsession when records carry base_qid)")
+    ap.add_argument("--include-sid", default="", metavar="REGEX",
+                    help="analysis set: only chain_id/sid matching REGEX (e.g. '^beam-1M-')")
+    ap.add_argument("--exclude-sid", default="", metavar="REGEX")
+    ap.add_argument("--legacy-qtypes", action="store_true",
+                    help="pre-C.2 reading: stored qtype 'multihop' stays 'multihop' (default: "
+                         "xspan_locator, see qtypes.py)")
     ap.add_argument("--mem-ratio-arms", default="",
                     help="arms whose run-mean memory_tokens form the realized mem-token "
                          "ratio, 'treatment,baseline' (default: nc-graph,baseline; legacy "
@@ -1211,6 +1481,13 @@ def main() -> int:
         raw.extend(load_json_records(pat))
     if not raw:
         raise SystemExit("no records loaded")
+    global QTYPE_LEGACY
+    QTYPE_LEGACY = bool(args.legacy_qtypes)
+    track = args.track if args.track != "auto" else (
+        "longsession" if any("base_qid" in r for r in raw) else "chains")
+    raw, sid_filter = filter_sids(raw, args.include_sid, args.exclude_sid)
+    if not raw:
+        raise SystemExit(f"no records left after --include-sid/--exclude-sid {sid_filter}")
     raw, validity = validate_rows(raw)
     for line in validity_lines(validity):
         print(f"[validity] {line}", file=sys.stderr)
@@ -1278,7 +1555,7 @@ def main() -> int:
     sec = None
     if not legacy:
         sec = secondary_family(recs, anchor_key, args.cluster, args.boot, args.seed,
-                               n_sessions, primary_b)
+                               n_sessions, primary_b, track)
     diag = {B: graph_diag(recs, B) for B in views} if not legacy else {}
     suspicious = [
         {"qid": r["qid"], "arm": r["arm"], "chain_id": r["chain_id"],
@@ -1299,9 +1576,16 @@ def main() -> int:
                                                                       for j in judged) else None))),
             "judge_same_family_reason": (mapping or {}).get("judge_same_family_reason"),
             "treatment": treat, "primary_b": primary_b, "legacy": legacy,
-            "budgets": sorted(views, reverse=True)}
+            "budgets": sorted(views, reverse=True), "track": track,
+            "sid_filter": (f"include={sid_filter['include']} exclude={sid_filter['exclude']}"
+                           if (sid_filter["include"] or sid_filter["exclude"]) else None),
+            "qtype_mapping": "legacy (stored labels)" if QTYPE_LEGACY else "C.2 (multihop -> xspan_locator)"}
     md = render(pv["summary"], pv["deltas"], pv["slices"], gates, meta, suspicious)
     md += "\n" + render_extra(views, primary_b, sec, diag, treat, legacy, meta)
+    ls_views = None
+    if track == "longsession" and not legacy:
+        ls_views = longsession_views(recs, treat, primary_b, args.cluster, args.boot, args.seed)
+        md += "\n" + render_longsession(ls_views, treat, meta)
     print(md)
     with open(args.out, "w") as w:
         w.write(md)
@@ -1310,7 +1594,8 @@ def main() -> int:
                    "by_budget": {str(B): {"summary": v["summary"], "deltas": v["deltas"],
                                           "slices": v["slices"]} for B, v in views.items()},
                    "summary": pv["summary"], "deltas": pv["deltas"], "gates": gates,
-                   "slices": pv["slices"], "secondary": sec, "graph_diag": diag},
+                   "slices": pv["slices"], "secondary": sec, "graph_diag": diag,
+                   "longsession": ls_views},
                   open(args.json, "w"), indent=1, default=str)
     print(f"\n[written] {args.out}" + (f" and {args.json}" if args.json else ""))
     return 0

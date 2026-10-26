@@ -561,7 +561,8 @@ class MetricsAmendmentC(unittest.TestCase):
         self.assertIn("nc-graph-baseline", d["deltas"])                 # primary cell pairs
         self.assertIn("nc-graph-nc-chunks", d["deltas"])
         sec = d["secondary"]["tests"]
-        self.assertEqual(list(sec), list(mv.SECONDARY_IDS))
+        # Amendment C.2: the Holm family is S1-S3 (m = 3); S4d/S5d are descriptive (xspan_locator)
+        self.assertEqual(list(sec), list(mv.SECONDARY_IDS) + list(mv.DESCRIPTIVE_IDS))
         # S1: graph (0.75) vs chunks (0.5), paired on identical items -> clearly positive
         self.assertGreater(sec["S1_graph_vs_chunks"]["point"], 0.15)
         self.assertEqual(sec["S1_graph_vs_chunks"]["label"], "graph helps")
@@ -571,11 +572,12 @@ class MetricsAmendmentC(unittest.TestCase):
         # S3: nc-graph@512 (0.2) loses 0.3 -> NOT non-inferior
         self.assertEqual(sec["S3_ni_512"]["decision"], "not supported")
         self.assertGreater(sec["S3_ni_512"]["p"], 0.5)
-        # multi-hop stratum tests exist and use only multihop items (k % 3 == 0 -> 2 of 6)
-        self.assertGreater(sec["S4_multihop_vs_baseline"]["n_pairs"], 0)
-        self.assertLess(sec["S4_multihop_vs_baseline"]["n_pairs"],
-                        sec["S1_graph_vs_chunks"]["n_pairs"])
-        self.assertEqual(sec["S4_multihop_vs_baseline"]["n_pairs"], 10 * 2)
+        # descriptive xspan_locator contrasts use only the stored-"multihop" items (k % 3 == 0 -> 2 of 6)
+        s4d = sec["S4d_xspan_locator_vs_baseline"]
+        self.assertGreater(s4d["n_pairs"], 0)
+        self.assertLess(s4d["n_pairs"], sec["S1_graph_vs_chunks"]["n_pairs"])
+        self.assertEqual(s4d["n_pairs"], 10 * 2)
+        self.assertTrue(s4d["decision"].startswith("descriptive"))
         for t in sec.values():
             self.assertIn("p_holm", t)
         self.assertIn("Secondary hypotheses", md)
@@ -594,15 +596,16 @@ class MetricsAmendmentC(unittest.TestCase):
     def test_underpowered_labels_secondaries_inconclusive(self):
         rc_, d, md = run_metrics(synth_rows(4, p={("nc-graph", 1536): 0.9, ("baseline", None): 0.4}))
         self.assertEqual(d["gates"]["verdict"], "INCONCLUSIVE")
+        fam = d["secondary"]["family"]
         self.assertTrue(all(t["decision"].startswith(("INCONCLUSIVE", "n/a"))
-                            for t in d["secondary"]["tests"].values()))
+                            for k, t in d["secondary"]["tests"].items() if k in fam))
 
     def test_missing_cell_counts_as_p_one_not_a_shrunk_family(self):
         rc_, d, _ = run_metrics(synth_rows(10, budgets=(1536,)))
         sec = d["secondary"]["tests"]
         self.assertIsNone(sec["S3_ni_512"]["p"])
         self.assertTrue(sec["S3_ni_512"]["decision"].startswith("n/a"))
-        self.assertEqual(len(d["secondary"]["family"]), 5)
+        self.assertEqual(len(d["secondary"]["family"]), 3)           # C.2: S1-S3
 
     def test_legacy_run_gets_exploratory_banner_and_no_secondaries(self):
         rows = [r for r in synth_rows(9, budgets=(1536,)) if r["arm"] != "nc-graph"]

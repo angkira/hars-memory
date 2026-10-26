@@ -86,6 +86,8 @@ import sys
 import tempfile
 from collections import Counter, defaultdict
 
+import qtypes as QT  # Amendment C.2: stored "multihop" is analysed as xspan_locator
+
 # Amendment C: four arms; the legacy 3-arm `nc` is read as nc-chunks (exploratory only, C1)
 ARMS_AMENDED = ("baseline", "nc-chunks", "nc-graph", "nc-note-only")
 ARMS_LEGACY = ("baseline", "nc-chunks", "nc-note-only")
@@ -602,7 +604,7 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
         st["anchor_hit"] = (r["anchor_hit"] if isinstance(r.get("anchor_hit"), bool)
                             else na("records.anchor_hit"))
         recs.append({"qid": qid, "chain_id": cid, "arm": arm, "lag": r.get("lag"),
-                     "qtype": r.get("qtype"), "mem_budget": cell,
+                     "qtype": QT.canon_qtype(r.get("qtype"), r.get("source_qtype")), "mem_budget": cell,
                      "span_idx": sp, "gold_anchor": anchor, "bm25_budget": budget,
                      "stages": st})
 
@@ -634,7 +636,7 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
             per_arm_lag[f"{a}|lag{lag}"] = dict(n=len(sel), **agg(sel))
     per_arm_multihop = {}
     for a in per_arm:
-        sel = [x for x in recs if x["arm"] == a and x.get("qtype") == "multihop"]
+        sel = [x for x in recs if x["arm"] == a and x.get("qtype") == QT.XSPAN_LOCATOR]
         if sel:
             per_arm_multihop[a] = dict(n=len(sel), **agg(sel))
 
@@ -811,7 +813,7 @@ def render(res: dict) -> str:
         for a, d in res_c["per_arm"].items():
             L.append("| " + " | ".join([a, str(d["n"])] + [cell(d[s]) for s in STAGES]) + " |")
         if res_c.get("per_arm_multihop"):
-            L += ["", "### Multi-hop stratum (qtype multihop)", "", "| " + " | ".join(head) + " |",
+            L += ["", "### xspan_locator stratum (stored qtype multihop; Amendment C.2, descriptive)", "", "| " + " | ".join(head) + " |",
                   "|" + "---|" * len(head)]
             for a, d in res_c["per_arm_multihop"].items():
                 L.append("| " + " | ".join([a, str(d["n"])] + [cell(d[s]) for s in STAGES]) + " |")

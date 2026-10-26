@@ -181,6 +181,25 @@ def window_around(span: str, evidence: str, width: int = WINDOW) -> tuple[str, s
     return span[: 2 * width], "evidence_not_found"
 
 
+def window_for(span: str, evidence, width: int = WINDOW) -> tuple[str, str]:
+    """window_around for one evidence string, or for a LIST of evidence strings (multi-hop /
+    long-session items): the per-evidence windows joined in order, status = the weakest."""
+    if not isinstance(evidence, (list, tuple)):
+        return window_around(span, evidence, width)
+    parts, stats = [], []
+    for ev in evidence:
+        w, how = window_around(span, ev if isinstance(ev, str) else json.dumps(ev), width)
+        if w not in parts:
+            parts.append(w)
+        stats.append(how)
+    if not parts:
+        return window_around(span, "", width)
+    order = ["evidence_exact", "evidence_prefix", "evidence_normalized", "no_evidence",
+             "evidence_not_found"]
+    weakest = max(stats, key=lambda x: order.index(x) if x in order else len(order))
+    return "\n[...]\n".join(parts), weakest
+
+
 def unrelated_excerpt(rec: dict, pool: list[dict], rng: random.Random,
                       width: int = WINDOW) -> tuple[str, str, str]:
     """Unanswerable items get a real excerpt from a DIFFERENT chain (never their own)."""
@@ -224,8 +243,37 @@ reason: <= 25 words.
 
 Reply ONLY JSON: {{"score":0|1|2,"unsupported_claim":true|false,"abstained":true|false,"reason":"..."}}"""
 
+# Long-session items that carry the benchmark's own rubric (BEAM): the rubric is passed to the
+# judge as the grading standard. Items without a rubric use PROMPT verbatim (chain datasets).
+RUBRIC_BLOCK = """Rubric written by the benchmark authors for this question (the reference answer above
+is its short form). Grade against it: 2 = the candidate satisfies every rubric item (or all
+that matter for the question), 1 = it satisfies some but not all, 0 = it satisfies none or
+contradicts them. A candidate that merely restates the question satisfies nothing.
+<rubric>
+{rubric}
+</rubric>
+
+"""
+
+
+def rubric_text(rec: dict) -> str:
+    rb = rec.get("rubric")
+    if isinstance(rb, str):
+        rb = [rb]
+    items = [norm_ws(str(x)) for x in (rb or []) if norm_ws(str(x))]
+    return "\n".join(f"- {x}" for x in items)
+
 
 def build_prompt(rec: dict, excerpt: str) -> str:
+    base = _build_prompt(rec, excerpt)
+    rt = rubric_text(rec)
+    if not rt:
+        return base
+    return base.replace("Grade the candidate answer:", RUBRIC_BLOCK.format(rubric=rt)
+                        + "Grade the candidate answer:", 1)
+
+
+def _build_prompt(rec: dict, excerpt: str) -> str:
     return PROMPT.format(
         question=rec.get("question", "").strip(),
         reference=(rec.get("canonical_short_answer") or "").strip() or "(none recorded)",
@@ -542,7 +590,7 @@ def main() -> int:
     excerpts = {}     # rid -> (excerpt, status, source_chain)
     for r in records:
         if r.get("answerable", True):
-            excerpt, how = window_around(r.get("span_text", ""), r.get("evidence", ""))
+            excerpt, how = window_for(r.get("span_text", ""), r.get("evidence", ""))
             excerpts[rid_of(r)] = (excerpt, how, None)
         else:
             excerpts[rid_of(r)] = unrelated_excerpt(r, records, rng)
