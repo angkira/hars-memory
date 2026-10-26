@@ -6,3 +6,6 @@ verify_chains.report.md
 runs/
 sessions/
 *.pid
+
+# pi agent credential store (never commit)
+pi-agent/auth.json
