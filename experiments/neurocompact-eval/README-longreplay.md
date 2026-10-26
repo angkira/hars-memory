@@ -1,5 +1,11 @@
 # Long-replay eval (real OpenCode sessions, real compaction boundaries)
 
+Scope: this file documents the single-boundary `run_longreplay.py` pilot. The chained 3-compaction
+A/B (`run_chainreplay.py`, arms baseline / nc / nc-note-only, budget parity, validity gates) is
+described in RUNBOOK-gate.md, REPORT-PROTOCOL.md and HANDOFF.md; its ask prompt, budget and
+validity rules differ from this pilot. Use :8307 for chain runs; :8305 is the dead-extractor
+trap unless started with extractor env (INFRA-NOTES.md).
+
 Гипотеза на длинном горизонте: при 3-4 реальных компакциях подряд bounded-сводка
 физически не вмещает факты → «короткий handoff + граф + recall» должен оторваться
 от «оригинальной сводки». Текущий пилот (12 сегментов) стоял на границе, где

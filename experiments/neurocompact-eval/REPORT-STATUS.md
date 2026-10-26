@@ -7,14 +7,15 @@ Date: 2026-10-26. Status: decisive run in progress, batches. NO OUTCOME CLAIM IS
 Ten real OpenCode sessions are cut into 10 chains x 3 spans (~10k tokens each); each chain is
 replayed verbatim through 3 forced compactions, and questions are asked only after C3. Three
 arms: `baseline` (in-context structured summary, hard-trimmed to 1536 realized tokens),
-`nc` (short 640-token note + HARS graph recall packed to the remaining budget,
-`clamp(1536 - realized_note, 256, 1024)`), and `nc-note-only` (fork of the nc session, note
+`nc` (short 640-token note + HARS recall packed to the remaining budget,
+`clamp(1536 - realized nc note, 256, 1024)`; the baseline's realized size is only reported), and `nc-note-only` (fork of the nc session, note
 only — isolates the recall channel). Agent and compactors: `qwen/qwen3.8-flash`; judge:
 `openai/gpt-6-luna`, blind (no arm labels, shuffled order with logged mapping) and
 evidence-grounded. 70 QA items (60 answerable with verbatim-verified evidence and unique gold
 anchors, 10 adversarial unanswerables); hallucination is cross-checked against the model's
 actually visible context (`clean_anchor_hit`, primed-hit exclusion). Statistics: paired deltas
-with chain-cluster bootstrap (10,000 resamples) plus Wilcoxon over per-chain means; decisions
+with cluster bootstrap (10,000 resamples, clustered by source SESSION) plus Wilcoxon over
+per-cluster means; MIN_CHAINS = 8 counts distinct sessions; decisions
 follow pre-registered WIN/FAIL thresholds (RUNBOOK-gate.md); a kill/blame funnel
 (anchor_in_summary / anchor_in_graph / anchor_in_recall vs BM25 over the same dropped context)
 runs offline on archived artifacts. Design follows the external review (argon_answer_r1.md);
@@ -52,6 +53,15 @@ query boost off). Forensic baseline: gate-212839 showed the recall channel deliv
 P(anchor_hit | anchor_in_recall) = 3/3 — and both unanswerable probes were cleanly abstained
 by nc while baseline and nc-note-only each hallucinated 1/2 (n=2 chains, diagnostic only).
 
+## Known caveats (HANDOFF.md "OPEN PROTOCOL ISSUES")
+
+The 10 chains are 5 independent sessions, so the metrics_v2 power check (8 sessions) cannot be
+met with this dataset and the verdict will be INCONCLUSIVE unless the dataset is rebuilt or
+the protocol amended. Also open: whether `nc` recall exercises the graph or only chunk
+retrieval (M2, unverified), the 12k+12k payload limit to HARS (M3), the undiagnosed batch-A
+error 530 (M5), tuning chains inside the decision set and batch 1 run under the old
+prompt/cap (M7).
+
 ## What the decisive numbers will be
 
 Per arm (baseline / nc / nc-note-only) on the merged 10-chain set: judge score mean,
@@ -60,7 +70,8 @@ latency, realized memory tokens and parity ratio, persisted-compaction rate; per
 slices; chain-cluster bootstrap 95% CIs for paired deltas (nc - baseline, nc - nc-note-only);
 the pre-registered WIN/FAIL/INCONCLUSIVE verdict (thresholds verbatim in RUNBOOK-gate.md);
 kill/blame funnel table with the BM25 comparison (kill graph if HARS anchor_in_recall
-<= BM25 + 5 pp).
+<= BM25 + 5 pp). Chains invalid under the current gates (CLIP FAIL, RECALL FAIL, aborts) and
+incomplete arm triplets are dropped before any number is computed.
 
 ## No outcome claim
 

@@ -13,7 +13,8 @@ ask-time context cost (brief.md).
 The decisive experiment implements the external review's design (argon_answer_r1.md): the
 three-arm structure with `nc-note-only` as a zero-compaction fork, C=3 chained compactions
 with questions only after C3, realized-token budget parity, blind evidence-grounded judging,
-unique-anchor metrics, adversarial unanswerables, chain-cluster bootstrap gates, and the
+unique-anchor metrics, adversarial unanswerables, cluster-bootstrap gates (clustered by source
+session, see section 5), and the
 kill/blame funnel are all the reviewer's design choices (argon_answer_r1.md, Q1-Q5).
 
 ## 2. Data
@@ -40,8 +41,8 @@ evidence (EMPTY). All gates passed at rate 1.000 on all 70 items; hard-gate fail
 
 | Arm | Post-compaction artifact | Ask-time memory | Compactions |
 |---|---|---|---|
-| `baseline` | structured summary, hard budget 1536 tokens, section-trimmer enforces the cap (`NC_SUM_SECTION_TRIM=1`) | the summary alone | 3 (no HARS) |
-| `nc` | short schema-matched note, cap 640 tokens | note + injected `memory_recall` packed to the remainder: `clamp(1536 - realized_C3_note, 256, 1024)` | 3, persisted to HARS |
+| `baseline` | structured summary, hard budget 1536 tokens, section-trimmer enforces the cap (`NC_SUM_SECTION_TRIM=1`); realized size is only reported | the summary alone | 3 (no HARS) |
+| `nc` | short schema-matched note, cap 640 tokens | note + injected `memory_recall` packed to the remainder: `clamp(mem_budget 1536 - realized nc C3 note, 256, 1024)` | 3, persisted to HARS |
 | `nc-note-only` | fork of the `nc` session at C3; identical note | note only, 0 recall bytes | none extra (fork) |
 
 - Memory service: HARS per-session graphs on :8307 (`nc-hars-chain-glm`, glm extractor,
@@ -49,15 +50,28 @@ evidence (EMPTY). All gates passed at rate 1.000 on all 70 items; hard-gate fail
 - Agent and compactors: `qwen/qwen3.8-flash` everywhere, reasoning off (RUNBOOK-gate.md;
   run_chainreplay.py `NC_SUM_REASONING_EFFORT=off`).
 - Judge: `openai/gpt-6-luna`, one fixed judge for all arms. Blind: no arm labels, shuffled
-  presentation order with a logged mapping file. Evidence-grounded: the judge sees a
+  presentation order with a logged mapping file; arm-revealing strings inside answers
+  (`-nc-`/`-baseline-` session-id parts, recall-wrapper headers, "recalled memory", HARS) are
+  masked as `[masked]` in the judge-visible answer only and logged in the mapping.
+  Evidence-grounded: the judge sees a
   deterministic source excerpt around the verbatim evidence span, and its hallucination flag
   is split into `unsupported_or_contradicted_claim` vs `abstained`. Unsupported answers are
   re-verified against the model's actually visible context (visible_context.py) before
   counting (argon_answer_r1.md Q2; REPORT-forensics-gate212839.md post-pass).
 - Runner invariants: exactly 3 forced compactions per chain per live arm; `[unsummarized`
-  fallback invalidates the chain; every question answered on a fresh `cp -a` fork of the
-  post-C3 session (no cross-question contamination); QA evidence re-verified at runtime
-  (RUNBOOK-gate.md).
+  fallback aborts the chain (rows written `valid=false`); nc persistence gate after C3
+  (`compactions == 3`, `entities > 0`, `vectors_indexed > 0` when reported); every question
+  answered on a fresh `cp -a` fork of the post-C3 session (no cross-question contamination);
+  QA evidence re-verified at runtime (RUNBOOK-gate.md).
+- Chain validity: a chain is `valid=false` on CLIP FAIL (>1/6 unrepaired `stop=length` per
+  arm), RECALL FAIL (any nc recall empty/errored/0 packed content units), nc note alone
+  busting the budget, baseline writing to HARS, or an abort. The per-chain parity ratio is a
+  warning, not a validity criterion. Rows are written once per chain at chain end with the
+  final flag; a recall preflight runs before any spend. Metrics and judge export drop invalid
+  chains and incomplete arm triplets and hard-fail on duplicate (qid, arm) / rid.
+- Ask prompt: identical for all arms, including the abstention sentence ("If you do not have
+  the information needed to answer, say that you do not know"); the nc recall block is
+  appended after the question and carries no arm-specific abstention instruction.
 - Cost ceilings: pre-freeze gate $0.60; full run $2.50 hard (RUNBOOK-gate.md).
 
 ## 4. Budget parity protocol, and why (amendment log)
@@ -80,7 +94,8 @@ Getting there took two failed gate cycles, recorded in RUNBOOK-gate.md "Amendmen
    trim to `mem_budget`; `--baseline-sum-max-tokens` default changed 3072 -> 1536;
    `NC_SUM_SECTION_TRIM=1` for all summarizing arms. Parity is now a protocol property, not
    sampling luck (RUNBOOK-gate.md). The nc recall cap is derived from the realized C3 note
-   (`clamp(1536 - realized_note, 256, 1024)`), so nc cannot exceed the budget by
+   (`clamp(1536 - realized_nc_note, 256, 1024)`; the baseline's realized C3 is reported only and
+   never enters the cap), so nc cannot exceed the budget by
    construction; 256/1024 are guard clamps against starving or busting the channel
    (RUNBOOK-gate.md, run_chainreplay.py). nc note cap calibrated at 640 (0/6 clips, realized
    417-635) on gate-212839 + gate2 + calib2-4 (RUNBOOK-gate.md); the gate-212839 nc-note-only
@@ -91,13 +106,14 @@ Getting there took two failed gate cycles, recorded in RUNBOOK-gate.md "Amendmen
    (RUNBOOK-gate.md).
 
 The per-chain ratio window is a warning only; the gate is the run-mean ratio, printed as
-`RUN BUDGET ... PASS/FAIL` and written to run_budget.json. CLIP FAIL stays per-chain
-(RUNBOOK-gate.md).
+`RUN BUDGET ... PASS/FAIL` and written to run_budget.json (metrics_v2 computes the same
+run-mean nc/baseline `memory_tokens` ratio from the kept records; it does not read
+run_budget.json). CLIP FAIL and RECALL FAIL stay per-chain (RUNBOOK-gate.md).
 
 Gate pass criteria (all must hold before the full run; thresholds from the external review,
 RUNBOOK-gate.md): 0 `[unsummarized` across all compactions; <=1/6 `stop=length`; baseline
-anchor_hit after C3 in [0.40, 0.85]; nc recall non-empty (>=100 chars packed) on 100% of asks
-with `recall_packed_tokens <= 1024`; realized memory-token ratio in [0.80, 1.05]; judge
+anchor_hit after C3 in [0.40, 0.85]; nc recall usable (no RECALL FAIL: non-empty raw payload, no error,
+>=1 packed content unit) on 100% of asks with `recall_packed_tokens <= 1024`; realized memory-token ratio in [0.80, 1.05]; judge
 calibration on duplicates exact agreement >= 90% (kappa >= 0.80) and P(unsupported_claim AND
 score=2) <= 5%.
 
@@ -127,9 +143,14 @@ objective hallucination that does not depend on judge calibration (argon_answer_
 On gate-212839: nc abstained 2/2 cleanly; baseline and nc-note-only each hallucinated 1/2 on
 the never-mentioned probes (REPORT-forensics-gate212839.md).
 
-**Statistics**: paired per-question deltas with 95% CIs via chain-cluster bootstrap (10,000
-resamples over chains), plus paired Wilcoxon over per-chain means; questions within a chain
-share summary/graph fate and are not i.i.d. (argon_answer_r1.md Q2).
+**Statistics**: paired per-question deltas with 95% CIs via cluster bootstrap (`--boot`
+default 10,000, `--seed` default 1337), plus paired Wilcoxon over per-cluster means. The
+cluster unit is the source SESSION (chain_id minus `_cN`), not the chain: c0 and c1 of one
+session share 2 of 3 spans (`--cluster chain` exists for comparison only). Questions within a
+cluster share summary/graph fate and are not i.i.d. (argon_answer_r1.md Q2 asked for chain
+clusters; session clustering is the stricter implementation after the code review). The power
+check `MIN_CHAINS = 8` counts distinct sessions; below it metrics_v2 returns INCONCLUSIVE with
+no WIN/FAIL verdict. The dataset has 5 sessions (HANDOFF.md OPEN PROTOCOL ISSUES B4).
 
 **Decision gates (verbatim thresholds, RUNBOOK-gate.md "Decision rules", from the external
 review)**:
@@ -143,6 +164,12 @@ review)**:
 - FAIL = ANY: Δscore < −0.10; Δanchor < −5 pp; Δhalluc > −5 pp; dead memory (|Δ| vs
   note-only: score < 0.05 AND anchor < 3 pp); median ask > 30 s; cost/Q > 3x baseline.
 - Everything else: INCONCLUSIVE / UNDERPOWERED — never reported as a directional win.
+- Implementation notes (metrics_v2.py): anchor rules use `clean_anchor_hit` (fallback to raw
+  `anchor_hit` with a warning when visible_context is missing); the unanswerable false-answer
+  rule is `Δ <= -0.10` or `nc <= 0.25` when `baseline <= 0.30`; the memory ratio is
+  run-mean nc / run-mean baseline `memory_tokens`; a missing gate input is n/a and yields
+  INCONCLUSIVE, never FAIL; invalid chains and incomplete arm triplets are dropped before any
+  statistic.
 
 **Kill/blame funnel** (offline, $0, on archived artifacts; RUNBOOK-gate.md):
 
@@ -175,7 +202,15 @@ review)**:
    falls back to the repo default `localhost:8080` — a dead 405-nginx — and produces
    `ok=true` compactions with empty graphs. The as-found :8305 instance is in this state
    (INFRA-NOTES.md).
-5. **Single host network namespace.** All containers run `--network host`; every HARS
+5. **Open protocol issues** (not resolved by the harness fixes; details and owner questions in
+   HANDOFF.md "OPEN PROTOCOL ISSUES"): B4 (10 chains = 5 independent sessions; shared probe in
+   7/10 unanswerables; MIN_CHAINS over sessions unreachable), M2 (recall called without
+   `ll_keywords`: graph branch probably skipped, nc may be chunk-RAG; unverified), M3
+   (`neurocompact.ts` sends only the first and last 12k chars of each dropped span to HARS,
+   baseline summarizer sees up to 60k), M5 (batch-A recall_error=530 undiagnosed), M7
+   (packer/cap tuning used decision chains `qq8Vqbow_c0`, `y062eGZR_c0`; batch 1 ran under the
+   old prompt/cap; judge calibration = two temp-0 passes of one model = repeatability only).
+6. **Single host network namespace.** All containers run `--network host`; every HARS
    instance is port-pinned on the one host namespace, so a port collision or a stray listener
    takes out an arm's memory service (hars-api.sh; INFRA-NOTES.md).
 

@@ -68,3 +68,14 @@ HARS_NC_ENGINE_THREADS=1 HARS_NC_ENGINE_QUEUE=32 HARS_NC_QUEUE_TIMEOUT_MS=600000
 The API key is taken from the caller's environment; never hardcode it. Recreating with the
 same name force-removes the old container (`docker rm -f`) — the data dir is the only
 persistent state, so point at the existing `hars-data-chain-glm` to keep session graphs.
+
+## Recall channel dependencies (batch-A recall_error=530, undiagnosed)
+
+The `memory_recall` path of the :8307 instance uses the embedding server
+`http://127.0.0.1:8791/v1` (local `google/embeddinggemma-300m`, as recorded for the removed
+luna instance; for `nc-hars-chain-glm` unverified). Suspected, unverified: :8791 was down after
+the 04:17 host OOM, with no lexical fallback, and/or the container restarted onto other code.
+Checks: container restart count / `StartedAt`; `:8791` health; `vdb_chunks.json` size in the
+batch-A session dirs; `embedding failed` in the container logs. The runner now does a
+`memory_recall` preflight and marks chains with unusable recalls `valid=false` (RECALL FAIL).
+See HANDOFF.md OPEN PROTOCOL ISSUES M5.

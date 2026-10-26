@@ -5,10 +5,12 @@ INFRA-NOTES.md, REPORT-forensics-gate212839.md.
 
 ## Code locations (where this lives)
 
-- **Home repo:** `hars-longterm-memory`, branch `exp/neurocompact-eval` (from
-  `feat/compaction-session-graph`), pushed to GitHub
-  (`iuriimedvedev-dev/hars-longterm-memory`) and knotgate gitlab. In-repo path:
-  `experiments/neurocompact-eval/`.
+- **Home repo:** `github.com/angkira/hars-memory` (private), branch
+  `exp/neurocompact-eval-clean`. It is a snapshot import of `hars-longterm-memory` at
+  `feat/compaction-session-graph` (ffd3bd6) WITHOUT upstream history. Upstream (public):
+  `iuriimedvedev-dev/hars-longterm-memory`. In-repo path: `experiments/neurocompact-eval/`.
+  The old branch `exp/neurocompact-eval` on the upstream GitHub repo is leaked (see "Data is
+  NOT in git") and must not be used.
 - **Standalone mirror:** `github.com/angkira/neurocompact-eval`, branch
   `exp/neurocompact-session-memory` (private; contains private session content —
   keep private).
@@ -24,8 +26,12 @@ Test whether HARS externalized graph memory (short note + packed recall) matches
 in-context 1536-token summary on 10 chained-compaction sessions, 3 arms (baseline / nc /
 nc-note-only), questions only after C3, blind judge gpt-6-luna, pre-registered WIN/FAIL gates.
 Protocol frozen after external review; gates 1-6 done; decisive 10-chain run is IN PROGRESS in
-batches — batch 1 (chains 1-3) valid, batch A (chains 4-7) completed but INVALID, batch B
-(chains 8-10) not started.
+batches — batch 1 (chains 1-3) valid under the OLD runner (see OPEN PROTOCOL ISSUES: not
+protocol-identical to new runs), batch A (chains 4-7) completed but INVALID, batch B (chains
+8-10) not started. The runner/metrics were fixed after a code review (commits touching
+`run_chainreplay.py`, `metrics_v2.py`, `export_judge_input.py`, `judge_v2.py`; plan
+`.plans/2026-10-26_nc-eval-harness-fixes.md`); several protocol questions are still open
+(section "OPEN PROTOCOL ISSUES").
 
 ## CURRENT STATE
 
@@ -57,11 +63,21 @@ batches — batch 1 (chains 1-3) valid, batch A (chains 4-7) completed but INVAL
         both; gate6-013036 is the calibrated-judge run with metrics.json clean.
       - (also in runs/: gate7-011604, 2 chains aborted by the mid-replay compaction guard
         "force hook must be parked" — runner guard, pre-full-run; not a gate verdict.)
-- [x] Parity mechanism (final design): baseline summary hard-trimmed to mem_budget=1536
-      (`NC_SUM_SECTION_TRIM=1`, `--baseline-sum-max-tokens 1536`); nc note cap 640, recall cap
-      `clamp(1536 - realized_C3_note, 256, 1024)`; gate is the run-mean ratio in [0.80, 1.05]
-      written to run_budget.json (per-chain window is a warning only); CLIP FAIL stays
-      per-chain; `--require-no-clip` on.
+- [x] Parity mechanism (final design, as enforced by the CURRENT runner): baseline summary
+      hard-trimmed to mem_budget=1536 (`NC_SUM_SECTION_TRIM=1`, `--baseline-sum-max-tokens
+      1536`); nc note cap 640; recall cap `clamp(mem_budget - realized nc C3 note, 256, 1024)`
+      (`recall_cap_for`; the baseline's realized C3 is only REPORTED, never enters the cap);
+      gate is the run-mean ratio in [0.80, 1.05] (runner: `RUN BUDGET` + run_budget.json;
+      metrics_v2: `win_mem_token_ratio` = run-mean nc `memory_tokens` / run-mean baseline
+      `memory_tokens` over the kept records). The per-chain window is a warning only
+      (`[budget warn]`); a chain is invalidated only by structural defects: CLIP FAIL (>1/6
+      unrepaired `stop=length` per arm, `--require-no-clip` on), nc note alone busting the
+      budget (recall cap clamped low), RECALL FAIL (any empty/errored nc recall), baseline
+      writing to HARS, or a chain abort. Rows are buffered per chain and written once at chain
+      end with the final `valid` flag. All arms share one ask prompt incl. the abstention
+      sentence (`ASK_PROMPT`). Persistence gate: nc `compactions == 3`, `entities > 0`,
+      `vectors_indexed > 0` when reported. Runner preflight: one `memory_recall` before any
+      spend, abort on a dead channel. Runner refuses a non-empty `--out`.
 
 ### IN FLIGHT (as found by this agent)
 
@@ -79,17 +95,22 @@ batches — batch 1 (chains 1-3) valid, batch A (chains 4-7) completed but INVAL
         12.3-16.6 kchars — the channel broke between 04:17 and 07:57.
       - RUN BUDGET FAIL: run ratio 0.579 (window [0.80, 1.05]); baseline fill dropped to
         0.71-0.80 (was 0.92-0.94 in batch 1).
+      - Under the CURRENT runner this batch would be stopped by the preflight call or marked
+        valid=false by RECALL FAIL; it ran under the old runner, which marked it valid.
       - 2/4 chains valid=false: GFkz8FeB_c0 and qq8Vqbow_c1 (CLIP FAIL, nc unrepaired
         stop=length). Per-chain cap advice is in chain_budget.jsonl.
-      -> Diagnose the recall_error=530 first (one memory_recall call by hand against :8307,
-      then a 1-chain --dry-run + smoke). Do NOT merge fullB-075703 nc rows into the decision
-      set as-is; re-run batch A clean.
+      -> Diagnose the recall_error=530 first (cause is UNDIAGNOSED, see OPEN PROTOCOL ISSUES
+      M5; one memory_recall call by hand against :8307, then a 1-chain --dry-run + smoke).
+      Do NOT merge fullB-075703 nc rows into the decision set as-is; re-run batch A clean.
 - [ ] Batch B — chains 8-10 (gcKDB2Q7_c1, GFkz8FeB_c1, OAITa4mS_c1): NOT STARTED.
 
 ### TODO (in order)
 
-1. Diagnose batch A recall_error=530; if the fix changes nc behavior, re-run batch A (4
-   chains) with the same command shape as fullB (subset chains file, small batch).
+0. Owner decision on the OPEN PROTOCOL ISSUES below (B4 above all) BEFORE spending on more
+   batches: B4 decides whether a decisive verdict is reachable at all.
+1. Diagnose batch A recall_error=530 (M5 checklist); if the fix changes nc behavior, re-run
+   batch A (4 chains) with the same command shape as fullB (subset chains file, small batch).
+   Batch 1 ran under the old prompt/cap: re-run chains 1-3 too, or document the mix (M7).
 2. Run batch B (chains 8-10), after `--dry-run`:
 
 ```bash
@@ -104,7 +125,10 @@ python3 run_chainreplay.py --chains chains-batchB.jsonl --arms baseline,nc,nc-no
   --mem-budget 1536 --require-no-clip --mcp http://127.0.0.1:8307/mcp
 ```
 
-3. Merge the three run dirs (see procedure below) — only with a CLEAN batch A.
+3. Merge the three run dirs (see procedure below) — only with a CLEAN batch A. The merge
+   MUST yield exactly one row per (qid, arm) and per rid: export_judge_input.py and
+   metrics_v2.py exit 2 on duplicates (do not concatenate the invalid fullB-075703 rows with
+   their re-run).
 4. Export -> judge -> metrics (RUNBOOK-gate.md full-run block, with `--judge-input` added on
    metrics_v2 so clean_anchor_hit / primed_hit are computed; gate6-013036 also passed
    `--json`):
@@ -119,8 +143,22 @@ python3 judge_v2.py --in "runs/<MERGED>/judge-input.jsonl" \
   --mapping "runs/<MERGED>/judge-mapping.json"
 python3 metrics_v2.py --records runs/<MERGED>/records.jsonl \
   --judge runs/<MERGED>/judged.jsonl --judge-input runs/<MERGED>/judge-input.jsonl \
-  --out REPORT-chains.md
+  --out REPORT-chains.md          # optional: --json, --boot N (10000), --seed S (1337), --cluster session|chain
 ```
+
+   What metrics_v2 does with the merged records (code, not intent): drops whole chains with
+   any row whose `valid` is not `true` or that has a `recall_error`; drops qids lacking the
+   full baseline/nc/nc-note-only triplet; exits 2 on duplicate (qid, arm) or rid. Bootstrap
+   clusters by SESSION (chain_id minus `_cN`), and the power check `MIN_CHAINS = 8` counts
+   DISTINCT SESSIONS (fewer => verdict forced to INCONCLUSIVE, rule tables are diagnostics).
+   Anchor gates use `clean_anchor_hit` when it is defined on every answerable record with an
+   anchor verdict (needs `--judge-input`); otherwise they fall back to raw `anchor_hit` with
+   a warning. A gate input that is missing is `n/a`: a WIN rule that is n/a cannot be met, an
+   n/a FAIL rule blocks WIN => INCONCLUSIVE, never FAIL. Check the `[validity]` lines on stderr
+   for which chains/qids were dropped. The judge masks arm-revealing strings (`-nc-` /
+   `-baseline-` session-id parts, `[memory recall ...]`/`<memory>`/"Recalled session memory"
+   headers, "recalled memory", HARS) in the judge-visible answer only and logs it in the
+   mapping file (`answer_masked`, `masking`).
 
 5. Kill/blame funnel + BM25 comparison (offline, $0): adapt `funnel_gate212839.py` /
    `funnel_clean_gate212839.py` to the merged dir; stages anchor_in_summary / anchor_in_graph
@@ -152,8 +190,11 @@ cp -a runs/<MERGED>/sessions "$D"/sessions                 # HARS graphs
   from `chain_budget.jsonl` (`valid`, `invalid_reasons`); records also carry `valid` +
   `chain_invalid_reasons`.
 - `sessions/`: merge by relative path (`rsync -a D/sessions/ MERGED/sessions/` per dir).
-- `run_budget.json`: recomputed by `metrics_v2.py` on the merged records — do NOT hand-merge
-  the per-batch run_budget.json files (batch 1 has none anyway; it was killed pre-end).
+- `run_budget.json`: NOT recomputed by `metrics_v2.py` (it only computes the run-mean
+  `memory_tokens` ratio gate from the kept records and prints it; it never reads or writes
+  run_budget.json). Do NOT hand-merge the per-batch run_budget.json files (batch 1 has none;
+  it was killed pre-end, and the runner computes it over all chains incl. invalid ones).
+  Merge is manual (script below); no merge script exists in `scripts/`.
 
 ```bash
 cd /tmp/opencode/nc-eval/runs
@@ -182,8 +223,9 @@ curl -sf -m 5 http://127.0.0.1:8307/healthz >/dev/null && echo ':8307 UP' || ech
 - Agent/compaction/question-answer model: `qwen/qwen3.8-flash` (runner header `qa=` is the
   ANSWER model, defaults to agent model; the dataset QA GENERATOR was `z-ai/glm-5.3-flash`,
   chains-manifest.json — different concepts, do not confuse).
-- nc note cap **640** tokens; mem_budget **1536** realized tokens; parity window [0.80, 1.05];
-  recall cap clamp(1536 - realized note, 256, 1024), packer v2, PACK_QUERY_BONUS=1.0 (off).
+- nc note cap **640** tokens; baseline hard trim **1536**; mem_budget **1536** realized tokens;
+  parity window [0.80, 1.05] on the run mean; recall cap clamp(1536 - realized nc C3 note,
+  256, 1024) (baseline realized C3 is only reported), packer v2, PACK_QUERY_BONUS=1.0 (off).
 - Judge: `openai/gpt-6-luna`, blind (shuffled order + logged mapping), budget flag default
   $0.30/run.
 - OpenRouter key: exported from `OPENROUTER_API_KEY` in `cortex/.env` (see the export
@@ -215,9 +257,51 @@ curl -s -m 15 https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $OP
 - nc compactions ~60 s each on the glm extractor (healthz run_ms max 53.7 s, queue 600 s
   timeout); total run ~2 h — batch it and let it run.
 - Batch A recall_error=530 on 28/28 nc asks (recall_raw_chars=0): the nc arm in fullB-075703
-  ran effectively note-only. Resolve before trusting any fullB number.
+  ran effectively note-only. Resolve before trusting any fullB number (cause undiagnosed, M5).
+- The runner needs `run_pool.py` (pi JSON-mode stdout parser) from the live working copy
+  `/tmp/opencode/nc-eval`; it is not committed here. `--dry-run` and `--pack-selftest` do not
+  need it.
 - Judge calibration kappa on the `unsupported` flag alone is 0.624 (score kappa 0.956) —
   mention as a caveat in the final report.
+
+## OPEN PROTOCOL ISSUES (owner decision needed)
+
+Found by the code review; NOT fixed by the harness fixes (no dataset rebuild, no runs).
+Until decided, treat any full-run number as exploratory.
+
+- **B4 — only 5 independent sessions.** The 10 chains are 5 sessions x (c0, c1); c0 and c1 of
+  a session share 2 of 3 spans, and 7/10 unanswerable probes use the same probe
+  (`NC_PHANTOM_TTL_MS`). metrics_v2 clusters by session and requires `MIN_CHAINS = 8` distinct
+  sessions, so with this dataset the power check can never pass: the verdict is forced to
+  INCONCLUSIVE (per metrics_v2 code; rule tables printed as diagnostics, a FAIL rule that
+  fires is not promoted to a FAIL verdict). Why it matters: the pre-registered WIN/FAIL gate
+  is unreachable until the dataset is rebuilt (more independent sessions, distinct probes) or
+  the protocol is amended (owner decision; amend BEFORE looking at results).
+- **M2 — nc may be chunk-RAG, not graph.** The runner calls `memory_recall` with
+  `session_id`, `question`, `top_k=8` and no `ll_keywords`/`hl_keywords`, so the retrieval mode
+  resolves to naive and the graph branch (`HARS_MEMORY_GRAPH_BRANCH=auto`) is probably
+  skipped (unverified on a live server). Why it matters: the claim under test is graph
+  memory; if recall is chunk-only, nc vs baseline does not test the graph, and the funnel's
+  `anchor_in_graph` / "kill graph" rule are meaningless. Check the recall payload sections
+  (relations/entities present?) before interpreting.
+- **M3 — mid-span anchors unreachable for HARS.** `neurocompact.ts` serializes the dropped
+  context, cuts it to `RAW_CAP = 60000` chars, and sends only the first `DROP_HALF = 12000` and
+  last 12000 chars to `memory_compact`; the baseline summarizer sees up to 60k. Anchors in
+  the middle of a long dropped span are never ingested by HARS. Why it matters: it
+  structurally disadvantages nc relative to baseline on the items the memory is for (share of
+  anchors outside the head+tail window: unmeasured).
+- **M5 — batch A recall_error=530 undiagnosed.** Suspects: embedding server :8791 down after
+  the 04:17 host OOM, with no lexical fallback; the container restarted onto other code.
+  Checks: container restart count / `StartedAt` of `nc-hars-chain-glm`; `:8791` health;
+  `vdb_chunks.json` size in the batch-A session dirs; grep logs for `embedding failed`. Why it
+  matters: batch A must be re-run, and a repeat would silently turn nc into note-only (the
+  new preflight + RECALL FAIL gate catch it, but only the root cause prevents it).
+- **M7 — tuning chains are in the decision set.** Packer v2 and cap tuning used chains
+  `qq8Vqbow_c0` and `y062eGZR_c0`, which are decision chains. Report results with and without
+  them. Also: batch 1 (`runs/full-20261026T021613`) ran under the old ask prompt / cap logic,
+  so it is not protocol-identical to new runs — re-run chains 1-3 or document the mix.
+  Judge calibration (agreement 0.976, kappa 0.956) was two temp-0 passes of ONE model: it
+  measures repeatability, not accuracy against humans or another judge.
 
 ## Cost ledger so far
 
@@ -232,11 +316,16 @@ curl -s -m 15 https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $OP
 Note: RUNBOOK-gate.md still says "key balance ~$4.0" — stale; the recorded balance at full-run
 launch was $6.5162. Judge spend per run is capped by `judge_v2.py --budget-usd` (default 0.30).
 
-## Data is NOT in git (repo is public)
+## Data is NOT in git (public-repo leak incident)
 
 `export/calib_items.jsonl`, `export/chains*.jsonl`, `export/chains-manifest.json` and
 `verify_chains.report.md` contain private session content/anchors and are git-ignored
-(see `.gitignore` here). They live in `/tmp/opencode/nc-eval` and must be archived to
-`/mnt/datasets/ft/artifacts/`. Scripts regenerate them (`make_chains.py`, `verify_chains.py`).
-Earlier commits of the old branch `exp/neurocompact-eval` on GitHub contained them; that branch
-must be deleted.
+(see `.gitignore` here; `runs/` and `sessions/` too). They live in `/tmp/opencode/nc-eval`
+and must be archived to `/mnt/datasets/ft/artifacts/`. Scripts regenerate them
+(`make_chains.py`, `verify_chains.py`).
+Leak incident: earlier commits of the old branch `exp/neurocompact-eval` on the PUBLIC upstream
+GitHub repo (`iuriimedvedev-dev/hars-longterm-memory`) contained them; that branch must be
+deleted (status of the deletion: unverified). The current home repo
+(`github.com/angkira/hars-memory`, private, branch `exp/neurocompact-eval-clean`) is a snapshot
+import without upstream history and carries none of these files. Do not push this branch or any
+data file to the upstream repo.
