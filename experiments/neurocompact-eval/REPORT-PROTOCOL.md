@@ -595,6 +595,58 @@ baseline_cap`, recorded with source `cli`; an explicit cap is a statement of the
 calibration, and is labelled so). The `smoke` command calibrates on its own single chain WITHOUT
 excluding it (a smoke is not a decision set; its `calibration.json` is not reusable).
 
+### 4a.5 PROTOCOL AMENDMENT C.5 (2026-10-26, written before any decision-set result was seen)
+
+Provenance: the owner's home bundle (`20261026T172729Z-homerun-home`, `calibration.json`, `oh/calibration/b1536-i*/`,
+`logs/oh.calibrate.*.log`). With Anthropic `claude-haiku-5-5` the baseline summarizer hit `finish_reason=length` at
+`max_tokens=1536` (NATIVE Claude tokens) while the very same summary measured **959 tokens in tiktoken cl100k and 1102 in
+chars/3.6**. Parity and every budget were measured with cl100k (runner, packer) or chars/3.6 (pi extension `realized_tokens`,
+the `summary_chars/3.6` fallback): three counters for one quantity, none of them the model's; the generation caps
+(`max_tokens`) are native tokens. So the nc arm's recall + note, packed to ~1536 "our" tokens, was ~1.4-1.6 x more NATIVE tokens
+than the baseline's 1536-token generation could ever hold, and the C.4 calibration ratio (1.32 at cap 1536, 1.20 at cap 2026)
+was mostly this exchange rate (plus noise: the calibration looked at C3 of ONE chain, whose baseline C3 was 1051/1069 against
+C1/C2 ~1400). Measured here with the free `count_tokens` endpoint on claude-haiku-5-5 (6000-character samples, request
+framing overhead of 8 tokens subtracted): native / cl100k = **1.57 (Python source), 1.53 (protocol prose), 1.64 (TypeScript)**,
+native / (chars/3.6) = 1.58-1.60 (the chars/3.6 label was never conservative on Claude). As with C to C.4, nothing below may be
+edited after the first decision-set record exists (a deviation is Amendment D). C.5 changes the UNIT in which parity and budgets
+are measured; it changes no metric, threshold, arm, window, formula, prompt, judge or section-5 rule.
+
+**C.5-1. Parity and all budgets are measured in the answering model's native tokenizer.** One layer, `scripts/tokcount.py`:
+
+- Anthropic: `POST /v1/messages/count_tokens` (`{"model", "messages":[{"role":"user","content":text}]}` -> `{"input_tokens"}`);
+  Gemini: `models/{m}:countTokens` (`totalTokens`); both free (Anthropic: subject to per-tier requests-per-minute limits, hence
+  the retry/backoff, the concurrency limit and the on-disk cache keyed by (provider, model, sha256(text))). The request's
+  constant framing overhead (8 tokens, measured per model as `count("x") - 1`) is subtracted, so a count is the cost of the TEXT.
+  Other providers (OpenRouter, custom): tiktoken cl100k, `native=false`, flagged. Offline/dry-run/tests: a calibrated-ratio
+  estimator, `native=false, estimated=true`. A live Anthropic/Gemini run that cannot count natively is REFUSED unless
+  `--token-counter tiktoken` accepts a flagged, non-native measurement.
+- Applies to everything parity-related, at compaction time and ask time: the baseline's and the nc note's realized tokens,
+  the recall payload AS INJECTED (wrapper and header included), `memory_tokens`, `arm_note_tokens`, the recall cap arithmetic,
+  the calibration. The tokenizer id and the native flag are stamped on every record, `chain_budget`, `calibration.json`,
+  `run_manifest.json` (`token_counter`), `run_budget.json`, `caps.json`.
+- Hard trims are to the NATIVE budget: the extension trims the baseline summary and the nc note to `NC_SUM_MAX_TOKENS`
+  verified against `count_tokens` (the section trimmer runs at an estimator cap that is lowered until the native count fits);
+  the recall packer packs with the fast estimator and then verifies the injected block natively, re-scaling until it fits
+  (and growing back toward the budget when it undershoots); long-session notes use the same fit. The extension's chars/3.6
+  `realized_tokens` is no longer a budget source (logged as `est_tokens_chars36`; the runner re-counts anyway).
+- Consequence for the numbers: B = 1536, the nc note cap (640 at B = 1536) and the recall cap clamp are now NATIVE tokens.
+  The formulas are unchanged; in absolute content the nc note and recall shrink by the exchange rate (~1.5x fewer cl100k
+  tokens), the baseline summary does not (its generation was always native).
+
+**C.5-2. The baseline cap defaults to cap(B) = B again.** With native counting the cap and the realized memory are the same unit,
+so cap(B) = B is the intended default. The C.4 machinery (`--baseline-cap`, `--baseline-cap-scale`, calibration, `caps.json`)
+stays; the calibration (a) counts natively, (b) aggregates over all compactions C1..C3 of every calibration chain AND the
+ask-time memory and reports both (`ratio_ask_time` = nc (C3 note + injected recall) / baseline C3, the quantity the gate measures,
+and `ratio_pooled_all_compactions` over 3k baseline summaries; the cap advice uses the pooled fill), (c) may use k chains
+(`[oh] calibration_chains`, default 1; all excluded from the decision set), and (d) accepts when CLIP-free and the run ratio is
+in [0.80, 1.05]. The calibration chains are still excluded from the decision set.
+
+**C.5-3. What this invalidates.** All earlier gate/batch parity numbers (cl100k or chars/3.6) overstate nc's share of the
+memory by the tokenizer exchange rate on Claude models (~1.5x before the cap), so their ratios must not be compared with
+C.5 numbers; the `calibration.json` of the 20261026T172729Z home campaign (and any calibration without `amendment: "C.5"`) is
+VOID and `home_run.py oh` refuses to use it. Non-Anthropic/Gemini runs keep a flagged cl100k measurement (`native=false`),
+which is a documented limitation of those runs, not a parity claim in the model's tokens.
+
 ## 5. Measurement stack
 
 **Recall packer v2** (run_chainreplay.py, frozen after the gate-212839 offline eval):

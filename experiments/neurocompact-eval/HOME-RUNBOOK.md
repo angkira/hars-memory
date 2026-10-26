@@ -36,7 +36,7 @@
 
 Written 2026-10-26. You run everything here with your HARS, your real embedder and your Anthropic key
 (later maybe OpenRouter / Gemini through a profile), and send ONE file back: the bundle (step 9).
-The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, C.2, C.3, **C.4**). Nothing in this
+The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, C.2, C.3, C.4, **C.5**). Nothing in this
 runbook changes a metric or a rule; the tooling is `scripts/home_run.py` (one entry point) on top of the
 existing scripts. All paths below are relative to the repo root.
 
@@ -58,7 +58,7 @@ they were computed; with tiktoken they move by roughly +-15%).
 |---|---|---|---|---|---|
 | `oh` DEFAULT: B=1536 only | 14 chains x 10 items x 4 arms | **$0.75** with prompt cache (uncached $3.64) | $1.90 (560 items) | - | ~7 h |
 | `beam` DEFAULT: B=1536 only, **N=10 seeded chats** | BEAM-1M, ~13M tokens, ~100 boundaries, ~5.7k HARS pieces | **~$9.8** (of which HARS extraction ~$6.0, an ESTIMATE; scaled from the 35-chat figure, `dry-run` gives the real one; answer-call cache saving not included) | ~$1.4 (400 items) | - | ~19 h (~17 h HARS ingest at the guessed 11 s/piece) |
-| `cc` DEFAULT: the session(s) you pick (`cc --find`) | per session with ~7 real boundaries, 16 generated questions (12 single + 4 multihop), every:3 checkpoints | ~$1-1.5 / session | ~$0.3-0.7 / session | ~$1-2 / session (Sonnet, upper-ish bound) | ~2-3 h / session |
+| `cc` DEFAULT: the session(s) you pick (`cc --find`) | per session with ~7 real boundaries, 54 generated questions (40 single + 10 multihop + 4 unanswerable; menu mode), every:3 checkpoints | ~$1-1.5 / session | ~$0.3-0.7 / session | ~$1-2 / session (Sonnet, upper-ish bound) | ~2-3 h / session |
 | **DEFAULT TOTAL, one cc session** | | **~$12** | **~$3.7** | **~$1.5** | **~$17**; caps 3 / 20 / 5, total 30 |
 
 Opt-in (not run by default; `dry-run` prices them from your `[oh]/[beam]` budgets, figures below are UNCACHED list-price estimates of the C.2 numbers):
@@ -127,7 +127,7 @@ uv run python $S/home_run.py doctor --deep                          # in another
 behavioural paraphrase probe** (a tiny `memory_compact` + `memory_recall`; a hash/shim or broken embedder FAILS it -
 `memory_status` alone cannot be trusted: it reports `HARS_MEMORY_EMBED_MODEL` even when `HARS_MEMORY_EMBED_PROVIDER=http`
 serves a different model, see the findings in `HANDOFF.md`); the cents-level liveness ping of every profile model;
-the server's extractor/keyword model vs the profile; keys; pi 1.4.x; node; free disk; tiktoken; your inputs.
+the server's extractor/keyword model vs the profile; keys; **`tokcount.native` (Amendment C.5: one free `count_tokens` call on the answering model must succeed; FAIL = a run would be refused)**; pi 1.4.x; node; free disk; tiktoken; your inputs.
 Do not run two clients against the HARS engine at once (1 thread / queue 32 by design; the host has an OOM history).
 
 ## 4. Inputs
@@ -187,6 +187,17 @@ printed in every report, C.1-2). The vendor switch (OpenRouter / Gemini) is `--p
 
 Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~7 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
+
+### 6.0 Amendment C.5 - tokens are native (read first)
+
+Parity and every budget are now counted in the answering model's NATIVE tokens (`count_tokens`, free; needs the same key; cached
+in `~/.cache/nc-tokcount/cache.jsonl`, override `NC_TOKCOUNT_CACHE`). Your bundle showed why: a baseline summary of 959 cl100k
+tokens hit `max_tokens=1536` (~1.6x). The calibration of `20261026T172729Z-homerun-home` is VOID: use a NEW campaign (`--new`),
+refresh the scripts (EVAL-VERSION `2026-10-26.c5`), run `doctor` (row `tokcount.native` must be OK), then `calibrate`. The cap
+defaults to cap(B) = B and should now calibrate at ~1.0; `[oh] calibration_chains = 3` (default 1) averages the fill over more
+chains (all excluded from the decision set; costs ~3x the cents-level calibration). `calibration.json` shows `ratio_ask_time`
+(the gate's quantity) and `ratio_pooled_all_compactions`. Offline: `NC_TOKCOUNT=estimate`; `--token-counter tiktoken` accepts a
+flagged non-native measurement (not for a decision set on Claude).
 
 ### 6a. Baseline-cap calibration (Amendment C.4) - why `oh` refuses without it
 

@@ -71,6 +71,7 @@ sys.path.insert(0, BASE)
 import cc_discover  # noqa: E402
 import ls_redact  # noqa: E402
 import providers as P  # noqa: E402
+import tokcount  # noqa: E402  (Amendment C.5: native token counting)
 
 DEFAULT_ROOT = "/mnt/datasets/ft/artifacts"
 PI_VERSION_PREFIX = "1.4."
@@ -82,7 +83,7 @@ PHASES = ("gen", "run", "judge")
 CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
 PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
 PLACEHOLDER_CAP = 0.0
-HOME_RUN_VERSION = "2026-10-26.c4"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+HOME_RUN_VERSION = "2026-10-26.c5"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
 EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
 HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
 BUDGET_TOTAL_DEFAULT = 30.0
@@ -104,10 +105,14 @@ DEFAULT_CONFIG: dict = {
            # table {1536 = 2010}) / baseline_cap_scale (cap(B) = round(B*scale); 0 = unset) are EXPLICIT values:
            # the start of `calibrate`, and accepted by `oh` without a calibration.
            "baseline_cap": "", "baseline_cap_scale": 0.0,
-           "calibration_max_iterations": 2, "calibration_seed": 20261026},
+           "calibration_max_iterations": 2, "calibration_seed": 20261026,
+           # Amendment C.5: calibrate on k chains (first k of the seeded order; ALL excluded from the decision set).
+           # Default 1; realized tokens are aggregated over C1..C3 of every calibration chain.
+           "calibration_chains": 1},
     "beam": {"repo": "", "size": "1M", "chats": "sample", "n_chats": 10, "seed": 20261026, "limit": 0,
              "checkpoints": "end", "budgets": [1536], "session_concurrency": 1, "extra_args": []},
-    "cc": {"paths": [], "root": "~/.claude/projects", "min_tokens": 0, "limit": 0, "n_single": 12, "n_multihop": 4,
+    "cc": {"paths": [], "root": "~/.claude/projects", "min_tokens": 0, "limit": 0, "n_single": 40, "n_multihop": 10,
+           "n_unanswerable": 4,   # gen_longsession_qa menu-mode defaults (window-targeted); ~$0.3 on Sonnet per session
            "session_budget_usd": 2.5, "checkpoints": "every:3", "budgets": [1536], "max_questions": 0, "extra_args": []},
     "smoke": {"run_cap_oh": 0.90, "run_cap_ls": 0.25, "judge_cap": 0.25},
     "hars": {"data_dir": "", "port": 8307},
@@ -535,6 +540,20 @@ class Probes:
                      timeout=60, retries=2, soft_extra_body=P.thinking_soft_extra(profile, "disabled"))
         return f"{res.text.strip()[:20]!r} ${res.cost_usd or 0:.5f}"
 
+    def native_count(self, profile, model: str, key_env: str | None) -> str:
+        """Amendment C.5 liveness: one NATIVE count of a code-ish sample (count_tokens is free). Returns a
+        one-line description; raises when the counter is not reachable."""
+        import tokcount  # noqa: PLC0415
+        prov = tokcount.provider_of_profile(profile.name)
+        if prov not in tokcount.NATIVE_PROVIDERS:
+            raise RuntimeError(f"profile {profile.name} has no native token counter (cl100k fallback, native=False)")
+        key = P.resolve_key(profile, key_env)
+        ctr = tokcount.Counter(prov, model, mode="native", key=key, cache_path="")
+        sample = "def f(x):\n    return {'k': [x, x+1], 'id': 'a1b2c3'}\n" * 12
+        n = ctr.count(sample)
+        return (f"{ctr.tokenizer_id}: {n} tok for {len(sample)} chars (native/{tokcount.FAST_ID} = "
+                f"{n / max(1, tokcount.fast_count(sample)):.2f}); framing overhead {ctr.manifest()['overhead_subtracted']} subtracted")
+
     def tiktoken_info(self) -> tuple[bool, str]:
         try:
             import tiktoken  # noqa: PLC0415
@@ -724,6 +743,14 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
                 add(f"model.{role}", "FAIL", f"{m} via {prof.name} not reachable: {str(e)[:160]}")
         if not any(r["check"].startswith("model.extractor") for r in rows):
             pass
+        # Amendment C.5: parity and every budget are counted in the answering model's NATIVE tokens
+        am = models.get("answer") or models.get("agent")
+        try:
+            add("tokcount.native", "OK", probes.native_count(prof, am, kenv), scope="oh,beam,cc")
+        except Exception as e:  # noqa: BLE001
+            add("tokcount.native", "FAIL", f"native token counting for {am} via {prof.name} is not available: "
+                f"{str(e)[:160]} (Amendment C.5: a run would be refused; count_tokens is free - check the key / "
+                "network / model id)", scope="oh,beam,cc")
     if deep and not offline:
         rows.extend(deep_ingest_check(cfg, probes))
     # pi / node
@@ -751,8 +778,8 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
         f"{free:.1f} GB free at {root} (want >= {mn:.0f}: BEAM-10M sessions, run dirs, HARS stores)")
     okt, info = probes.tiktoken_info()
     add("tiktoken", "OK" if okt else "WARN",
-        info if okt else f"{info} -> token counts fall back to chars/3.6 (recorded as tokenizer in every "
-                         "record); a decision set must use ONE tokenizer, so decide now")
+        (info if okt else f"{info} -> the FAST estimator falls back to chars/3.6") +
+        " (only the packer's inner loop / non-native providers; budgets use the native counter, Amendment C.5)")
     # inputs
     oh = cfg["oh"].get("artifact_dir")
     add("input.oh", "OK" if oh and os.path.isfile(os.path.join(oh, "chains.jsonl")) else "WARN",
@@ -1153,7 +1180,7 @@ def estimate_cc(camp: Campaign) -> dict:
                            "(--use-real-compactions, `orig` arm) needs sessions that were compacted by Claude Code")
     dry = camp.p("cc", "dry-data")
     shutil.rmtree(dry, ignore_errors=True)
-    nq = int(c["n_single"]) + int(c["n_multihop"])
+    nq = int(c["n_single"]) + int(c["n_multihop"]) + int(c.get("n_unanswerable", 4))
     for s in sessions:
         if s.get("compactions"):
             L.save_session(placeholder_session(s, nq), dry)
@@ -1162,7 +1189,8 @@ def estimate_cc(camp: Campaign) -> dict:
         _, gtext = camp.run("dry.cc.gen", [camp.script("gen_longsession_qa.py"), "--sessions", data,
                                            "--out", camp.p("cc", "dry-gen"), *profile_args(camp.cfg),
                                            "--use-real-compactions", "--n-single", str(c["n_single"]),
-                                           "--n-multihop", str(c["n_multihop"]), "--dry-run",
+                                           "--n-multihop", str(c["n_multihop"]),
+                                           "--n-unanswerable", str(c.get("n_unanswerable", 4)), "--dry-run",
                                            "--budget-usd", "1000000"], check=False)
         gen_usd = parse_gen_dry(gtext)
         s = estimate_ls(camp, "cc", dry, c["budgets"], c["checkpoints"], True,
@@ -1174,7 +1202,7 @@ def estimate_cc(camp: Campaign) -> dict:
     return {"track": "cc", "gen_usd": gen_usd, "run_usd": s["run_usd"], "judge_usd": s["judge_usd"],
             "judged_items": s["judged_items"], "wall_hours": s["wall_hours"], "budgets": c["budgets"],
             "sessions": s["sessions"], "sessions_imported": len(sessions), "cache_saving_usd": s.get("cache_saving_usd", 0.0),
-            "note": "questions are placeholders (n_single+n_multihop per session, real boundaries, "
+            "note": "questions are placeholders (n_single+n_multihop+n_unanswerable per session, real boundaries, "
                     "orig arm included); QA generation is an upper-ish bound (max calls)"}
 
 
@@ -1545,15 +1573,24 @@ def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exc
     allc = oh_all_chains(camp)
     seed = o.get("calibration_seed", 20261026)
     chain_id, order = pick_calibration_chain([c["chain_id"] for c in allc], seed)
+    k_chains = max(1, int(o.get("calibration_chains", 1) or 1))
+    if exclude and k_chains >= len(order):
+        raise HomeRunError(f"[oh] calibration_chains = {k_chains} would leave no decision-set chain "
+                           f"({len(order)} chains in total)")
+    cal_ids = order[:min(k_chains, len(order))]
     cdir = camp.p("oh", "calibration")
     os.makedirs(cdir, exist_ok=True)
     chain_path = os.path.join(cdir, "chain.jsonl")
+    by_id = {c["chain_id"]: c for c in allc}
     with open(chain_path, "w") as f:
-        f.write(json.dumps(next(c for c in allc if c["chain_id"] == chain_id), ensure_ascii=False) + "\n")
+        for cid_ in cal_ids:
+            f.write(json.dumps(by_id[cid_], ensure_ascii=False) + "\n")
+    prof_ = P.load_profile(camp.cfg["general"]["profile"])
+    expect_native = tokcount.provider_of_profile(prof_.name) in tokcount.NATIVE_PROVIDERS
     primary = 1536 if 1536 in budgets else max(budgets)
     ordered = [primary] + sorted((b for b in budgets if b != primary), reverse=True)
     start = start or {"map": {}, "scale": None, "origin": "default"}
-    print(f"[calibrate] chain {chain_id} (first of {len(order)} in seeded order, seed {seed}); B in {ordered}; "
+    print(f"[calibrate] chain(s) {cal_ids} (first {len(cal_ids)} of {len(order)} in seeded order, seed {seed}); B in {ordered}; "
           f"at most {max_iter} calibration run(s) per B; acceptance: CLIP-free and ratio in [{PARITY_LO}, {PARITY_HI}]")
     per_b: dict[str, dict] = {}
     scale = None
@@ -1576,7 +1613,8 @@ def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exc
                 rem = camp.remaining("oh", "run")
                 if os.path.isdir(out) and os.listdir(out):
                     camp.quarantine(out)
-                argv = [camp.script("run_chainreplay.py"), "--calibrate", "--chains", chain_path, "--limit", "1",
+                argv = [camp.script("run_chainreplay.py"), "--calibrate", "--chains", chain_path, "--limit", str(len(cal_ids)),
+                        "--calibrate-chains", str(len(cal_ids)),
                         *profile_args(camp.cfg), "--allow-same-family-judge", "--arms", "baseline,nc-chunks",
                         "--mem-budgets", str(int(B)), "--baseline-cap", f"{int(B)}:{int(cap)}",
                         "--baseline-cap-source", "cli", "--budget-usd", str(rem), "--out", out,
@@ -1592,6 +1630,10 @@ def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exc
                     raise HomeRunError(f"calibration run {step} did not finish (exit {rc}); log logs/{step}.log; "
                                        "re-running redoes it")
                 return {"B": B, "iter": k, "cap": cap, "out": out, "ratio": cal.get("ratio"),
+                        "ratio_ask_time": cal.get("ratio_ask_time", cal.get("ratio")),
+                        "ratio_pooled_all_compactions": cal.get("ratio_pooled_all_compactions"),
+                        "tokenizer": cal.get("tokenizer"), "tokenizer_native": cal.get("tokenizer_native"),
+                        "amendment": cal.get("amendment"),
                         "in_window": cal.get("in_window"), "clip": cal.get("clip"),
                         "clip_free": cal.get("clip_free"), "recommended_cap": cal.get("recommended_cap"),
                         "nc_memory_total": cal.get("nc_memory_total"),
@@ -1602,9 +1644,14 @@ def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exc
                                    f"use --new for a fresh campaign or --force-step {step}")
             iters.append(res)
             spent_total += float(res.get("spent_usd") or 0.0)
-            print(f"  [calibrate B={B} #{k}] cap {cap}: ratio {res['ratio']} "
-                  f"({'in' if res['in_window'] else 'OUTSIDE'} window), clip-free={res['clip_free']}, "
-                  f"advice cap {res['recommended_cap']}, spent {fmt_usd(res['spent_usd'])}")
+            print(f"  [calibrate B={B} #{k}] cap {cap}: ask-time ratio {res['ratio']} "
+                  f"({'in' if res['in_window'] else 'OUTSIDE'} window; pooled over all compactions "
+                  f"{res.get('ratio_pooled_all_compactions')}), clip-free={res['clip_free']}, tokenizer "
+                  f"{res.get('tokenizer')}, advice cap {res['recommended_cap']}, spent {fmt_usd(res['spent_usd'])}")
+            if expect_native and not res.get("tokenizer_native"):
+                why = (f"the calibration run counted tokens with {res.get('tokenizer')!r} (native=False): Amendment C.5 "
+                       "calibrates in the answering model's NATIVE tokens only")
+                break
             if res["clip_free"] and res["in_window"] is True:
                 ok = True
                 break
@@ -1627,9 +1674,12 @@ def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exc
             break
     pb = per_b.get(str(primary)) or {}
     source_dir = pb.get("run_dir")
+    pb_tok = (pb.get("iterations") or [{}])[-1]
     cal_out = {
-        "version": 1, "ts": utc_iso(), "track": "oh", "status": status, "chain_id": chain_id,
-        "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first',
+        "version": 2, "amendment": "C.5", "ts": utc_iso(), "track": "oh", "status": status, "chain_id": cal_ids[0],
+        "chain_ids": cal_ids, "calibration_chains": len(cal_ids),
+        "tokenizer": (pb_tok or {}).get("tokenizer"), "tokenizer_native": (pb_tok or {}).get("tokenizer_native"),
+        "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first k',
                             "seed": seed, "population": len(order), "order_head": order[:3]},
         "primary_budget": primary, "budgets": ordered, "window": [PARITY_LO, PARITY_HI],
         "max_iterations": max_iter,
@@ -1641,7 +1691,7 @@ def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exc
         "source_run_dir": source_dir, "spent_usd": round(spent_total, 6),
         "started_from": {"origin": start.get("origin"), "map": {str(k): v for k, v in start["map"].items()},
                          "scale": start.get("scale")},
-        "excluded_from_decision_set": ([chain_id] if exclude else []),
+        "excluded_from_decision_set": (list(cal_ids) if exclude else []),
         "note": ("the calibration chain is excluded from the decision set (Amendment C.4)" if exclude else
                  "smoke: nothing here is a decision set, the calibration chain is not excluded"),
     }
@@ -1667,6 +1717,10 @@ def oh_cap_plan(camp: Campaign, args, budgets: list[int]) -> dict:
     if cli["map"] or cli["scale"]:
         ex = {**cli, "origin": "cli"}
         mode, source = "explicit", "cli"
+    elif cal and cal.get("amendment") != "C.5":
+        raise HomeRunError(f"oh refuses to run: {camp.p(CAL_FILE)} predates Amendment C.5 (counted in cl100k / chars "
+                           "tokens, not the answering model's native tokens) and is VOID. Run "
+                           "`home_run.py calibrate` again (new campaign dir: --new), or pass --baseline-cap explicitly.")
     elif cal.get("status") == "pass":
         ex = {"map": {int(b): int(c) for b, c in (cal.get("caps") or {}).items()}, "scale": cal.get("scale"),
               "origin": "calibration"}
@@ -1689,7 +1743,11 @@ def oh_cap_plan(camp: Campaign, args, budgets: list[int]) -> dict:
         else:
             raise HomeRunError(f"no baseline cap for B={B}: the explicit map {ex['map']} has no entry for it and "
                                "no --baseline-cap-scale is set; pass --baseline-cap-scale or add the B to the map")
-    plan = {"mode": mode, "origin": ex["origin"], "source": source, "caps": rows,
+    tok = {"tokenizer": cal.get("tokenizer"), "tokenizer_native": cal.get("tokenizer_native")} if mode == "calibrated" \
+        else {"tokenizer": None, "tokenizer_native": None,
+              "tokenizer_note": "explicit caps: the run's own tokenizer is stamped in run_manifest.json "
+                                "(Amendment C.5: the answering model's native counter)"}
+    plan = {"mode": mode, "origin": ex["origin"], "source": source, "caps": rows, **tok,
             "map": {str(k): v for k, v in ex["map"].items()}, "scale": ex["scale"],
             "calibration": camp.p(CAL_FILE) if cal else None,
             "excluded_from_decision_set": oh_exclusions(camp), "ts": utc_iso()}
@@ -1943,7 +2001,8 @@ def cmd_cc(camp: Campaign, args) -> int:
             os.makedirs(qa_dir, exist_ok=True)
             argv = [camp.script("gen_longsession_qa.py"), "--sessions", *[s["_path"] for s in todo], "--out", qa_dir,
                     *profile_args(cfg), "--use-real-compactions", "--n-single", str(c["n_single"]),
-                    "--n-multihop", str(c["n_multihop"]), "--budget-usd", str(rem),
+                    "--n-multihop", str(c["n_multihop"]),
+                    "--n-unanswerable", str(c.get("n_unanswerable", 4)), "--budget-usd", str(rem),
                     "--session-budget-usd", str(c["session_budget_usd"])]
             rc, _ = camp.run("cc.qa", argv, check=False)
             if os.path.isfile(os.path.join(qa_dir, "qa-manifest.json")):

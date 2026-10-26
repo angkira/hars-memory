@@ -46,7 +46,7 @@
  *
  * Every compaction prints one machine-readable stderr line:
  *   [nc-metrics] {"arm":"baseline|nc|note-only","stop":"stop","max_tokens":N,
- *                 "usage":{...},"summary_chars":N,"realized_tokens":N,
+ *                 "usage":{...},"summary_chars":N,"realized_tokens":N (native with NC_TOKCOUNT_NATIVE=anthropic),
  *                 "tokenizer":"...","trimmed_sections":[...],
  *                 "trimmed_tokens":N,"persisted":true}
  * plus, when something was cut, a human-greppable
@@ -189,6 +189,61 @@ const TOKENIZER_LABEL = "estimator:chars/3.6";
 
 function countTokens(text: string): number {
 	return Math.round((text || "").length / 3.6);
+}
+
+// Amendment C.5: budgets are NATIVE tokens of the answering model. The chars/3.6 count above is only a
+// fast estimator (it drives the section trimmer's inner loop); with NC_TOKCOUNT_NATIVE=anthropic the cap is
+// enforced against POST /v1/messages/count_tokens (free; key ANTHROPIC_API_KEY, base ANTHROPIC_BASE_URL,
+// model NC_TOKCOUNT_MODEL): see fitNative(). `realized_tokens` in [nc-metrics] is then the native count,
+// and `est_tokens_chars36` carries the chars/3.6 number as a diagnostic. The runner re-counts anyway.
+const NATIVE_COUNT = (process.env.NC_TOKCOUNT_NATIVE || "off") === "anthropic";
+let nativeOverhead: number | null = null;
+
+async function nativeRaw(text: string): Promise<number> {
+	let base = (process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com").replace(/\/+$/, "");
+	if (base.endsWith("/v1")) base = base.slice(0, -3);
+	const body = JSON.stringify({
+		model: process.env.NC_TOKCOUNT_MODEL || process.env.NC_SUM_MODEL_ID || "",
+		messages: [{ role: "user", content: text }],
+	});
+	let lastErr = "";
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			const r = await fetch(`${base}/v1/messages/count_tokens`, {
+				method: "POST",
+				headers: {
+					"x-api-key": process.env.ANTHROPIC_API_KEY || "",
+					"anthropic-version": "2023-06-01",
+					"content-type": "application/json",
+				},
+				body,
+			});
+			if (r.ok) {
+				const j: any = await r.json();
+				if (typeof j.input_tokens === "number") return j.input_tokens;
+				lastErr = "no input_tokens in response";
+			} else {
+				lastErr = `HTTP ${r.status}`;
+				if (![408, 409, 425, 429, 500, 502, 503, 504, 529].includes(r.status)) break;
+			}
+		} catch (e) {
+			lastErr = String(e);
+		}
+		await new Promise((res) => setTimeout(res, 1500 * 2 ** attempt));
+	}
+	throw new Error(`count_tokens failed: ${lastErr}`);
+}
+
+/** Native token count of `text` (request framing overhead subtracted), or null when native counting is off/unavailable. */
+async function nativeCount(text: string): Promise<number | null> {
+	if (!NATIVE_COUNT || !text || !text.trim()) return null;
+	try {
+		if (nativeOverhead === null) nativeOverhead = Math.max(0, (await nativeRaw("x")) - 1);
+		return Math.max(1, (await nativeRaw(text)) - nativeOverhead);
+	} catch (e) {
+		console.error(`[nc] native token count unavailable (${e}); falling back to the chars/3.6 estimator`);
+		return null;
+	}
 }
 
 interface NcSection {
@@ -1100,9 +1155,32 @@ ${convText}
 		// the tail (ACTIVE STATE). Never trust the model's own length control.
 		// forceRepair wires the stop reason in: a stop=length completion that was
 		// cut on a bare list marker or mid-sentence gets its tail repaired.
-		const trimRes = summary
-			? trimNote(summary, noteCap, SECTION_TRIM, response.stopReason === "length")
-			: null;
+		//
+		// Amendment C.5: with NC_TOKCOUNT_NATIVE=anthropic the cap is a NATIVE-token cap. trimNote() works in the
+		// chars/3.6 estimator, so run it at estCap = noteCap / (native per estimator token of THIS text) and
+		// lower estCap until the trimmed text's native count fits (verify, don't assume).
+		let trimRes: NcNoteResult | null = null;
+		let nativeTokens: number | null = null;
+		let estCap = noteCap;
+		let nativeIters = 0;
+		if (summary) {
+			const forceRepair = response.stopReason === "length";
+			const n0 = await nativeCount(summary);
+			if (n0 !== null) {
+				estCap = Math.max(1, Math.floor(noteCap / Math.max(0.05, n0 / Math.max(1, countTokens(summary)))));
+				trimRes = trimNote(summary, estCap, SECTION_TRIM, forceRepair);
+				let n = await nativeCount(trimRes.text);
+				while (n !== null && n > noteCap && nativeIters < 14 && estCap > 1) {
+					nativeIters++;
+					estCap = Math.max(1, Math.min(estCap - 1, Math.floor((estCap * noteCap * 0.985) / n)));
+					trimRes = trimNote(summary, estCap, SECTION_TRIM, forceRepair);
+					n = await nativeCount(trimRes.text);
+				}
+				nativeTokens = n;
+			} else {
+				trimRes = trimNote(summary, noteCap, SECTION_TRIM, forceRepair);
+			}
+		}
 		const trimmedSummary = trimRes ? trimRes.text : "";
 		if (trimRes) {
 			// Human-greppable line, ALWAYS printed for a summarized compaction
@@ -1126,7 +1204,9 @@ ${convText}
 			);
 		}
 		const summaryOrRaw = trimmedSummary || `[unsummarized — raw tail of dropped context]\n${convText.slice(-4000)}`;
-		const realizedTokens = countTokens(summaryOrRaw);
+		const estTokens = countTokens(summaryOrRaw);
+		const realizedTokens = nativeTokens !== null && trimmedSummary ? nativeTokens : estTokens;
+		const realizedNative = nativeTokens !== null && !!trimmedSummary;
 		if (process.env.NC_DEBUG === "1") {
 			console.error(`[nc-debug] summary len=${summary.length} head=${summary.slice(0, 90)}`);
 		}
@@ -1176,7 +1256,11 @@ ${convText}
 			summary_chars: summaryOrRaw.length,
 			realized_tokens: realizedTokens,
 			realized_chars: summaryOrRaw.length,
-			tokenizer: TOKENIZER_LABEL,
+			tokenizer: realizedNative ? `anthropic:count_tokens:${process.env.NC_TOKCOUNT_MODEL || SUM_MODEL_ID}` : TOKENIZER_LABEL,
+			native: realizedNative,
+			est_tokens_chars36: estTokens,
+			native_est_cap: realizedNative ? estCap : null,
+			native_trim_iters: nativeIters,
 			section_trim: SECTION_TRIM,
 			trimmed_sections: trimRes ? trimRes.trimmedSections : [],
 			trimmed_tokens: trimRes ? trimRes.trimmedTokens : 0,

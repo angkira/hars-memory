@@ -66,6 +66,9 @@ class FakeProbes(H.Probes):
     def tiktoken_info(self):
         return True, "tiktoken cl100k_base loaded"
 
+    def native_count(self, profile, model, key_env):
+        return "anthropic:count_tokens:%s: 400 tok (fake)" % model
+
 
 def cfg_for(root, **over):
     base = {"general": {"artifact_root": root, "name": "t"}, "caps": {"gen": 5.0, "run": 50.0, "judge": 20.0}}
@@ -73,6 +76,19 @@ def cfg_for(root, **over):
 
 
 class ConfigAndCaps(unittest.TestCase):
+    def test_cc_qa_defaults_are_the_menu_mode_numbers(self):
+        cc = H.load_config(None, {})["cc"]
+        self.assertEqual((cc["n_single"], cc["n_multihop"], cc["n_unanswerable"]), (40, 10, 4))
+        self.assertGreaterEqual(cc["session_budget_usd"], 1.0)          # expected spend ~$0.3 on Sonnet
+        self.assertGreaterEqual(H.CC_TYPICAL["gen"], 1.0)
+        ex = H.load_config(os.path.join(os.path.dirname(H.__file__), "..", "home_run.toml.example"), {})["cc"]
+        self.assertEqual((ex["n_single"], ex["n_multihop"], ex["n_unanswerable"]), (40, 10, 4))
+
+    def test_calibration_chains_default_one_and_tokenizer_check_exists(self):
+        self.assertEqual(H.load_config(None, {})["oh"]["calibration_chains"], 1)
+        rows = H.doctor_checks(H.load_config(None, {"general": {"name": "t"}}), FakeProbes(), live=True)
+        self.assertEqual([r["status"] for r in rows if r["check"] == "tokcount.native"], ["OK"])
+
     def test_caps_refuse_when_unset_and_per_track_override(self):
         cfg = H.load_config(None, {})
         for ph in H.PHASES:
@@ -472,7 +488,9 @@ class FakeRunner:
                "clip": {"baseline": {"compactions": 3, "unrepaired_clipped": 3 if clipb else 0, "clip_fail": clipb},
                         "nc-chunks": {"compactions": 3, "unrepaired_clipped": 3 if clipn else 0, "clip_fail": clipn}},
                "clip_free": not (clipb or clipn), "recommended_cap": step.get("recommended_cap", cap),
-               "nc_memory_total": 1500, "baseline_memory_total": round(1500 / ratio), "spent_usd": 0.25}
+               "nc_memory_total": 1500, "baseline_memory_total": round(1500 / ratio), "spent_usd": 0.25,
+               "amendment": "C.5", "tokenizer": "anthropic:count_tokens:claude-haiku-5-5", "tokenizer_native": True,
+               "ratio_ask_time": ratio, "ratio_pooled_all_compactions": ratio}
         json.dump(cal, open(os.path.join(out, "calibration.json"), "w"))
         self.cal_argvs = getattr(self, "cal_argvs", []) + [argv]
         return 0, f"calibration cap {cap} ratio {ratio}\n"

@@ -3,7 +3,16 @@
 Written 2026-10-26 by the interim agent. Read with: RUNBOOK-gate.md, REPORT-PROTOCOL.md,
 INFRA-NOTES.md, REPORT-forensics-gate212839.md.
 
-## STATE UPDATE 2026-10-26 (Amendment C.4: calibrated baseline cap) — NEWEST, READ FIRST
+## STATE UPDATE 2026-10-26 (Amendment C.5: native-token parity) — NEWEST, READ FIRST
+
+EVAL-VERSION / HOME_RUN_VERSION `2026-10-26.c5`. Cause: tokenizer exchange rate (cl100k/chars-3.6 budgets vs native `max_tokens`; measured
+native/cl100k 1.53-1.64 on claude-haiku-5-5, REPORT-PROTOCOL.md 4a.5). `scripts/tokcount.py` is the ONE counter (Anthropic/Gemini
+count_tokens, cached, concurrency-limited; flagged cl100k/estimator otherwise); run_chainreplay/run_longsession/home_run use it for realized
+tokens, injected recall (packer verifies natively), trims (the pi extension fits the cap natively via `NC_TOKCOUNT_NATIVE=anthropic`),
+`memory_tokens`, calibration (k chains, C1..C3 + ask-time reported both; caps.json records the tokenizer). `doctor` checks `tokcount.native`.
+The 20261026T172729Z calibration is void: new campaign, refresh the home copy, `doctor`, `calibrate`.
+
+## (previous) STATE UPDATE 2026-10-26 (Amendment C.4: calibrated baseline cap)
 
 Owner's home smoke: OH calibration at baseline cap 1536 failed (baseline C3 `stop=length` = CLIP FAIL on claude-haiku-5-5, run ratio
 nc/baseline 1.31 vs window [0.80, 1.05]); the runner's own advice was a cap near 2010. Two tooling bugs kept it from being applied:

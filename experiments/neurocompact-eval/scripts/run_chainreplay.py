@@ -141,6 +141,7 @@ import urllib.request
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import providers  # noqa: E402  (single provider layer: profiles, prices, family check, budget)
+import tokcount  # noqa: E402  (ONE token counter: native tokens of the answering model, Amendment C.5)
 from providers import model_family, family_conflict  # noqa: E402,F401  (re-exported, tests use rc.*)
 try:
     from run_pool import extract, extract_spend  # noqa: E402  (reused helper: pi JSON-mode stdout parser)
@@ -399,20 +400,63 @@ def recall_ceil_formula(budget: int) -> int:
 # ---------------------------------------------------------------------------
 # tokenizer
 # ---------------------------------------------------------------------------
-try:
-    import tiktoken  # noqa: F401
+# FAST estimator (tiktoken cl100k when its vocabulary loads, else chars/3.6): used ONLY inside the
+# packer's inner loops and for dry-run projections. EVERY budget / parity / realized / memory_tokens
+# number goes through ntok() = the answering model's NATIVE tokenizer (tokcount.py, Amendment C.5).
+count_tokens = tokcount.fast_count
+FAST_TOKENIZER = tokcount.FAST_ID
+TOKENIZER = FAST_TOKENIZER          # stamped on records; set_counter() replaces it by the counter's id
+COUNTER = None                      # tokcount.Counter of the run (None only in unit tests of the legacy paths)
 
-    _ENC = tiktoken.get_encoding("cl100k_base")
 
-    def count_tokens(text: str) -> int:
-        return len(_ENC.encode(text or ""))
+def set_counter(counter) -> None:
+    """Install the run's token counter (also as the tokcount default, which pack_injection and
+    run_longsession use) and re-stamp TOKENIZER."""
+    global COUNTER, TOKENIZER
+    COUNTER = counter
+    tokcount.set_default(counter)
+    TOKENIZER = counter.tokenizer_id if counter is not None else FAST_TOKENIZER
 
-    TOKENIZER = "tiktoken:cl100k_base"
-except Exception:  # tiktoken not installed in this interpreter
-    def count_tokens(text: str) -> int:
-        return int(round(len(text or "") / 3.6))
 
-    TOKENIZER = "estimator:chars/3.6"
+def ntok(text: str) -> int:
+    """Budget-grade token count (native when a native counter is installed)."""
+    return COUNTER.count(text) if COUNTER is not None else count_tokens(text)
+
+
+def tokenizer_info() -> dict:
+    if COUNTER is None:
+        return {"tokenizer": TOKENIZER, "native": False, "estimated": False}
+    m = COUNTER.manifest()
+    return {"tokenizer": m["tokenizer"], "native": m["native"], "estimated": m["estimated"]}
+
+
+def setup_counter(args, live: bool):
+    """Build + install the run's counter. Live Anthropic/Gemini runs REFUSE to continue on a
+    non-native counter unless --token-counter says so explicitly (silently falling back to
+    cl100k is exactly the Amendment C.5 bug)."""
+    prov = tokcount.provider_of_profile(getattr(args, "provider", None))
+    mode = (getattr(args, "token_counter", None) or os.environ.get("NC_TOKCOUNT") or "auto").lower()
+    if not live and mode in ("auto", "native"):
+        mode = "estimate"                       # dry-run / offline: calibrated ratio estimator, flagged
+    model = getattr(args, "qa_model", None) or getattr(args, "agent_model", None) or ""
+    ctr = tokcount.Counter(prov, model, mode=mode,
+                           ratio=(tokcount.prior_ratio(prov) if (not live and mode == "estimate"
+                                                                 and not os.environ.get("NC_TOKCOUNT")) else None),
+                           concurrency=int(getattr(args, "tokcount_concurrency", 4) or 4))
+    if live and prov in tokcount.NATIVE_PROVIDERS and mode in ("auto", "native") and not ctr.native:
+        raise tokcount.TokCountError(
+            f"no native token counter for {prov}/{model}: set the provider key (count_tokens is free) "
+            "or pass --token-counter tiktoken to accept a NON-native (cl100k) parity measurement")
+    if ctr.native:
+        n = ctr.count("tokcount preflight: the quick brown fox jumps over the lazy dog")   # fail before any spend
+        print(f"token counter: {ctr.tokenizer_id} (NATIVE; preflight ok, {n} tok; "
+              f"framing overhead {ctr.manifest()['overhead_subtracted']} subtracted)", flush=True)
+    else:
+        print(f"token counter: {ctr.tokenizer_id} (native=False"
+              f"{', estimated' if ctr.estimated else ''}) - parity numbers are NOT in the answering "
+              "model's tokens", flush=True)
+    set_counter(ctr)
+    return ctr
 
 
 def norm_ws(s: str) -> str:
@@ -1486,6 +1530,12 @@ def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str 
         # (a write that is never read costs 1.25x) unless NC_SUM_CACHE_RETENTION says otherwise.
         "NC_PROMPT_CACHE": "on" if PROMPT_CACHE else "off",
         "NC_SUM_CACHE_RETENTION": cache_env()["NC_SUM_CACHE_RETENTION"],
+        # Amendment C.5: the extension hard-trims to the NATIVE cap through count_tokens when told to
+        # (anthropic only; key/base url are the ANTHROPIC_* variables already in this env). Its chars/3.6
+        # `realized_tokens` stays in [nc-metrics] as a diagnostic; the runner re-counts.
+        "NC_TOKCOUNT_NATIVE": ("anthropic" if (COUNTER is not None and COUNTER.native
+                                        and COUNTER.provider == "anthropic") else "off"),
+        "NC_TOKCOUNT_MODEL": (sum_model or agent_model),
     })
     env.pop("PI_CACHE_RETENTION", None)
     env.update({k: v for k, v in cache_env().items() if k == "PI_CACHE_RETENTION"})
@@ -2004,22 +2054,70 @@ def preflight_verdict(pf: dict, preflight_session: str | None, allow_degraded: b
 
 
 def pack_injection(raw: str, sid: str, budget: int = RECALL_BUDGET_TOKENS,
-                   query: str | None = None) -> dict:
-    """Pack recall so that wrapper + body fits the budget; verify, don't assume."""
-    scaffold = build_injection(sid, "", budget)
-    body_budget = budget - count_tokens(scaffold)
-    packed = pack_recall(raw, sid, budget=max(64, body_budget), query=query)
-    injected = build_injection(sid, packed["text"], budget)
-    over = count_tokens(injected) - budget
-    if over > 0:                      # estimator jitter at the seams: shrink and redo once
-        packed = pack_recall(raw, sid, budget=max(64, body_budget - over), query=query)
+                   query: str | None = None, counter=None) -> dict:
+    """Pack recall so that wrapper + body fits the budget; verify, don't assume.
+
+    Amendment C.5: with a counter (explicit, or the run's installed one) the budget is in the answering
+    model's NATIVE tokens. The packer's inner loops use the fast estimator; the injected block (wrapper
+    included, exactly as sent) is then counted natively and the estimator budget is re-scaled until it
+    fits (and, if it undershoots, grown back toward the budget). `tokens` / `total_tokens` are native.
+    """
+    counter = counter if counter is not None else COUNTER
+    if counter is None:               # legacy estimator-only path (unit tests of the packer)
+        scaffold = build_injection(sid, "", budget)
+        body_budget = budget - count_tokens(scaffold)
+        packed = pack_recall(raw, sid, budget=max(64, body_budget), query=query)
         injected = build_injection(sid, packed["text"], budget)
-    packed["total_tokens"] = count_tokens(injected)
+        over = count_tokens(injected) - budget
+        if over > 0:                  # estimator jitter at the seams: shrink and redo once
+            packed = pack_recall(raw, sid, budget=max(64, body_budget - over), query=query)
+            injected = build_injection(sid, packed["text"], budget)
+        packed["total_tokens"] = count_tokens(injected)
+        packed["injected"] = injected
+        packed["budget"] = budget
+        packed["tokenizer"] = FAST_TOKENIZER
+        packed["native"] = False
+        if packed["total_tokens"] > budget:
+            raise ChainFailure(f"injected recall is {packed['total_tokens']} tokens "
+                               f"(body {packed['tokens']}) > the {budget}-token ask-time budget")
+        return packed
+    scaffold_n = counter.count(build_injection(sid, "", budget))
+    scale = counter.scale_for(raw) if raw else counter.scale
+    est_body = max(64, int((budget - scaffold_n) / max(scale, 0.05)))
+    best = None            # (native_total, packed, injected) with native_total <= budget, largest
+    tried = []
+    for it in range(10):
+        packed = pack_recall(raw, sid, budget=max(32, est_body), query=query)
+        injected = build_injection(sid, packed["text"], budget)
+        total = counter.count(injected)
+        tried.append((est_body, total))
+        if total <= budget and (best is None or total > best[0]):
+            best = (total, packed, injected)
+        if total <= budget and total >= 0.95 * budget:
+            break
+        if total > budget:
+            nxt = min(est_body - 4, int(est_body * (budget - scaffold_n) / max(1, total - scaffold_n) * 0.985))
+        else:                          # undershoot: the packer is discrete; grow once or twice, never past a known miss
+            nxt = int(est_body * (budget - scaffold_n) / max(1, total - scaffold_n) * 0.99)
+            if any(t > budget and e <= nxt for e, t in tried):
+                break
+            if it >= 3:
+                break
+        if nxt < 32 or nxt == est_body:
+            break
+        est_body = nxt
+    if best is None:
+        raise ChainFailure(f"injected recall cannot be packed into the {budget}-token NATIVE ask-time budget "
+                           f"(tried est budgets/native totals {tried})")
+    total, packed, injected = best
+    packed["tokens_fast"] = packed.get("tokens")
+    packed["tokens"] = counter.count(packed["text"]) if packed["text"] else 0
+    packed["total_tokens"] = total
     packed["injected"] = injected
     packed["budget"] = budget
-    if packed["total_tokens"] > budget:
-        raise ChainFailure(f"injected recall is {packed['total_tokens']} tokens "
-                           f"(body {packed['tokens']}) > the {budget}-token ask-time budget")
+    packed["tokenizer"] = counter.tokenizer_id
+    packed["native"] = counter.native
+    packed["pack_iterations"] = len(tried)
     return packed
 
 
@@ -2114,14 +2212,17 @@ def note_cap_for(arm: str, args) -> int:
             else args.note_sum_max_tokens)
 
 
-def note_tokens_from(metrics: dict, summary: str) -> tuple[int, str]:
+def note_tokens_from(metrics: dict, summary: str, counter=None) -> tuple[int, str]:
     """Realized note tokens + which source produced them.
 
-    Preference: the extension's own `realized_tokens` from `[nc-metrics]` (the
-    count of the text it actually handed back). Fallback: the documented
-    chars/3.6 estimator. The configured cap is NEVER used here — the ask-time
-    budget has to reflect what the model will actually read.
+    Amendment C.5: the BUDGET source is the run's token counter (the answering model's native
+    tokenizer); the extension's `[nc-metrics].realized_tokens` (chars/3.6, or its own native count)
+    is logged as a diagnostic only. The configured cap is NEVER used here. Without a counter
+    (legacy unit tests) the old rule applies: extension value, else summary_chars/3.6.
     """
+    counter = counter if counter is not None else COUNTER
+    if counter is not None:
+        return counter.count(summary), f"tokcount:{counter.tokenizer_id}"
     rt = (metrics or {}).get("realized_tokens")
     if isinstance(rt, (int, float)) and rt > 0:
         return int(round(float(rt))), "nc-metrics.realized_tokens"
@@ -2245,7 +2346,8 @@ def chain_budget(chain_id: str, args, comps_by_arm: dict, recall_tokens: list[in
         "clipped_compactions": clipped,
         "compactions_per_arm": counts,
         "valid": True, "invalid_reasons": [],
-        "tokenizer": TOKENIZER, "agent_model": args.agent_model,
+        "tokenizer": TOKENIZER, "tokenizer_native": bool(COUNTER is not None and COUNTER.native),
+        "agent_model": args.agent_model,
         "agent_provider": getattr(args, "provider", PROVIDER),
         "judge_model": getattr(args, "judge_model", None),
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2490,12 +2592,17 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
             if summary.strip().startswith("[unsummarized"):
                 raise ChainFailure(f"span {idx}: compaction fell back to the raw tail "
                                    "(summary starts with [unsummarized)")
-            realized = count_tokens(summary)
-            ntok, nsrc = note_tokens_from(m, summary)
-            if abs(ntok - realized) > max(8, int(0.05 * max(realized, 1))):
-                print(f"    BUDGET span {idx}: note tokens differ by source — "
-                      f"{ntok} ({nsrc}) vs {realized} ({TOKENIZER}); the budget uses "
-                      f"{nsrc}", flush=True)
+            realized = count_tokens(summary)              # fast estimator: diagnostic only
+            ntok_, nsrc = note_tokens_from(m, summary)
+            ext_rt = m.get("realized_tokens")             # the extension's own count: diagnostic only
+            if isinstance(ext_rt, (int, float)) and ext_rt > 0 \
+                    and abs(ntok_ - ext_rt) > max(8, int(0.05 * max(ntok_, 1))):
+                print(f"    BUDGET span {idx}: extension realized_tokens={int(ext_rt)} "
+                      f"({m.get('tokenizer', 'chars/3.6')}) differs from the budget count {ntok_} "
+                      f"({nsrc}); the BUDGET uses {nsrc} (extension value is a diagnostic)", flush=True)
+            if COUNTER is not None and ntok_ > cap:
+                print(f"    !!! BUDGET span {idx}: {arm} note is {ntok_} native tokens > cap {cap} AFTER the "
+                      "extension's trim (extension could not count natively?)", flush=True)
             stop = m.get("stop")
             boundary_repaired = bool(m.get("boundary_repaired"))
             if stop == "length":
@@ -2505,11 +2612,11 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
                          "UNREPAIRED amputated tail (boundary_repaired absent/false; "
                          "recorded truncated=true and counts as a clip)")
                 print(f"    BUDGET span {idx}: {arm} CUT AT THE CAP (stop=length, "
-                      f"{ntok} tok by {nsrc} vs cap {cap}) — provider cut the completion; "
+                      f"{ntok_} tok by {nsrc} vs cap {cap}) — provider cut the completion; "
                       f"{state}.", flush=True)
             if arm == "baseline":
-                print(f"    BUDGET baseline span {idx}: realized {ntok} tok of a {cap} "
-                      f"CEILING ({ntok / cap:.0%} fill — the cap is not a target)",
+                print(f"    BUDGET baseline span {idx}: realized {ntok_} tok of a {cap} "
+                      f"CEILING ({ntok_ / cap:.0%} fill — the cap is not a target)",
                       flush=True)
             status = hars_status(args.mcp, sid)
             persisted = int(status.get("compactions") or 0)
@@ -2529,12 +2636,17 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
                 "clipped_repaired": stop == "length" and boundary_repaired,
                 "summary_chars": len(summary),
                 "summary_head": summary[:200],
-                "summary_tokens": realized,
-                "realized_tokens": ntok,
+                "summary_tokens": realized,              # FAST estimator (diagnostic)
+                "summary_tokens_fast_tokenizer": FAST_TOKENIZER,
+                "ext_realized_tokens": ext_rt,            # extension (chars/3.6 or its own count): diagnostic
+                "ext_tokenizer": m.get("tokenizer"),
+                "realized_tokens": ntok_,                 # BUDGET number: native when a native counter is installed
+                "over_cap_native": bool(COUNTER is not None and ntok_ > cap),
+                "tokenizer_native": bool(COUNTER is not None and COUNTER.native),
                 "note_tokens_source": nsrc,
                 "cap": cap,
                 "cap_kind": "ceiling" if arm == "baseline" else "note_cap",
-                "fill": round(ntok / cap, 3) if cap else None,
+                "fill": round(ntok_ / cap, 3) if cap else None,
                 "max_tokens": m.get("max_tokens"),
                 "usage": m.get("usage"),
                 "tokens_before": ev.get("tokensBefore", m.get("tokens_before")),
@@ -2549,7 +2661,7 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
                 "stderr_path": os.path.relpath(err_path, out_dir),
             }
             if arm == ARM_CHUNKS:
-                rc = recall_cap_for(ntok, args, baseline_realized)
+                rc = recall_cap_for(ntok_, args, baseline_realized)
                 rec.update({**{k: rc[k] for k in (
                     "mem_budget", "recall_uncapped_target", "recall_cap",
                     "recall_cap_clamped_low", "recall_cap_clamped_high",
@@ -2559,7 +2671,7 @@ def run_compactions(chain: dict, arm: str, args, out_dir: str, run_id: str,
             # Records are buffered per chain and flushed once the chain's budget
             # verdict exists, so every record carries valid/clipped_compactions.
             print(f"    [{arm}] C{idx}: stop={rec['finish_reason']} "
-                  f"summary={len(summary)}ch/{ntok}tok cap={cap} persisted={persisted} "
+                  f"summary={len(summary)}ch/{ntok_}tok cap={cap} persisted={persisted} "
                   f"before={rec['tokens_before']} after={rec['tokens_after']}", flush=True)
             if arm == ARM_CHUNKS:   # HARS extraction runs server-side: flagged estimate
                 charge_estimate("est_hars_usd", args.extractor_model, HARS_EXTRACT_IN,
@@ -2633,7 +2745,7 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
         recall_s = time.time() - t_rec
         raw = payload.get("context") or ""
         recall_error = str(payload.get("error") or "")
-        packed = pack_injection(raw, sid, budget=recall_cap, query=str(q["question"]))
+        packed = pack_injection(raw, sid, budget=recall_cap, query=str(q["question"]), counter=COUNTER)
         if packed["total_tokens"] > recall_cap:
             raise ChainFailure(f"recall for {qid} injected {packed['total_tokens']} tokens "
                                f"> the {recall_cap}-token cap derived from the C3 note")
@@ -2652,7 +2764,7 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
             # not an abort: the chain is marked valid=false by chain_budget()
             # (RECALL FAIL) and its rows are still written for forensics
             print(f"    !!! RECALL FAIL {qid}: {'; '.join(fail)}", flush=True)
-        cache[qid] = {**packed, "raw_tokens": count_tokens(raw),
+        cache[qid] = {**packed, "raw_tokens": ntok(raw),
                       "recall_seconds": round(recall_s, 1),
                       "recall_error": recall_error or None,
                       "recall_ok": payload.get("ok"),
@@ -2667,7 +2779,7 @@ def collect_recall(chain: dict, state: dict, args, recall_cap: int,
             print(f"    [{label}] {qid}: session_graph status={gsum['session_graph_status']} "
                   f"keyword_source={gsum['keyword_source']} kg_entities={gsum['kg_entities']} "
                   f"kg_relations={gsum['kg_relations']}", flush=True)
-        print(f"    [{label}] {qid}: recall raw={len(raw)}ch ({count_tokens(raw)}tok) -> "
+        print(f"    [{label}] {qid}: recall raw={len(raw)}ch ({ntok(raw)}tok) -> "
               f"packed body={packed['tokens']}tok injected={packed['total_tokens']}tok "
               f"(cap {recall_cap}) chunks={packed['chunks_kept']}/{packed['chunks']} "
               f"rels={packed['relations_kept']}/{packed['relations']} in {recall_s:.1f}s",
@@ -2733,7 +2845,7 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
                 kg_txt, chunk_txt = split_packed_sections(packed["text"])
                 anchor_in_kg = bool(pat.search(kg_txt))
                 anchor_in_chunks = bool(pat.search(chunk_txt))
-        mem_tokens = count_tokens(injected) if injected else 0
+        mem_tokens = ntok(injected) if injected else 0     # AS INJECTED (wrapper + header included), native
         if arm not in RECALL_ARMS:
             if packed["packed_chars"] or mem_tokens:
                 raise ChainFailure(f"{arm} ask {qid} injected {mem_tokens} recall tokens "
@@ -2768,7 +2880,8 @@ def run_asks(chain: dict, arm: str, args, out_dir: str, run_id: str,
             "gold_anchor": anchor, "answerable": q.get("answerable"),
             "evidence": q.get("evidence"),
             "agent_model": args.agent_model, "qa_model": args.qa_model,
-            "tokenizer": TOKENIZER, "ok": r["ok"],
+            "tokenizer": TOKENIZER, "tokenizer_native": bool(COUNTER is not None and COUNTER.native),
+            "ok": r["ok"],
             "recall_error": recall_error or None,
             "recall_failure_reasons": (packed.get("recall_failure_reasons") or [])
                                       if arm in RECALL_ARMS else [],
@@ -2868,16 +2981,16 @@ def sweep_c3(chain: dict, args, out_dir: str, run_id: str, snapshot_dir: str,
     ev = (r["compaction_events"][0].get("result") or {}) if r["compaction_events"] else {}
     m = r["metrics"][0] if len(r["metrics"]) == 1 else {}
     summary = ev.get("summary") or ""
-    ntok, nsrc = note_tokens_from(m, summary)
-    row = {"sweep_cap": cap, "realized_tokens": ntok, "tokens_source": nsrc,
-           "fill": round(ntok / cap, 3) if cap else None, "stop": m.get("stop"),
+    nt, nsrc = note_tokens_from(m, summary)
+    row = {"sweep_cap": cap, "realized_tokens": nt, "tokens_source": nsrc,
+           "fill": round(nt / cap, 3) if cap else None, "stop": m.get("stop"),
            "truncated": m.get("stop") == "length", "ok": r["ok"],
            "compactions": len(r["compaction_events"]),
            "entries_delta": after - before,
            "summary_chars": len(summary), "threshold": threshold,
            "seconds": round(r["wall"], 1), "dir": os.path.relpath(arm_dir, out_dir)}
-    print(f"    [sweep] cap={cap}: stop={row['stop']} realized={ntok}tok "
-          f"({ntok / cap:.0%} fill) entries {before}->{after} in {r['wall']:.1f}s", flush=True)
+    print(f"    [sweep] cap={cap}: stop={row['stop']} realized={nt}tok "
+          f"({nt / cap:.0%} fill) entries {before}->{after} in {r['wall']:.1f}s", flush=True)
     return row
 
 
@@ -2970,10 +3083,47 @@ def calibrate_table(rows: dict, args, sweep_rows: list[dict],
     return out
 
 
+def calibrate_aggregate(per_chain: list[dict], baseline_cap: int) -> dict:
+    """Aggregate calibration measurements over k chains (Amendment C.5).
+
+    per_chain item: {"chain_id", "baseline_by_span": {1: n, 2: n, 3: n}, "nc_note_by_span": {...},
+                     "nc_recall_tokens": mean injected recall tokens at ask time, "nc_total", "baseline_c3"}.
+    Reports BOTH views:
+      ask_time  - what the gate measures: mean(nc C3 note + injected recall) / mean(baseline C3 summary);
+      pooled    - nc ask-time memory / mean baseline realized over ALL compactions C1..C3 of ALL chains
+                  (3k samples instead of k: the fill is noisy, e.g. C3 1051/1069 vs C1/C2 ~1400).
+    """
+    tot = [c["nc_total"] for c in per_chain if c.get("nc_total")]
+    b3 = [c["baseline_c3"] for c in per_chain if c.get("baseline_c3")]
+    allb = [v for c in per_chain for v in (c.get("baseline_by_span") or {}).values() if v]
+    alln = [v for c in per_chain for v in (c.get("nc_note_by_span") or {}).values() if v]
+    mean = lambda xs: (sum(xs) / len(xs)) if xs else None   # noqa: E731
+    mn, mb3, mba = mean(tot), mean(b3), mean(allb)
+    ratio_ask = round(mn / mb3, 3) if (mn and mb3) else None
+    ratio_pooled = round(mn / mba, 3) if (mn and mba) else None
+    out = {"chains": len(per_chain), "nc_memory_total_mean": round(mn, 1) if mn else None,
+           "baseline_c3_mean": round(mb3, 1) if mb3 else None,
+           "baseline_all_compactions_mean": round(mba, 1) if mba else None,
+           "baseline_all_compactions_n": len(allb), "nc_note_all_compactions_mean": round(mean(alln), 1) if alln else None,
+           "ratio_ask_time": ratio_ask, "ratio_pooled_all_compactions": ratio_pooled,
+           "baseline_fill_c3": round(mb3 / baseline_cap, 3) if (mb3 and baseline_cap) else None,
+           "baseline_fill_pooled": round(mba / baseline_cap, 3) if (mba and baseline_cap) else None}
+    if mn and mba and baseline_cap:
+        out["recommended_cap_pooled"] = cap_advice(mn, mba, baseline_cap)
+    if mn and mb3 and baseline_cap:
+        out["recommended_cap_ask_time"] = cap_advice(mn, mb3, baseline_cap)
+    return out
+
+
 def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
-    """One chain through both live arms, no QA asks, realized-token table."""
-    chain = chains[0]
-    cid = chain["chain_id"]
+    """k chains (--calibrate-chains, default 1) through both live arms, no QA asks, realized-token table.
+
+    Amendment C.5: realized tokens are NATIVE (answering model's tokenizer); the report aggregates over all
+    compactions C1..C3 of all k chains AND the ask-time memory (note + injected recall), and shows both.
+    """
+    k = max(1, int(getattr(args, "calibrate_chains", 1) or 1))
+    chains = chains[:k]
+    cid = chains[0]["chain_id"]
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(WORKDIR, exist_ok=True)
     sweep_caps: list[int] = []
@@ -2985,7 +3135,7 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
         print(f"  !!! --sweep-caps: at most 2 extra compactions; using {sweep_caps[:2]}, "
               f"dropping {sweep_caps[2:]}")
         sweep_caps = sweep_caps[:2]
-    print(f"CALIBRATE run_id={args.run_id} chain={cid} (of {len(chains)}) "
+    print(f"CALIBRATE run_id={args.run_id} chains={[c['chain_id'] for c in chains]} "
           f"provider={args.provider} agent={args.agent_model} mcp={args.mcp} tokenizer={TOKENIZER}")
     print(f"  mem_budget={args.mem_budget} note cap={args.note_sum_max_tokens} "
           f"baseline ceiling={args.baseline_sum_max_tokens} "
@@ -2999,77 +3149,123 @@ def run_calibrate(chains: list[dict], args, arms: list[str]) -> int:
     models_backup = write_models_base_url(args.provider)
     rows: dict[str, dict] = {}
     sweep_rows: list[dict] = []
+    per_chain: list[dict] = []
+    clip_n = {"baseline": [0, 0], ARM_CHUNKS: [0, 0]}      # [compactions, unrepaired clipped]
     comps_f = open(os.path.join(args.out, "compactions.jsonl"), "w")
     try:
-        st_b = run_compactions(chain, "baseline", args, args.out, args.run_id, comps_f,
-                               None, None, snapshot_before_c3=bool(sweep_caps))
-        b3 = next((r for r in st_b["compactions"] if int(r["span_idx"]) == 3), None)
-        if not b3:
-            raise ChainFailure("baseline arm produced no C3 record")
-        rows["baseline"] = {"cap": b3["cap"], "note_tokens": b3["realized_tokens"],
-                            "note_tokens_source": b3["note_tokens_source"],
-                            "recall_tokens": 0, "stop": b3["stop"]}
-        snap = os.path.join(args.out, "sessions", cid, "_pre-c3", "baseline")
-        if sweep_caps and os.path.isdir(snap):
-            for cap in sweep_caps:
-                sweep_rows.append(sweep_c3(chain, args, args.out, args.run_id, snap,
-                                           st_b["session_id"], cap,
-                                           int(b3.get("force_threshold") or FORCE_FLOOR),
-                                           f"[sweep {cid}] C3 at cap {cap}"))
-        st_n = run_compactions(chain, ARM_CHUNKS, args, args.out, args.run_id, comps_f,
-                              None, None)
-        n3 = next((r for r in st_n["compactions"] if int(r["span_idx"]) == 3), None)
-        if not n3:
-            raise ChainFailure("nc arm produced no C3 record")
-        rc = recall_cap_for(n3["realized_tokens"], args)
-        print(f"  recall cap from the ACTUAL C3 note: {rc['recall_cap_arithmetic']}", flush=True)
-        cache: dict = {}
-        tokens = collect_recall(chain, st_n, args, rc["recall_cap"], cache)
-        mean_tok = int(round(sum(tokens) / len(tokens))) if tokens else 0
-        rows[ARM_CHUNKS] = {**rc, "cap": n3["cap"], "note_tokens": n3["realized_tokens"],
-                      "note_tokens_source": n3["note_tokens_source"],
-                      "recall_tokens": mean_tok, "stop": n3["stop"],
-                      "recall_tokens_detail": tokens}
-        if ARM_NOTE in arms:
-            st_o = run_compactions(chain, ARM_NOTE, args, args.out, args.run_id,
-                                   comps_f, st_n["arm_dir"], st_n["session_id"])
-            rows[ARM_NOTE] = {"cap": None, "note_tokens": n3["realized_tokens"],
-                                    "note_tokens_source": "fork of the nc C3 note",
-                                    "recall_tokens": 0, "stop": "reused",
-                                    "session_id": st_o["session_id"]}
-        calib_comps = {"baseline": st_b["compactions"], ARM_CHUNKS: st_n["compactions"]}
-        if ARM_NOTE in arms:
-            calib_comps[ARM_NOTE] = st_o["compactions"]
-        flush_comp_records(comps_f, calib_comps,
-                           {"mem_budget": args.mem_budget, "mode": "calibrate",
-                            "valid": None})
-        out = calibrate_table(rows, args, sweep_rows, int(args.baseline_sum_max_tokens),
-                             int(args.note_sum_max_tokens))
+        for ci, chain in enumerate(chains):
+            cid_ = chain["chain_id"]
+            first = ci == 0
+            st_b = run_compactions(chain, "baseline", args, args.out, args.run_id, comps_f,
+                                   None, None, snapshot_before_c3=bool(sweep_caps) and first)
+            b3 = next((r for r in st_b["compactions"] if int(r["span_idx"]) == 3), None)
+            if not b3:
+                raise ChainFailure("baseline arm produced no C3 record")
+            row_b = {"cap": b3["cap"], "note_tokens": b3["realized_tokens"],
+                     "note_tokens_source": b3["note_tokens_source"],
+                     "recall_tokens": 0, "stop": b3["stop"]}
+            snap = os.path.join(args.out, "sessions", cid_, "_pre-c3", "baseline")
+            if sweep_caps and first and os.path.isdir(snap):
+                for cap in sweep_caps:
+                    sweep_rows.append(sweep_c3(chain, args, args.out, args.run_id, snap,
+                                               st_b["session_id"], cap,
+                                               int(b3.get("force_threshold") or FORCE_FLOOR),
+                                               f"[sweep {cid_}] C3 at cap {cap}"))
+            st_n = run_compactions(chain, ARM_CHUNKS, args, args.out, args.run_id, comps_f,
+                                   None, None)
+            n3 = next((r for r in st_n["compactions"] if int(r["span_idx"]) == 3), None)
+            if not n3:
+                raise ChainFailure("nc arm produced no C3 record")
+            rc = recall_cap_for(n3["realized_tokens"], args)
+            print(f"  recall cap from the ACTUAL C3 note: {rc['recall_cap_arithmetic']}", flush=True)
+            cache: dict = {}
+            tokens = collect_recall(chain, st_n, args, rc["recall_cap"], cache)
+            mean_tok = int(round(sum(tokens) / len(tokens))) if tokens else 0
+            row_n = {**rc, "cap": n3["cap"], "note_tokens": n3["realized_tokens"],
+                     "note_tokens_source": n3["note_tokens_source"],
+                     "recall_tokens": mean_tok, "stop": n3["stop"], "recall_tokens_detail": tokens}
+            calib_comps = {"baseline": st_b["compactions"], ARM_CHUNKS: st_n["compactions"]}
+            if first:
+                rows["baseline"], rows[ARM_CHUNKS] = row_b, row_n
+                if ARM_NOTE in arms:
+                    st_o = run_compactions(chain, ARM_NOTE, args, args.out, args.run_id,
+                                           comps_f, st_n["arm_dir"], st_n["session_id"])
+                    rows[ARM_NOTE] = {"cap": None, "note_tokens": n3["realized_tokens"],
+                                      "note_tokens_source": "fork of the nc C3 note",
+                                      "recall_tokens": 0, "stop": "reused",
+                                      "session_id": st_o["session_id"]}
+                    calib_comps[ARM_NOTE] = st_o["compactions"]
+            flush_comp_records(comps_f, calib_comps,
+                               {"mem_budget": args.mem_budget, "mode": "calibrate", "valid": None})
+            per_chain.append({
+                "chain_id": cid_,
+                "baseline_by_span": {int(r["span_idx"]): int(r["realized_tokens"]) for r in st_b["compactions"]},
+                "nc_note_by_span": {int(r["span_idx"]): int(r["realized_tokens"]) for r in st_n["compactions"]},
+                "baseline_c3": int(b3["realized_tokens"]), "nc_note_c3": int(n3["realized_tokens"]),
+                "nc_recall_tokens": mean_tok, "nc_total": int(n3["realized_tokens"]) + mean_tok,
+                "ratio_ask_time": (round((int(n3["realized_tokens"]) + mean_tok) / int(b3["realized_tokens"]), 3)
+                                   if b3["realized_tokens"] else None),
+                "baseline_stop_by_span": {int(r["span_idx"]): r["stop"] for r in st_b["compactions"]},
+                "recall_tokens_detail": tokens})
+            for arm_, st_ in (("baseline", st_b), (ARM_CHUNKS, st_n)):
+                clip_n[arm_][0] += len(st_["compactions"])
+                clip_n[arm_][1] += sum(1 for r in st_["compactions"] if r.get("truncated"))
+
+        agg = calibrate_aggregate(per_chain, int(rows["baseline"]["cap"]))
+        # the table shows the AGGREGATE (means over the k chains); with k=1 it is the single chain
+        trows = {a: dict(r) for a, r in rows.items()}
+        if len(per_chain) > 1:
+            trows["baseline"]["note_tokens"] = int(round(agg["baseline_c3_mean"]))
+            trows[ARM_CHUNKS]["note_tokens"] = int(round(sum(c["nc_note_c3"] for c in per_chain) / len(per_chain)))
+            trows[ARM_CHUNKS]["recall_tokens"] = int(round(sum(c["nc_recall_tokens"] for c in per_chain) / len(per_chain)))
+        out = calibrate_table(trows, args, sweep_rows, int(args.baseline_sum_max_tokens),
+                              int(args.note_sum_max_tokens))
+        print(f"tokenizer {TOKENIZER} (native={bool(COUNTER is not None and COUNTER.native)}); "
+              f"{len(per_chain)} chain(s)")
+        print(f"ask-time ratio (nc note + injected recall) / baseline C3 = {agg['ratio_ask_time']}   "
+              f"[baseline C3 mean {agg['baseline_c3_mean']}, fill {agg['baseline_fill_c3']}]")
+        print(f"pooled ratio vs ALL {agg['baseline_all_compactions_n']} baseline compactions C1..C3 = "
+              f"{agg['ratio_pooled_all_compactions']}   [baseline mean {agg['baseline_all_compactions_mean']}, "
+              f"fill {agg['baseline_fill_pooled']}]")
+        rp = agg.get("recommended_cap_pooled")
+        if rp:
+            print(f"  cap advice (pooled fill): {rp['note']}")
         # CLIP verdict with the SAME rule as chain_budget (--require-no-clip): an arm fails
         # when > CLIP_LIMIT of its compactions are unrepaired stop=length cuts.
         clip = {}
-        for arm_, st_ in (("baseline", st_b), (ARM_CHUNKS, st_n)):
-            n_ = len(st_["compactions"])
-            k_ = sum(1 for r in st_["compactions"] if r.get("truncated"))
+        for arm_, (n_, k_) in clip_n.items():
             clip[arm_] = {"compactions": n_, "unrepaired_clipped": k_,
                           "clip_fail": bool(n_ and k_ / n_ > CLIP_LIMIT)}
         ci_ = getattr(args, "baseline_cap_info", None) or {}
         spent_ = round(BUDGET.spent, 6) if BUDGET else None
-        out.update({"chain_id": cid, "run_id": args.run_id, "mode": "calibrate",
+        # acceptance quantity = the run-level (mean over chains) ask-time ratio, like RUN BUDGET
+        ratio_run = agg["ratio_ask_time"]
+        out.update({"ratio": ratio_run, "in_window": (None if ratio_run is None
+                                                      else PARITY_LO <= ratio_run <= PARITY_HI),
+                    "nc_memory_total": agg["nc_memory_total_mean"],
+                    "baseline_memory_total": agg["baseline_c3_mean"]})
+        rec_pool = (rp or {}).get("recommended_cap")
+        out.update({"chain_id": cid, "chain_ids": [c["chain_id"] for c in per_chain],
+                    "run_id": args.run_id, "mode": "calibrate",
                     "mem_budget": args.mem_budget,
                     "clip": clip,
                     "clip_free": not any(v["clip_fail"] for v in clip.values()),
                     "baseline_cap": int(args.baseline_sum_max_tokens),
                     "baseline_cap_source": ci_.get("baseline_cap_source"),
                     "baseline_cap_basis": ci_.get("baseline_cap_basis"),
-                    "recommended_cap": ((out.get("recommendation") or {}).get("fill_model")
-                                        or {}).get("recommended_cap"),
+                    "recommended_cap": rec_pool or ((out.get("recommendation") or {}).get("fill_model")
+                                                    or {}).get("recommended_cap"),
+                    "aggregate": agg, "per_chain": per_chain,
+                    "ratio_ask_time": agg["ratio_ask_time"],
+                    "ratio_pooled_all_compactions": agg["ratio_pooled_all_compactions"],
                     "spent_usd": spent_,
                     "baseline_sum_max_tokens": args.baseline_sum_max_tokens,
                     "note_sum_max_tokens": args.note_sum_max_tokens,
                     "recall_cap_min": args.recall_cap_min,
                     "recall_cap_max": args.recall_cap_max,
-                    "tokenizer": TOKENIZER, "agent_model": args.agent_model,
+                    "tokenizer": TOKENIZER, "tokenizer_native": bool(COUNTER is not None and COUNTER.native),
+                    "token_counter": (COUNTER.manifest() if COUNTER is not None else None),
+                    "amendment": "C.5", "agent_model": args.agent_model,
                     "agent_provider": args.provider, "judge_model": args.judge_model,
                     "qa_asks": 0, "rows": rows,
                     "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
@@ -3095,7 +3291,7 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
     spans = chain["spans"]
     seg_chars = [sum(len(s["text"]) for s in sp["segments"]) for sp in spans]
     seg_count = [len(sp["segments"]) for sp in spans]
-    span_tokens = [count_tokens(span_text(sp)) for sp in spans]
+    span_tokens = [ntok(span_text(sp)) for sp in spans]   # native-ratio estimate (provider tokens)
     qa = chain["qa"]
     mem_budget = int(getattr(args, "mem_budget", DEFAULT_MEM_BUDGET))
     # Measured fills (protocol run 2026-10-25): baseline realizes 43-63% of its
@@ -3231,7 +3427,9 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
               f"judge {args.judge_model} / extractor {args.extractor_model} follow the profile; "
               f"the HARS server is configured separately: providers.py hars-env --profile "
               f"{args.provider})")
-    print(f"arms: {','.join(arms)} | HARS: {args.mcp} | tokenizer: {TOKENIZER}")
+    print(f"arms: {','.join(arms)} | HARS: {args.mcp} | tokenizer: {TOKENIZER} "
+          f"(dry-run: calibrated-ratio ESTIMATE, native=False; a live run counts parity/budgets with the "
+          f"answering model's native count_tokens - Amendment C.5)")
     print(f"ask-time memory budget: --mem-budget {args.mem_budget} realized tokens "
           f"(parity window [{PARITY_LO}, {PARITY_HI}] nc/baseline)")
     print(f"  baseline: NC_SUM_MAX_TOKENS={args.baseline_sum_max_tokens} = cap (prompt limit = max_tokens = HARD trim), "
@@ -3266,7 +3464,7 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
         for i, sp in enumerate(c["spans"]):
             print(f"  span {sp['span_idx']} lag {sp['lag']}: {len(sp['segments'])} segments, "
                   f"{sum(len(s['text']) for s in sp['segments'])} chars, "
-                  f"~{count_tokens(span_text(sp))} tokens")
+                  f"~{ntok(span_text(sp))} tokens")
         align = check_alignment(c)
         bad = [a for a in align if not a["ok"]]
         print(f"  alignment: {len(align) - len(bad)}/{len(align)} pass"
@@ -3450,6 +3648,9 @@ def build_manifest(args, arms, budgets, chains) -> dict:
         "judge_same_family": v["judge_same_family"], "judge_same_family_reason": v["reason"],
         "embedder": emb, "hars_mcp": args.mcp, "arms": arms, "mem_budgets": budgets,
         "chains": [c["chain_id"] for c in chains], "tokenizer": TOKENIZER,
+        "tokenizer_native": bool(COUNTER is not None and COUNTER.native),
+        "token_counter": (COUNTER.manifest() if COUNTER is not None else None),
+        "amendment": "C.5: parity and all budgets in the answering model's native tokens",
         "baseline_caps": {str(b): (getattr(args, "baseline_caps", {}) or {}).get(int(b))
                           for b in budgets},
         "excluded_chains": list(getattr(args, "excluded_chains", []) or []),
@@ -3572,6 +3773,16 @@ def main() -> int:
                     help="run ONE chain through both live arms with no QA asks and print "
                          "the realized note/recall/memory table + the recommended "
                          "--baseline-sum-max-tokens")
+    ap.add_argument("--calibrate-chains", type=int, default=1, metavar="K",
+                    help="calibrate only: run the first K chains (default 1); realized tokens are aggregated "
+                         "over all of them (Amendment C.5)")
+    ap.add_argument("--token-counter", default=None, choices=("auto", "native", "tiktoken", "estimate"),
+                    help="Amendment C.5: how parity/budget tokens are counted. auto = the answering model's "
+                         "NATIVE tokenizer via the provider's count_tokens API (anthropic, gemini), else "
+                         "tiktoken cl100k (native=False, flagged). A live anthropic/gemini run without a native "
+                         "counter is refused unless this is `tiktoken`. Env NC_TOKCOUNT sets the default (tests: estimate). Dry-run always uses `estimate`.")
+    ap.add_argument("--tokcount-concurrency", type=int, default=4,
+                    help="max in-flight count_tokens requests (default %(default)s)")
     ap.add_argument("--sweep-caps", default="",
                     help="calibrate only: comma list of baseline caps to sweep on the same "
                          "post-C2 session (max 2 extra compactions)")
@@ -3746,6 +3957,7 @@ def main() -> int:
         return 1
 
     if args.dry_run:
+        setup_counter(args, live=False)
         return print_dry_run(chains, skipped, arms, args)
     # ---- live modes only below ----
     if RUN_POOL_ERROR:
@@ -3768,6 +3980,11 @@ def main() -> int:
         if key_problem:
             print(f"!!! {key_problem}", file=sys.stderr)
             return 2
+    try:
+        setup_counter(args, live=True)      # Amendment C.5: native counter + free preflight, before any spend
+    except tokcount.TokCountError as e:
+        print(f"!!! TOKEN COUNTER: {e}", file=sys.stderr)
+        return 2
     # never append to a previous run: mixed runs in one records.jsonl are
     # indistinguishable downstream (merging is an explicit, documented step)
     used = [f for f in ("records.jsonl", "compactions.jsonl", "chain_budget.jsonl",
@@ -4154,6 +4371,8 @@ def main() -> int:
             "mean_baseline_memory_tokens": main_entry.get("mean_baseline_memory_tokens"),
             "run_ratio": main_entry.get("run_ratio"), "window": [PARITY_LO, PARITY_HI],
             "in_window": main_entry.get("in_window"), "tokenizer": TOKENIZER,
+            "tokenizer_native": bool(COUNTER is not None and COUNTER.native),
+            "token_counter": (COUNTER.manifest() if COUNTER is not None else None),
             "agent_model": args.agent_model, "agent_provider": args.provider,
             "judge_model": args.judge_model,
             "judge_same_family": args.judge_verdict["judge_same_family"],

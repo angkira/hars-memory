@@ -84,8 +84,59 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import longsession as L  # noqa: E402
 import providers as P  # noqa: E402  (profiles, the single price source, hard --budget-usd)
+import tokcount  # noqa: E402  (ONE token counter: the answering model's native tokens, Amendment C.5)
 from longsession import (LLM, LLMError, count_tokens, fmt_usd, note_cap_formula,  # noqa: E402
                          recall_ceil_formula, recall_floor_formula)
+
+def ntok(text: str) -> int:
+    """BUDGET-grade token count (Amendment C.5): the answering model's native tokenizer when a counter is
+    installed (run_chainreplay.set_counter / tokcount.set_default), else the fast estimator. Every
+    realized-token, memory_tokens and cap number in this runner goes through here; plain count_tokens()
+    stays the fast estimator for dry-run projections and serialization sizing."""
+    return tokcount.count(text)
+
+
+def tok_label() -> str:
+    c = tokcount.get_default()
+    return c.tokenizer_id if c is not None else L.TOKENIZER
+
+
+def tok_native() -> bool:
+    c = tokcount.get_default()
+    return bool(c is not None and c.native)
+
+
+def make_counter(a, live: bool):
+    """The run's counter (installed as the tokcount default and into run_chainreplay for the packer)."""
+    prov = "other" if a.provider == L.MOCK else tokcount.provider_of_profile(a.provider)
+    mode = (getattr(a, "token_counter", None) or os.environ.get("NC_TOKCOUNT") or "auto").lower()
+    if (not live or a.provider == L.MOCK) and mode in ("auto", "native"):
+        mode = "estimate"
+    key = None
+    if live and prov in tokcount.NATIVE_PROVIDERS and mode in ("auto", "native") and a.profile_obj is not None:
+        try:
+            key = P.resolve_key(a.profile_obj, a.key_env)
+        except P.ProviderError:
+            key = None
+    ctr = tokcount.Counter(prov, a.qa_model or a.agent_model or "", mode=mode, key=key,
+                           concurrency=int(getattr(a, "tokcount_concurrency", 4) or 4))
+    if live and prov in tokcount.NATIVE_PROVIDERS and mode in ("auto", "native") and not ctr.native:
+        raise SystemExit(f"!!! no native token counter for {prov}/{ctr.model}: set the provider key (count_tokens "
+                         "is free) or pass --token-counter tiktoken to accept a NON-native parity measurement")
+    if ctr.native:
+        ctr.count("tokcount preflight: the quick brown fox jumps over the lazy dog")     # fail before any spend
+    tokcount.set_default(ctr)
+    rcm = L.rc()
+    if rcm is not None and hasattr(rcm, "set_counter"):
+        rcm.set_counter(ctr)
+    return ctr
+
+
+def trim_note_native(text: str, cap: int, *, enabled: bool = True, force_repair: bool = False):
+    """trim_note() to a NATIVE-token cap: trims in estimator units and verifies with the counter."""
+    return tokcount.fit_native(tokcount.get_default(), text, cap,
+                               lambda t, ec: trim_note(t, ec, enabled=enabled, force_repair=force_repair))
+
 
 ARM_BASELINE, ARM_CHUNKS, ARM_GRAPH, ARM_ORIG = "baseline", "nc-chunks", "nc-graph", "orig"
 ARM_NOTE = "nc-note-only"
@@ -522,11 +573,11 @@ def print_dry_run(plans: list[dict], args, prices: dict, *, as_json: bool = Fals
     args.prices_cache = prices
     res = {"config": {"window": args.window, "keep_tail": args.keep_tail, "reserve": args.reserve,
                       "budgets": args.budgets, "checkpoints": args.checkpoints, "arms": args.arms_list,
-                      "real": bool(args.use_real_compactions), "tokenizer": L.TOKENIZER,
+                      "real": bool(args.use_real_compactions), "tokenizer": tok_label(),
                       "prices_usd_per_mtok": {k: list(v) for k, v in prices.items()}},
            "sessions": []}
     grand = 0.0
-    lines = [f"DRY RUN (no network). tokenizer={L.TOKENIZER} window={args.window} keep_tail={args.keep_tail} "
+    lines = [f"DRY RUN (no network). tokenizer={tok_label()} window={args.window} keep_tail={args.keep_tail} "
              f"reserve={args.reserve} budgets={args.budgets} arms={args.arms_list} "
              f"checkpoints={args.checkpoints}",
              f"prices USD/MTok (in,out): sum={prices['sum']} qa={prices['qa']} extractor={prices['ext']}"]
@@ -837,7 +888,7 @@ class SessionRun:
         cap = B if kind == "baseline" else note_cap_formula(B)
         conv_full = L.serialize(dropped)
         sha = hashlib.sha256(json.dumps([prev, hashlib.sha256(conv_full.encode()).hexdigest(), PROMPT_VERSION,
-                                         self.c.sum_llm.model, cap, self.a.sum_max_input]).encode()).hexdigest()
+                                         self.c.sum_llm.model, cap, self.a.sum_max_input, tok_label()]).encode()).hexdigest()
         key = f"{kind}|B{B}|j{j}"
         hit = self.mem.get(key)
         if hit and hit.get("sha") == sha:
@@ -865,14 +916,14 @@ class SessionRun:
             last_raw = r["text"]
             if not r["text"].strip():
                 raise LLMError(f"empty {kind} summary at boundary {j} (stop={r['stop_reason']})")
-            text, info = trim_note(r["text"], cap, enabled=True, force_repair=r["stop_reason"] == "length")
+            text, info = trim_note_native(r["text"], cap, enabled=True, force_repair=r["stop_reason"] == "length")
             tin += r["input_tokens"]
             tout += r["output_tokens"]
             cost += r["cost_usd"]
             lat += r["latency_s"]
             clipped |= r["stop_reason"] == "length"
             repaired |= info["boundary_repaired"]
-        entry = {"sha": sha, "text": text, "raw": last_raw, "prompt_sha256": prompt_shas, "tokens": count_tokens(text), "cap": cap, "slices": len(slices),
+        entry = {"sha": sha, "text": text, "raw": last_raw, "prompt_sha256": prompt_shas, "tokens": ntok(text), "tokenizer": tok_label(), "cap": cap, "slices": len(slices),
                  "input_tokens": tin, "output_tokens": tout, "cost_usd": cost, "latency_s": round(lat, 3),
                  "clipped": clipped, "clipped_repaired": clipped and repaired,
                  "trim": info, "over_cap": info.get("over_cap", False)}
@@ -984,11 +1035,11 @@ class SessionRun:
                     continue
                 memory, note_tokens = b["original_summary"], 0
             elif arm == ARM_NOTE:
-                memory, note_tokens = self.note_text[B], count_tokens(self.note_text[B])
+                memory, note_tokens = self.note_text[B], ntok(self.note_text[B])
             else:
                 graph = arm == ARM_GRAPH
                 memory = self.note_text[B]
-                note_tokens = count_tokens(memory)
+                note_tokens = ntok(memory)
                 cap_info = recall_cap(B, note_tokens)
                 hs = self.hars_sid(B)
                 pay = self.recall_payload(j, q, hs, graph)
@@ -1018,7 +1069,7 @@ class SessionRun:
             answer = r["text"] or ""
             anc = (q.get("gold_anchor") or "").strip()
             pat = anchor_pattern(anc) if anc else None
-            mem_tokens = count_tokens(memory) + (count_tokens(injected) if injected else 0)
+            mem_tokens = ntok(memory) + (ntok(injected) if injected else 0)     # AS INJECTED, native (C.5)
             kg_txt, ch_txt = (rcm.split_packed_sections(packed.get("text", "")) if arm in NC_ARMS else ("", ""))
             row = {
                 "run_id": self.c.run_id, "chain_id": self.sid, "sid": self.sid, "cluster_session": self.sid, "session_id": self.hars_sid(B) if arm in NC_ARMS else self.sid,
@@ -1031,7 +1082,7 @@ class SessionRun:
                 "answer": answer, "ok": bool(answer.strip()), "stop_reason": r["stop_reason"],
                 "latency_s": r["latency_s"], "prompt_tokens": r["input_tokens"], "completion_tokens": r["output_tokens"],
                 "cost_usd": r["cost_usd"],
-                "memory_tokens": mem_tokens, "memory_tokens_injected": count_tokens(injected) if injected else 0,
+                "memory_tokens": mem_tokens, "memory_tokens_injected": ntok(injected) if injected else 0,
                 "arm_note_tokens": note_tokens, "arm_memory_total": mem_tokens, "tail_tokens": tail_tokens,
                 "tail_from": b["at_idx"], "tail_to": b["trigger_idx"],
                 "memory_text": memory, "injected": injected, "prompt_sha256": L.sha256_text(prompt),
@@ -1054,7 +1105,7 @@ class SessionRun:
                 "recall_kg_relations_kept": packed.get("relations_kept") if arm in NC_ARMS else None,
                 "persisted_compaction": (self.ingest_ok if arm in NC_ARMS else (False if arm == ARM_BASELINE else None)),
                 "agent_model": self.c.sum_llm.model, "qa_model": self.c.qa_llm.model,
-                "agent_provider": a.provider, "tokenizer": L.TOKENIZER,
+                "agent_provider": a.provider, "tokenizer": tok_label(), "tokenizer_native": tok_native(),
                 "_reasons": reasons,
             }
             row.update(cap_info)
@@ -1307,6 +1358,12 @@ def parse_args(argv=None):
                     help="alias of --model-extractor: HARS extractor, RECORDED + priced only "
                          "(the server is configured by `providers.py hars-env`)")
     ap.add_argument("--key-env", default=None, help="env var holding the API key (never printed)")
+    ap.add_argument("--token-counter", default=None, choices=("auto", "native", "tiktoken", "estimate"),
+                    help="Amendment C.5: parity/budget tokens in the answering model's NATIVE tokenizer "
+                         "(count_tokens API; anthropic, gemini). auto falls back to tiktoken cl100k only for other "
+                         "providers (native=False, flagged); a live anthropic/gemini run without native counting is "
+                         "refused unless this is `tiktoken`. Dry-run/mock use `estimate`.")
+    ap.add_argument("--tokcount-concurrency", type=int, default=4, help="max in-flight count_tokens requests")
     ap.add_argument("--reasoning-effort", default=None, help="openrouter reasoning.effort passthrough")
     ap.add_argument("--anthropic-thinking", choices=("disabled", "default"), default="disabled",
                     help="disabled sends thinking={type:disabled} on the anthropic endpoint: adaptive "
@@ -1422,6 +1479,7 @@ def main(argv=None) -> int:
     prices = model_prices(a)
     a.prices_cache = prices
     if a.dry_run:
+        make_counter(a, live=False)
         print_dry_run(plans, a, prices, as_json=a.json)
         return 0
     if not a.fake_hars:
@@ -1467,9 +1525,10 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
                                  key_env=a.key_env, price=override, reasoning_effort=a.reasoning_effort,
                                  thinking=a.anthropic_thinking)
     sum_llm, qa_llm = mk("summarizer", a.sum_model), mk("answer", a.qa_model)
+    make_counter(a, live=True)
     ctx = Ctx(a, out, hars, sum_llm, qa_llm, run_id, budget)
     ctx.load_done()
-    print(f"run {run_id} -> {out} (tokenizer {L.TOKENIZER}, resume={resuming}, sessions={len(plans)})", flush=True)
+    print(f"run {run_id} -> {out} (tokenizer {tok_label()} native={tok_native()}, resume={resuming}, sessions={len(plans)})", flush=True)
     write_inputs_and_scripts(ctx, a, sessions)
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     fails = []
@@ -1507,7 +1566,9 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
                    "failed_sessions": failed, "llm_cost_usd": {"summariser": round(sum_llm.cost, 6),
                                                               "answer": round(qa_llm.cost, 6)},
                    "prompt_cache": {"summariser": sum_llm.cache_stats(), "answer": qa_llm.cache_stats()},
-                   "llm_cost_usd_all_invocations": total_cost, "tokenizer": L.TOKENIZER,
+                   "llm_cost_usd_all_invocations": total_cost, "tokenizer": tok_label(),
+                   "tokenizer_native": tok_native(),
+                   "token_counter": (tokcount.get_default().manifest() if tokcount.get_default() else None),
                    "hars_extraction_estimated_usd": round(ctx.est_hars_usd, 6),
                    "budget_usd": a.budget_usd}
         atomic_write(ctx.path("summary.json"), json.dumps(summary, indent=1))
