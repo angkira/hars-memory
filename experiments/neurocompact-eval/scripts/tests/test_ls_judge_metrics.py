@@ -173,6 +173,22 @@ class Pipeline(unittest.TestCase):
         self.assertIn("include=", d["meta"]["sid_filter"])
 
 
+    def test_end_only_drops_mid_checkpoint_rows(self):
+        out = os.path.join(self.rundir, "end.json")
+        old = sys.argv
+        sys.argv = ["metrics_v2.py", "--records", self.rec, "--out", os.path.join(self.rundir, "end.md"),
+                    "--json", out, "--boot", "100", "--end-only"]
+        try:
+            self.assertEqual(quiet(M.main), 0)
+        finally:
+            sys.argv = old
+        d = json.load(open(out))
+        self.assertTrue(d["meta"]["end_only"])
+        self.assertGreater(d["meta"]["mid_rows_dropped"], 0)
+        self.assertEqual(d["longsession"]["checkpoints"]["questions_asked_at_multiple_checkpoints"], 0)
+        self.assertNotIn("mid", d["longsession"]["position"])
+
+
 class RealCompactionOrig(unittest.TestCase):
     def test_orig_arm_is_kept_descriptive_and_not_required(self):
         with tempfile.TemporaryDirectory() as d:

@@ -1467,6 +1467,9 @@ def _main() -> int:
     ap.add_argument("--include-sid", default="", metavar="REGEX",
                     help="analysis set: only chain_id/sid matching REGEX (e.g. '^beam-1M-')")
     ap.add_argument("--exclude-sid", default="", metavar="REGEX")
+    ap.add_argument("--end-only", action="store_true",
+                    help="long-session: analyse only the END-checkpoint rows (C.2: the primary and "
+                         "the L-family use every question once per session; mid rows are exploratory)")
     ap.add_argument("--legacy-qtypes", action="store_true",
                     help="pre-C.2 reading: stored qtype 'multihop' stays 'multihop' (default: "
                          "xspan_locator, see qtypes.py)")
@@ -1486,6 +1489,12 @@ def _main() -> int:
     track = args.track if args.track != "auto" else (
         "longsession" if any("base_qid" in r for r in raw) else "chains")
     raw, sid_filter = filter_sids(raw, args.include_sid, args.exclude_sid)
+    n_mid = 0
+    if args.end_only:
+        kept_end = [r for r in raw if not _CP_RE.search(str(pick(r, "qid")))
+                    and r.get("is_end") is not False]
+        n_mid, raw = len(raw) - len(kept_end), kept_end
+        print(f"[end-only] dropped {n_mid} mid-checkpoint row(s)", file=sys.stderr)
     if not raw:
         raise SystemExit(f"no records left after --include-sid/--exclude-sid {sid_filter}")
     raw, validity = validate_rows(raw)
@@ -1579,6 +1588,7 @@ def _main() -> int:
             "budgets": sorted(views, reverse=True), "track": track,
             "sid_filter": (f"include={sid_filter['include']} exclude={sid_filter['exclude']}"
                            if (sid_filter["include"] or sid_filter["exclude"]) else None),
+            "end_only": bool(args.end_only), "mid_rows_dropped": n_mid,
             "qtype_mapping": "legacy (stored labels)" if QTYPE_LEGACY else "C.2 (multihop -> xspan_locator)"}
     md = render(pv["summary"], pv["deltas"], pv["slices"], gates, meta, suspicious)
     md += "\n" + render_extra(views, primary_b, sec, diag, treat, legacy, meta)

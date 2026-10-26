@@ -185,7 +185,8 @@ and the number of estimated rows is printed).
   - S2 token saving @1024: `nc-graph@1024` non-inferior to `baseline@1536`.
   - S3 token saving @512: `nc-graph@512` non-inferior to `baseline@1536`.
   - S4 multi-hop: `nc-graph - baseline`, B = 1536, multi-hop stratum only (`qtype` multihop).
-  - S5 multi-hop graph: `nc-graph - nc-chunks`, B = 1536, multi-hop stratum only.
+  - S5 multi-hop graph: `nc-graph - nc-chunks`, B = 1536, multi-hop stratum only. **[Superseded by C.2-1: S4 and S5 are
+    DESCRIPTIVE on the `xspan_locator` stratum; the Holm family is S1-S3, m = 3.]**
 - *Exploratory (no inference claimed):* everything else, in particular lag 1/2/3, HEAD/TAIL,
   anchor type, per-budget dose-response, nc-chunks vs baseline, mechanism readouts.
 
@@ -274,7 +275,7 @@ SWE-bench Verified sessions: 14 independent sessions, at most 3 per repository.
 command outputs, intermediate errors), never the known SWE-bench fix (the agent model may have
 seen the benchmark; a question answerable from the fix alone would measure contamination). A new
 item type `qtype = multihop` (cross-compaction: facts spanning two compactions, e.g. "the value
-after the change") is declared a pre-registered SECONDARY stratum (S4, S5); such items carry an
+after the change") is declared a pre-registered SECONDARY stratum (S4, S5); **[Superseded by C.2-1: relabelled `xspan_locator`, descriptive.]** such items carry an
 `evidence_spans` list, every leg of which the runner re-verifies verbatim in its span. The
 old tuning chains (`qq8Vqbow_c0`, `y062eGZR_c0`) belong to the retired dataset and are not in the
 decision set; the packer was tuned on them only.
@@ -357,6 +358,87 @@ cap values are **TBD by the owner** (placeholders: generation run `<GEN_CAP_USD>
 `--dry-run` prints the projection and a BUDGET CHECK against `--budget-usd`. Prices come from the profile
 tables; each entry carries `status` (`confirmed` = web sources and the pi-ai 1.4.0 catalog agree,
 `catalog_only`, `unverified`), source and date, and the status is recorded in the manifest.
+
+### 4a.2 PROTOCOL AMENDMENT C.2 (2026-10-26, written before any decision-set result was seen)
+
+Provenance: the dataset agent's spot check of the OpenHands multi-hop items (artifact
+`20261026T144511Z-oh-multihop-qa`) and the owner's decision to add the long-session track
+(`.plans/2026-10-26_long-session-eval.md`). No record of any decision set (OpenHands chains, BEAM,
+Claude Code) exists at the time of writing: only offline fixtures and cents-level smoke runs on the
+hash-shim embedder, which are not decision data. Like C and C.1, nothing below may be edited after
+the first decision-set record exists; a deviation is Amendment D. C.2 changes the secondary family
+and the meaning of one stratum; it does not touch any metric, threshold, arm, budget formula,
+parity gate or the section-5 WIN / FAIL rules.
+
+**C.2-1. The OpenHands "multihop" items are relabelled `xspan_locator` (supersedes the multi-hop
+wording of C4 S4/S5, C12 and C13).** The spot check found that only 1 of 10 inspected items
+genuinely needs both hops. The rest contain a LOCATOR in an old span (a file, a name, a step) and a
+FACT in a newer span that is answerable once the locator is known: they test whether a locator that
+lived in an old span and a fact that lives in a newer span can both be retained, NOT reasoning
+across a compaction. They are therefore analysed under the label `xspan_locator`. The data files are
+NOT rewritten (the stored `qtype` stays `"multihop"`, `verify_chains.py` keeps its gates, the runner
+keeps writing the stored label); the mapping happens at LOAD time in every analysis script through
+`scripts/qtypes.py::canon_qtype` (metrics_v2 `normalize`, funnel_chains), and
+`metrics_v2.py --legacy-qtypes` restores the pre-C.2 reading for old artifacts. Consequence: S4 and S5
+on the OpenHands set are DESCRIPTIVE (reported as S4d / S5d on the `xspan_locator` stratum, no p-value
+enters any correction, no inference is claimed). The chain-track secondary family becomes
+**S1, S2, S3 (m = 3)**, Holm step-down at one-sided alpha 0.025 exactly as in C4 (a cell without
+data still counts as p = 1; the family does not shrink further). The change makes the correction
+LESS conservative (m 5 -> 3) and is declared here, before any decision data, for that reason.
+
+**C.2-2. Genuine multi-hop moves to BEAM `multi_session_reasoning` on the long-session track.** The
+declared multi-hop stratum is the BEAM question type `multi_session_reasoning` (stored with
+`qtype = "multihop"` and `source_qtype = "multi_session_reasoning"`; the analysis label is the
+`source_qtype`). It is the only stratum with inferential endpoints besides the primary (L4, L5 below).
+`knowledge_update`, `temporal_reasoning` and `contradiction_resolution` are DECLARED strata: they are
+reported with paired nc-graph - baseline contrasts and cluster-bootstrap CIs, as descriptive
+(D_<stratum>, no p-value in the family). `information_extraction` (stored `single`) and the remaining
+BEAM types are exploratory.
+
+**C.2-3. Long-session track design.**
+
+- *Data and units.* BEAM size 1M, ALL chats the import finds in the BEAM repository (35 per the BEAM
+  dataset description; `import_beam.py` prints the count and `inputs.json` of the run records the sid
+  list - if the repo holds another number, that number is the sample and is stated in the report; no
+  chat is dropped after seeing results). The cluster unit is the chat (sid); `MIN_CHAINS = 8`
+  distinct sessions stays. BEAM sizes are never pooled: the analysis set is selected with
+  `metrics_v2.py --include-sid '^beam-1M-'`; BEAM-10M, 100K and 500K runs, if made, are separate
+  descriptive replications. Question types imported: information_extraction, knowledge_update,
+  temporal_reasoning, multi_session_reasoning, contradiction_resolution (`import_beam.py` defaults).
+- *Frozen run configuration.* Profile `anthropic` as in C.1 (agent / summariser / answer
+  `claude-haiku-5-5`, HARS extractor and keyword model `claude-haiku-5-5`, judge `claude-sonnet-5-5`
+  via `--allow-same-family-judge`, real embedder); boundaries window 150000 / keep-tail 20000 / reserve
+  2048 (`run_longsession.py` defaults, arm-independent, forced final boundary); the C2 recall call
+  shapes, C3 keyword policy, C5 packer, C6 caps and C9 persistence apply unchanged to the nc arms;
+  `--checkpoints end`. The primary analysis uses the END-checkpoint rows only (`metrics_v2.py
+  --end-only`, every question once per session); mid-checkpoint rows (retention curves) are
+  exploratory.
+- *PRIMARY (the only decision of the track):* `nc-graph` vs `baseline` at B = 1536 on BEAM-1M, paired per
+  question, cluster bootstrap over chats, evaluated with the unchanged section-5 WIN / FAIL rules
+  (verbatim thresholds, every "nc" reads "nc-graph", exactly as in C4). Judge: C.1-2, the BEAM
+  rubric is passed to the judge for every item that carries one (`judge_v2.py` rubric block), so the
+  score legs are rubric-graded. The anchor legs are computed on the items that carry a deterministic
+  `gold_anchor` (BEAM answers are mostly sentences, so this is a minority subset: its size and the
+  number of chats contributing are printed with the verdict); a rule whose input is missing is n/a and
+  cannot be met, exactly as in C4 (verdict INCONCLUSIVE, never FAIL or WIN by default).
+- *SECONDARY family L1-L5, fixed (m = 5), Holm step-down at one-sided alpha 0.025,* tests and
+  metric as in C4 (cluster bootstrap over chats, `clean_anchor_hit`, non-inferiority margins 0.10 /
+  0.15, cells without data count as p = 1):
+  L1 `nc-graph - nc-chunks` @1536; L2 `nc-graph@1024` non-inferior to `baseline@1536`; L3
+  `nc-graph@512` non-inferior to `baseline@1536`; L4 `nc-graph - baseline` @1536 on
+  `multi_session_reasoning`; L5 `nc-graph - nc-chunks` @1536 on `multi_session_reasoning`. L2 and L3
+  need the B sweep (`--mem-budgets 1536,1024,512`); if the sweep is not run they are n/a (p = 1) and
+  the family stays at five. `nc-chunks`, `nc-note-only` and every other contrast are descriptive.
+- *Claude Code sessions (owner's transcripts): DESCRIPTIVE ONLY.* Their questions are generated
+  (`gen_longsession_qa.py`, verbatim-evidence gates, generator `claude-sonnet-5-5`), the sample is
+  small and selected by the owner, and the real summary (`orig` arm) exists only at real boundaries
+  and at the reference B. No hypothesis test, family or verdict is attached to them; the `orig` arm is
+  a descriptive side arm in every table (never part of the required arm set, never in an inference);
+  generated `multihop` items there are `xspan_locator` by C.2-1. Transcripts are redacted on import
+  (`ls_redact.py`) and raw transcripts / session graph stores are not part of any result bundle.
+- *Holm families declared, in one place:* chain track {S1, S2, S3}; long-session track {L1, L2, L3,
+  L4, L5}. The two tracks are separate decision sets (separate datasets, separate primaries) and
+  are not pooled.
 
 ## 5. Measurement stack
 
