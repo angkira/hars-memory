@@ -25,6 +25,24 @@ import oh_pipeline as ohp  # noqa: E402
 import py_probes as pp  # noqa: E402
 import test_make_chains as tmc  # noqa: E402
 
+_SAVED = {}
+_PATCHED = ("evidence_windows", "suggested_anchors", "MAX_RETRIES_PER_SLOT", "llm", "SESS_DIR",
+            "_orig_evidence_windows", "_orig_suggested_anchors")
+
+
+def setUpModule():          # multihop.main() installs anchor-window patches on make_chains
+    for k in _PATCHED:
+        _SAVED[k] = (hasattr(mc, k), getattr(mc, k, None))
+
+
+def tearDownModule():       # do not leak them into other test modules
+    for k, (had, v) in _SAVED.items():
+        if had:
+            setattr(mc, k, v)
+        elif hasattr(mc, k):
+            delattr(mc, k)
+
+
 # ------------------------------------------------------------------ fixtures
 
 EV1 = "edited the file src/widgets/frobnicate_helper.py to guard the zero frob count branch now"
