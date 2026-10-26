@@ -20,6 +20,8 @@ Claude Code *.jsonl --import_claude_code.py ---+--> longsession/1 sessions --gen
 | `ls_redact.py` | the redaction pass (sk-, sk-ant-, sk-or-v1, ghp_/github_pat_, glpat-, AWS keys, PEM private keys, JWT, bearer, `password=`/`token=` assignments) |
 | `gen_longsession_qa.py` | single + multihop QA across compaction windows for sessions without questions; verbatim-evidence gates (reuses `multihop.validate_multihop` + `make_chains` helpers); full prompt/answer log in `qa-raw.jsonl` |
 | `run_longsession.py` | the runner (below) |
+| `export_longsession_judge.py` | run_longsession records + the session files -> `judge_v2` input: blind, one +-500-char evidence window per hop, BEAM `rubric` reaches the judge, `visible_context` (memory + recall + verbatim tail, question/answer excluded), memory channel fields dropped, `metrics_v2.validate_rows` filter |
+| `home_run.py` | the owner's single entry point (HOME-RUNBOOK.md): doctor / dry-run / smoke / oh / beam / cc / bundle |
 
 ## Format `longsession/1`
 
@@ -69,9 +71,7 @@ message that survives the compaction. `compactions` holds only REAL compactions 
   `memory_tokens`, `arm_note_tokens`, `memory_tokens_injected`, `anchor_hit`, `anchor_in_recall`, recall stats,
   `latency_s`, `prompt_tokens`, `completion_tokens`, `cost_usd`, plus `checkpoint`, `lag`, `tail_tokens`,
   `memory_text`, `injected`, `rubric`, `rubric_hit_frac` (a cheap proxy, NOT a judge). `metrics_v2.validate_rows`
-  accepts them with `arms=(baseline, nc-chunks, nc-graph, nc-note-only)`. `export_judge_input.py` is chain-shaped
-  (needs `chains.jsonl` spans) and is not wired; judge the rows with `judge_v2.py` after adding a thin exporter
-  (`question`, `canonical_short_answer`, `answer`, `rubric`, `evidence` are all in the row).
+  accepts them with `arms=(baseline, nc-chunks, nc-graph, nc-note-only)`. `export_judge_input.py` is chain-shaped; the long-session twin is `export_longsession_judge.py` (below).
 
 ### Artifacts (CLAUDE.md "never lose a run")
 
@@ -83,10 +83,11 @@ sha256), `MANIFEST.json` (machine, models, params, start/end, cost, git head, `r
 
 ## Cost estimate (`--dry-run`, offline, deterministic)
 
-Tokens from the session (`tiktoken` if installed, else chars/3.6 - printed), prices USD/MTok `(p_in, p_out)` per
-model (`--price-in/--price-out`, built-in table; **Haiku 5.5 = 0.10/0.50 as in `oh_pipeline`, the 1.00/5.00 in
-`run_chainreplay.PRICES` is a placeholder for the same id - verify**). With J boundaries, dropped tokens D_j,
-FILL = 0.85:
+Tokens from the session (`tiktoken` if installed, else chars/3.6 - printed). Prices come from ONE place, the
+`providers.py` profile tables (`profiles/<name>.json`, each entry with status/source; tier-aware: Haiku 5.5 =
+$0.10/$0.50 per MTok, $0.50/$2.50 above a 100k prompt; Sonnet 5.5 = $2/$10); `--price-in/--price-out` are explicit
+overrides. A live run needs a hard `--budget-usd` (alias `--max-cost-usd`); the HARS-side extraction is charged to the
+same cap as a flagged ESTIMATE per ingested piece. With J boundaries, dropped tokens D_j, FILL = 0.85:
 
 ```
 baseline_j  in = s_j*(P_b + S_(j-1)) + D_j     out = s_j * 0.85*B          s_j = ceil(D_j / (sum_max_input - P_b - B))
@@ -113,18 +114,25 @@ session (`compactions.jsonl` has the per-boundary ingest seconds) and re-run `--
 ## Typical commands
 
 ```bash
-# BEAM 1M, 5 sessions, 10 questions each, end checkpoint
-python3 -I scripts/import_beam.py --repo /path/to/beam-repo --size 1M --out data/beam1M --limit 5
-python3 scripts/run_longsession.py --sessions data/beam1M --dry-run --mem-budgets 1024,1536
-EVAL_API_KEY=... python3 scripts/run_longsession.py --sessions data/beam1M --name beam1M \
-    --provider anthropic --agent-model claude-haiku-5-5 --mem-budgets 1536 --mcp http://127.0.0.1:8307/mcp
+# BEAM 1M (35 chats), end checkpoint; --profile selects the vendor (anthropic | openrouter | gemini | custom)
+python3 -I scripts/import_beam.py --repo /path/to/beam-repo --size 1M --out data/beam1M
+python3 scripts/run_longsession.py --sessions data/beam1M --dry-run --profile anthropic --mem-budgets 1536,1024,512
+ANTHROPIC_API_KEY=... python3 scripts/run_longsession.py --sessions data/beam1M --name beam1M --profile anthropic \
+    --mem-budgets 1536 --mcp http://127.0.0.1:8307/mcp --budget-usd 40
+python3 scripts/export_longsession_judge.py --records <run>/records.jsonl --sessions data/beam1M --out <run>/judge-input.jsonl
+python3 scripts/judge_v2.py --in <run>/judge-input.jsonl --profile anthropic --allow-same-family-judge --budget-usd 8 \
+    --out <run>/judged.jsonl --mapping <run>/judge-mapping.json
+python3 scripts/metrics_v2.py --records <run>/records.jsonl --judge <run>/judged.jsonl --mapping <run>/judge-mapping.json \
+    --judge-input <run>/judge-input.jsonl --track longsession --include-sid '^beam-1M-' --end-only --json <run>/metrics.json
 
-# your own Claude Code sessions (redacted), QA generated, real compactions, orig arm, lag analysis
-python3 scripts/import_claude_code.py ~/.claude/projects/<proj> --out data/cc --min-tokens 300000
-EVAL_API_KEY=... python3 scripts/gen_longsession_qa.py --sessions data/cc --out data/cc-qa \
-    --provider anthropic --model claude-haiku-5-5 --use-real-compactions --n-single 20 --n-multihop 8
+# your own Claude Code sessions (redacted), QA generated, real compactions, orig arm, lag analysis (descriptive)
+python3 -I scripts/import_claude_code.py ~/.claude/projects/<proj> --out data/cc --min-tokens 300000
+ANTHROPIC_API_KEY=... python3 scripts/gen_longsession_qa.py --sessions data/cc --out data/cc-qa --profile anthropic \
+    --use-real-compactions --n-single 20 --n-multihop 8 --budget-usd 10
 python3 scripts/run_longsession.py --sessions data/cc-qa --use-real-compactions --checkpoints every:3 --dry-run
 ```
+
+`home_run.py` chains all of this with caps, resume and a bundle (HOME-RUNBOOK.md).
 
 Limits: BEAM ships 2 questions per type per chat (10 kept per session); BEAM answers are mostly sentences, so
 `gold_anchor` exists for few of them - score with the rubric/judge. Notes: the summariser prompts are a

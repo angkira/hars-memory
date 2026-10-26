@@ -6,6 +6,9 @@
 > nc-graph vs baseline at B=1536. The commands and numbers below this banner are the
 > pre-amendment record; where the two differ, Amendment C wins. All earlier runs are
 > exploratory chunk-RAG and are not in the decision set.
+> **AMENDMENT C.2 (REPORT-PROTOCOL.md 4a.2) changes the secondary family (chain track: Holm S1-S3, S4/S5 descriptive on
+> `xspan_locator`) and adds the long-session track (BEAM-1M primary, family L1-L5). The owner's step-by-step is
+> `HOME-RUNBOOK.md` (`scripts/home_run.py`); the commands below are the underlying scripts.**
 > **AMENDMENT C.1 (2026-10-26, owner home runs) governs the run configuration: provider profile
 > `anthropic`, judge via `--allow-same-family-judge`, real embedder recorded in the manifest, hard
 > `--budget-usd`. See the last section of this file.**
@@ -287,7 +290,7 @@ first third of the run (B-major order), so a budget stop still leaves a decision
 
 - PRIMARY: the WIN / FAIL rules above, verbatim, with nc := nc-graph, at B=1536 only
   (metrics_v2 gates on the B=1536 cell; other cells are descriptive).
-- SECONDARY (Holm, family of 5, one-sided alpha 0.025): S1 `nc-graph - nc-chunks` @1536 (anchor);
+- SECONDARY (**C.2: Holm family is S1-S3, m = 3; S4/S5 below are descriptive on `xspan_locator`**; original text: Holm, family of 5, one-sided alpha 0.025): S1 `nc-graph - nc-chunks` @1536 (anchor);
   S2 `nc-graph@1024` non-inferior to `baseline@1536`; S3 same @512; S4 multi-hop `nc-graph -
   baseline` @1536; S5 multi-hop `nc-graph - nc-chunks` @1536. Non-inferiority margins: clean
   anchor 0.10 AND score 0.15 (both must hold; p = max). Underpowered (< 8 sessions) = INCONCLUSIVE.

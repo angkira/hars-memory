@@ -8,12 +8,10 @@ import io
 import json
 import os
 import re
-import sys
 import tarfile
 import tempfile
 import unittest
 
-import ls_fixtures as F
 import home_run as H
 import longsession as L
 
@@ -45,7 +43,9 @@ class FakeProbes(H.Probes):
         if tool == "memory_session_status":
             return {"entities": 7, "vectors_indexed": 4}
         if tool == "memory_recall":
-            return {"context": ("... the battery was dead ..." if self.semantic else ""), "session": {"status": "ok"}}
+            q = args.get("question", "")
+            hit = next((w for _, qq, w in H.SEMANTIC_PROBES if qq == q), "")
+            return {"context": (f"... {hit} ..." if self.semantic else ""), "session": {"status": "ok"}}
         return {}
 
     def cmd(self, argv, timeout=20.0):
@@ -375,9 +375,7 @@ class BeamEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("no run cap", se)
         # estimate above the cap is refused without --accept-partial
-        argv = ["--root", self.root, "--offline-selftest", "--beam-repo", self.repo, "--run-cap", "0.0000001",
-                "--judge-cap", "1", "beam", "--new", "--skip-judge"]
-        # the mock provider estimates $0, so force a nonzero estimate through a price override-free guard
+        # the mock provider estimates $0, so the guard is exercised directly with a nonzero estimate
         est = {"run_usd": 3.0}
         cfg = H.load_config(None, {"caps": {"run": 1.0}})
         camp = H.Campaign(os.path.join(self.d.name, "c"), cfg, echo=False)
@@ -719,6 +717,34 @@ class SmokeOffline(unittest.TestCase):
             recs = H.read_jsonl(os.path.join(root, camps[0], "smoke", "ls-run", "records.jsonl"))
             self.assertEqual({r["arm"] for r in recs}, {"baseline", "nc-chunks", "nc-graph", "nc-note-only"})
             self.assertFalse(os.path.exists(os.path.join(root, ".homerun-current")))   # smoke never becomes "current"
+
+    def test_oh_smoke_picks_the_cheapest_chain_and_runs_the_whole_flow(self):
+        with tempfile.TemporaryDirectory() as d:
+            art = os.path.join(d, "art")
+            make_oh_artifact(art, 3)
+            root = os.path.join(d, "root")
+            os.environ["HR_TEST_KEY4"] = "k-" + "x" * 20
+            r = FakeRunner()
+            orig = r.chainreplay
+
+            def chainreplay(argv):
+                if "--dry-run" in argv:
+                    return 0, ("== chain_s0_c0\n  projected cost: a = $0.40\n== chain_s1_c0\n  projected cost: a = $0.20\n"
+                               "== chain_s2_c0\n  projected cost: a = $0.30\n"
+                               "TOTAL projected: 12 compactions, 80 asks, ~120.0 min, $0.9000\n")
+                return orig(argv)
+            r.chainreplay = chainreplay
+            rc, so, se = quiet(H.main, ["--root", root, "--key-env", "HR_TEST_KEY4", "--oh-dir", art, "smoke", "--skip-ls"],
+                               runner=r, probes=FakeProbes())
+            self.assertEqual(rc, 0, so + se)
+            camp = [x for x in os.listdir(root) if x.endswith("-smoke")][0]
+            chains = H.read_jsonl(os.path.join(root, camp, "oh", "inputs", "chains.jsonl"))
+            self.assertEqual([c["chain_id"] for c in chains], ["chain_s1_c0"])          # the cheapest one
+            scripts = [s for s, _ in r.calls]
+            for s in ("run_chainreplay.py", "merge_runs.py", "judge_v2.py", "metrics_v2.py", "funnel_chains.py"):
+                self.assertIn(s, scripts)
+            rep = H.read_json(os.path.join(root, camp, "smoke-report.json"))
+            self.assertTrue(all(x["ok"] for x in rep), rep)
 
     def test_smoke_refuses_a_shim_embedder_unless_allowed(self):
         with tempfile.TemporaryDirectory() as d:

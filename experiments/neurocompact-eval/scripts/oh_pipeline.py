@@ -85,6 +85,11 @@ def main() -> int:
     sessions_dir, which, rest = os.path.abspath(argv[1]), argv[2], argv[3:]
     if not os.path.isdir(sessions_dir):
         raise SystemExit(f"no such sessions dir: {sessions_dir}")
+    if which in ("make", "multihop", "salvage") and "--dry-run" not in rest and "--offline" not in rest \
+            and not args_has(rest, "--budget-usd"):
+        # refuse BEFORE any patching of make_chains (no side effects on a refused run)
+        raise SystemExit("--budget-usd is mandatory for a live paid run (hard cap, Amendment "
+                         "C.1-5); pass --dry-run / --offline to skip the LLM")
     import make_chains  # noqa: PLC0415
     make_chains.SESS_DIR = sessions_dir
     if which in ("make", "salvage"):
@@ -98,9 +103,6 @@ def main() -> int:
         install_anchor_help(make_chains)
     if which in ("make", "multihop", "salvage"):
         live = "--dry-run" not in rest and "--offline" not in rest and which != "reprobe"
-        if live and not args_has(rest, "--budget-usd"):
-            raise SystemExit("--budget-usd is mandatory for a live paid run (hard cap, Amendment "
-                             "C.1-5); pass --dry-run / --offline to skip the LLM")
         rest = use_profile(make_chains, profile_name, opt, rest, live)
     if which == "multihop":
         import multihop  # noqa: PLC0415

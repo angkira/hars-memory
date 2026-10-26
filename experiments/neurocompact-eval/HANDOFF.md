@@ -3,6 +3,37 @@
 Written 2026-10-26 by the interim agent. Read with: RUNBOOK-gate.md, REPORT-PROTOCOL.md,
 INFRA-NOTES.md, REPORT-forensics-gate212839.md.
 
+## STATE UPDATE 2026-10-26 (late: home-run tooling + Amendment C.2) — READ THIS FIRST
+
+The owner runs everything at home (own HARS, real embedder, Anthropic key; later maybe OpenRouter/Gemini via
+`--profile`) and sends ONE bundle back. Runbook: **`HOME-RUNBOOK.md`** (exact steps, expected cost/wall-clock, what to send).
+
+- **Entry point `scripts/home_run.py`** (config `home_run.toml.example`, placeholders for the three hard caps gen/run/judge):
+  `doctor [--deep]`, `hars-env`, `dry-run`, `smoke`, `oh`, `beam`, `cc`, `bundle`. One campaign dir under
+  `/mnt/datasets/ft/artifacts/<UTC>-homerun-<name>/` (step markers, per-step logs, exact command lines, spend ledger),
+  resumable/idempotent. Python (not bash) because it is a stateful DAG with cost arithmetic and a tested redaction scan.
+- **Providers everywhere**: `providers.py` profiles now drive `run_longsession.py`, `gen_longsession_qa.py` and
+  `oh_pipeline.py` (make/multihop/salvage via a `providers.chat` adapter); `--budget-usd` is mandatory on every live run;
+  the price tables of `longsession.py` / `run_chainreplay.py` are gone (profiles are the one price source, tier-aware
+  Haiku 5.5: $0.10/$0.50, $0.50/$2.50 above 100k prompt tokens). Old flags (`--provider`, `--agent-model`, `--qa-provider`,
+  `--max-cost-usd`, ...) remain aliases.
+- **Long-session judging**: `export_longsession_judge.py` (run_longsession records -> `judge_v2` input; blind; BEAM rubric
+  reaches the judge; visible_context = memory + recall + tail) and `metrics_v2.py` long-session track (orig side arm,
+  `@c<j>`/`base_qid` checkpoints, strata, lag buckets, `--include-sid`, `--end-only`, family L1-L5).
+- **Amendment C.2** (REPORT-PROTOCOL.md 4a.2, written before any decision result): OpenHands "multihop" -> `xspan_locator`
+  (analysis-time mapping in `scripts/qtypes.py`, data untouched, `--legacy-qtypes` restores), S4/S5 descriptive, chain Holm
+  family S1-S3 (m = 3); genuine multi-hop = BEAM `multi_session_reasoning`; long-session track primary = nc-graph vs baseline
+  @1536 on BEAM-1M (all 35 chats), family L1-L5 on the rubric-graded SCORE (only 34/350 BEAM items have a gold anchor);
+  Claude Code sessions descriptive only.
+- **Findings to act on (not fixed here, `hars_memory/` untouched)**: (1) `memory_status.configured_models.embedder`
+  (`hars_memory/mcp_server.py:1130`) prints `HARS_MEMORY_EMBED_MODEL` even when `HARS_MEMORY_EMBED_PROVIDER=http` serves another
+  model (the build container's :8307 hash shim is reported as `unsloth/embeddinggemma-300m (CPU)`), so the C.1-3 rule "the
+  server-reported embedder id wins" (`run_chainreplay.embedder_info`) can record the WRONG id; `doctor --deep` therefore adds a
+  behavioural paraphrase probe, and the owner should fix the status line (HTTP model + base url) before the decision runs.
+  (2) The real-BEAM dry-run says BEAM-1M x 35 chats at B=1536 is ~$34 and ~68 h (HARS ingest at a guessed 11 s/piece dominates):
+  calibrate on the first session.
+- Tests: `cd experiments/neurocompact-eval/scripts && python -m pytest tests -q` (all offline).
+
 ## STATE UPDATE 2026-10-26 (Protocol Amendment C) — READ THIS FIRST
 
 The protocol was amended before any new result: REPORT-PROTOCOL.md section 4a (C1-C15),

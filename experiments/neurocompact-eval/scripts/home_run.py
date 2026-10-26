@@ -547,10 +547,13 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
                 if got is None:
                     add(f"hars.{role}_model", "WARN", "the server does not report it in memory_status")
                 else:
-                    same = P.norm_model(str(got)) == P.norm_model(want)
-                    add(f"hars.{role}_model", "OK" if same else "WARN",
-                        f"server {got!r} vs profile {want!r}" + ("" if same else
-                                                                  " (the run manifest records the server's)"))
+                    gm, _, gurl = str(got).partition(" @ ")
+                    same = P.norm_model(gm) == P.norm_model(want)
+                    purl = (prof.base_url or "").rstrip("/")
+                    url_ok = (not gurl) or gurl.rstrip("/") == purl
+                    add(f"hars.{role}_model", "OK" if same and url_ok else "WARN",
+                        f"server {got!r} vs profile {want!r} @ {purl}"
+                        + ("" if same and url_ok else " (differs; the run manifest records the server's)"))
         except Exception as e:  # noqa: BLE001
             add("hars.embedder", "FAIL", f"memory_status failed: {type(e).__name__}: {str(e)[:120]}")
     # extractor / models liveness (client side) and, with --deep, the server's whole ingest path
@@ -628,12 +631,17 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
     return rows
 
 
-SEMANTIC_DOCS = (
-    "The automobile would not start this morning because the battery was dead after the cold night.",
-    "Bananas are rich in potassium and are mostly grown in tropical climates near the equator.",
-    "Quarterly revenue grew twelve percent in Europe while costs stayed flat across all regions.")
-SEMANTIC_QUERY = "Why did the vehicle refuse to turn over, was the accumulator flat?"
-SEMANTIC_HIT = "battery was dead"
+# (document, query, expected substring): the query shares NOT ONE word with its document (stopwords
+# included), so a lexical / hash bag-of-words embedder scores 0 and the recall comes back empty
+SEMANTIC_PROBES = (
+    ("Automobile ignition failed overnight; depleted battery.",
+     "Why wouldn't the vehicle crank, accumulator exhausted?", "depleted battery"),
+    ("Bananas contain potassium and thrive on tropical plantations.",
+     "Which fruit supplies electrolytes, cultivated in warm equatorial farms?", "tropical plantations"),
+    ("Quarterly revenue increased twelve percent across Europe.",
+     "How much did sales grow in the European region each trimester?", "twelve percent"),
+)
+SEMANTIC_MIN_HITS = 2
 
 
 def deep_ingest_check(cfg: dict, probes: Probes) -> list[dict]:
@@ -647,7 +655,8 @@ def deep_ingest_check(cfg: dict, probes: Probes) -> list[dict]:
     rows: list[dict] = []
     try:
         probes.mcp(url, "memory_compact", {"session_id": sid, "summary": "GOAL\nverify ingest\nACTIVE STATE\n- ok",
-                                           "dropped_context": list(SEMANTIC_DOCS), "metadata": {"source": "doctor"}}, 900)
+                                           "dropped_context": [d for d, _, _ in SEMANTIC_PROBES],
+                                           "metadata": {"source": "doctor"}}, 900)
         st = probes.mcp(url, "memory_session_status", {"session_id": sid}, 60)
         ent = int((st or {}).get("entities") or 0)
         vec = (st or {}).get("vectors_indexed")
@@ -656,16 +665,20 @@ def deep_ingest_check(cfg: dict, probes: Probes) -> list[dict]:
         else:
             rows.append(check_row("hars.deep_ingest", "FAIL", f"compact ok but entities={ent} vectors_indexed={vec}: the "
                                   "server's extractor/embedder path is dead (empty graph) - check HARS_MEMORY_EXTRACTOR_*"))
-        rec = probes.mcp(url, "memory_recall", {"session_id": sid, "question": SEMANTIC_QUERY, "top_k": 4}, 120)
-        ctx = str((rec or {}).get("context") or "")
-        if SEMANTIC_HIT in ctx:
-            rows.append(check_row("hars.semantic_probe", "OK", "a paraphrase with no shared word retrieved its target "
-                                  "sentence: the embedder is semantic"))
+        hits, detail = 0, []
+        for _, q, want in SEMANTIC_PROBES:
+            rec = probes.mcp(url, "memory_recall", {"session_id": sid, "question": q, "top_k": 4}, 120)
+            ok = want in str((rec or {}).get("context") or "")
+            hits += ok
+            detail.append(f"{'hit' if ok else 'MISS'}:{want!r}")
+        if hits >= SEMANTIC_MIN_HITS:
+            rows.append(check_row("hars.semantic_probe", "OK", f"{hits}/{len(SEMANTIC_PROBES)} zero-overlap paraphrase queries "
+                                  "retrieved their sentence: the embedder is semantic"))
         else:
             rows.append(check_row("hars.semantic_probe", "FAIL",
-                                  f"the paraphrase probe retrieved nothing relevant ({len(ctx)} chars of context, session "
-                                  f"status {(rec or {}).get('session')}): the embedder is lexical/hash-like (a shim?) or "
-                                  "broken. NOT decision-grade; start HARS with the real embedder (HARS_MEMORY_EMBED_*)"))
+                                  f"only {hits}/{len(SEMANTIC_PROBES)} zero-overlap paraphrase queries retrieved their sentence "
+                                  f"({', '.join(detail)}): the embedder is lexical/hash-like (a shim?) or broken. NOT "
+                                  "decision-grade; start HARS with the real embedder (HARS_MEMORY_EMBED_*)"))
     except Exception as e:  # noqa: BLE001
         rows.append(check_row("hars.deep_ingest", "FAIL", f"{type(e).__name__}: {str(e)[:160]}"))
     return rows
@@ -1502,7 +1515,7 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
                     shutil.copy2(os.path.join(src, fn), first)
             os.remove(all_p)
             scfg["oh"]["artifact_dir"] = first
-            ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=False)
+            ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=bool(args.skip_judge))
             camp.cfg = scfg
             rcode = cmd_oh(camp, ns)
             m = read_json(os.path.join(camp.p("oh", "merged"), "metrics.json"), {}) or {}
@@ -1520,21 +1533,27 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
             extra += ["--agent-model", "mock", "--fake-hars", "--no-preflight"]
         ls_run_step(camp, "smoke", data, run_dir, [512], "end", False, extra, 1, True, "smoke")
         rec = os.path.join(run_dir, "records.jsonl")
+        rows_ = read_jsonl(rec)
+        bad = sorted({f"{r['arm']}: {'; '.join(map(str, r.get('chain_invalid_reasons') or []))[:160]}"
+                      for r in rows_ if r.get("valid") is not True})
+        info = {"records": len(rows_), "invalid_arms": bad,
+                "tokenizer": rows_[0].get("tokenizer") if rows_ else None}
+        if bad:
+            if args.allow_shim:
+                info["note"] = ("arms invalid as expected with a hash/shim embedder; the export / judge / metrics stages "
+                                "need a valid set and are skipped (--allow-shim)")
+                return info
+            raise HomeRunError("some arms are invalid: " + "; ".join(bad[:3]))
         ji, judged, mp = (os.path.join(run_dir, n) for n in ("judge-input.jsonl", "judged.jsonl", "judge-mapping.json"))
         camp.run("smoke.export", [camp.script("export_longsession_judge.py"), "--records", rec, "--sessions", data, "--out", ji])
-        info = {"records": len(read_jsonl(rec))}
-        if not offline:
+        if not offline and not args.skip_judge:
             judge_step(camp, "smoke", "smoke", ji, judged, mp, True)
             m = metrics_step(camp, "smoke.metrics", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-smoke.md"),
                              os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only"])
             info["verdict"] = m.get("verdict")
-        rows_ = read_jsonl(rec)
-        bad = [f"{r['arm']}: {r.get('chain_invalid_reasons')}" for r in rows_ if r.get("valid") is not True]
-        info["invalid_arms"] = sorted(set(bad))
-        if bad and not args.allow_shim:
-            raise HomeRunError("some arms are invalid: " + "; ".join(sorted(set(bad))[:3]))
         return info
-    smoke_stage(results, "long-session (synthetic, B=512, 4 arms -> judge -> metrics)", ls)
+    if not args.skip_ls:
+        smoke_stage(results, "long-session (synthetic, B=512, 4 arms -> judge -> metrics)", ls)
     camp.cfg = scfg
     camp.write_manifest()
     spent = camp.ledger()["totals"]
@@ -1761,6 +1780,8 @@ def build_parser() -> argparse.ArgumentParser:
     sm = sub.add_parser("smoke", parents=[common], help="1 chain + 1 tiny long session (own campaign)")
     sm.add_argument("--no-live", action="store_true")
     sm.add_argument("--skip-oh", action="store_true")
+    sm.add_argument("--skip-ls", action="store_true", help="skip the synthetic long-session part")
+    sm.add_argument("--skip-judge", action="store_true", help="no judge call (saves the judge cap)")
     sm.add_argument("--allow-shim", action="store_true", help="accept the hash/shim embedder for this smoke only")
     for name, hlp in (("oh", "OpenHands chain track"), ("beam", "BEAM long-session track"),
                       ("cc", "Claude Code long-session track")):
