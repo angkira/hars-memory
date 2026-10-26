@@ -207,6 +207,13 @@ def _cmd_extractor_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_tui(args: argparse.Namespace) -> int:
+    """Terminal UI (optional ``[tui]`` extra). Lazy import: the base install never loads Textual."""
+    from hars_memory.tui.cli import main as tui_main
+
+    return tui_main(args.tui_argv)
+
+
 def _cmd_strategy_bench(args: argparse.Namespace) -> int:
     from hars_memory.eval.strategy_bench import StrategyBenchmarkError, run_strategy_matrix
     from hars_memory.strategies import StrategyConfigurationError, load_strategy_matrix
@@ -1186,6 +1193,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     extractor_p.set_defaults(func=_cmd_extractor_bench)
 
+    tui_p = sub.add_parser(
+        "tui",
+        help="Terminal UI: health, recall trace, sessions, projects, eval results (needs the [tui] extra).",
+    )
+    tui_p.add_argument(
+        "tui_argv",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to memory-tui (see `memory tui --help`).",
+    )
+    tui_p.set_defaults(func=_cmd_tui)
+
     # -- Servers --
     recall_p = sub.add_parser("recall", help="Query the LightRAG knowledge graph.")
     recall_p.add_argument("question", help="Natural language query")
@@ -1421,6 +1439,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     _ensure_project_root()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["tui"]:
+        # argparse REMAINDER cannot forward a leading `--flag`; hand everything after `tui` over verbatim.
+        sys.exit(_cmd_tui(argparse.Namespace(tui_argv=raw[1:])))
     parser = _build_parser()
     args = parser.parse_args(argv)
     exit_code = args.func(args)
