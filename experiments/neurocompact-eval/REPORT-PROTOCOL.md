@@ -3,6 +3,11 @@
 Status: protocol frozen for the decisive run; this document describes design and measurement
 only. All outcome numbers are in the marked placeholder section at the end.
 
+**AMENDMENT C (2026-10-26, section 4a) SUPERSEDES sections 2, 3 and 5 wherever they differ**
+(arms, dataset, treatment, hypotheses, budget, decision set). Sections 2-3 and 5 below describe
+the pre-amendment design and are kept as the audit trail of what the exploratory runs were. It
+was written and committed before any result of the amended design exists.
+
 ## 1. Claim under test
 
 For long coding-agent sessions, a short handoff note plus externalized searchable memory
@@ -117,6 +122,180 @@ anchor_hit after C3 in [0.40, 0.85]; nc recall usable (no RECALL FAIL: non-empty
 calibration on duplicates exact agreement >= 90% (kappa >= 0.80) and P(unsupported_claim AND
 score=2) <= 5%.
 
+## 4a. PROTOCOL AMENDMENT C (frozen 2026-10-26, before any result under the new code)
+
+Provenance: plan `.plans/2026-10-26_session-graph-recall.md` (commit 8ffb91d, section 6 items
+1-13) and the owner decisions of 2026-10-26, encoded here verbatim as frozen. No number, rule or
+threshold below may be changed after the first amended run produces a record; a deviation is a
+new amendment (D) written before the next run, never an edit of this one.
+
+**C1. Claim correction (M2).** In split mode `memory_recall` never read the session graph: with no
+`ll_keywords`/`hl_keywords` the mode resolved to naive and the graph branch was skipped, so the
+old `nc` arm is chunk-RAG over the compaction documents (cosine + token F1), not graph memory.
+Every prior nc number is therefore a chunk-RAG number and EXPLORATORY ONLY: batch 1
+(`runs/full-20261026T021613`), `fullB-075703`, gate1-gate7, calib runs. They are EXCLUDED from the
+decision set; metrics_v2 reads their `nc` records as `nc-chunks`, labels the report
+"LEGACY / EXPLORATORY" and never combines them with amended-design records.
+
+**C2. Arms (four) and frozen recall call shapes.**
+
+| Arm | Post-compaction artifact | Ask-time memory | memory_recall args |
+|---|---|---|---|
+| `baseline` | structured summary, hard-trimmed to B (`NC_SUM_SECTION_TRIM=1`) | summary alone | none |
+| `nc-chunks` (was `nc`) | note, cap `note_cap(B)`, persisted to HARS | note + packed recall | `{session_id, question, top_k: 8}` (byte-identical to the pre-amendment call) |
+| `nc-graph` | fork (`cp -a`) of the nc-chunks session after C3: same note, same compactions, same HARS session dir | note + packed recall, cap identical to nc-chunks | `{session_id, question, top_k: 8, session_graph: true, session_graph_mode: "hybrid"}`; no caller keywords |
+| `nc-note-only` | fork of nc-chunks after C3 | note alone, 0 recall bytes | none |
+
+`nc-graph` differs from `nc-chunks` ONLY in `session_graph: true` (and the mode string). Server
+side parameters not named in the call (fetch_top_k, KG byte caps 500/4500, rerank off) are the
+server defaults of the code revision under test; the server git sha is recorded in the run
+MANIFEST. The nc-graph recall is made on the same `nc-chunks` HARS session, read-only, right
+after C3, before any ask.
+
+**C3. Keyword policy (nc-graph), frozen.** LLM keyword extraction by the extractor model
+(LightRAG LLM cache ON, keywords cached per question), falling back to the question text as
+keywords if the LLM call errors. The runner supplies no keywords. `keyword_source`
+(`llm` | `question_fallback` | `caller`), the extracted `ll_keywords`/`hl_keywords` and the keyword
+model id are logged per ask. The keyword call is part of the ask: its time is inside the recall
+call and is counted in the median-ask-latency rules (metrics_v2 ask latency = `latency_s` +
+`recall_seconds`), and its tokens are counted in cost/question (server-reported usage; if the
+server reports none, a flagged estimate of 450 in / 80 out tokens per LLM-keyword ask is added
+and the number of estimated rows is printed).
+
+**C4. Hypotheses, in decreasing authority.**
+
+- *PRIMARY (the only decision):* `nc-graph` vs `baseline` at B = 1536, paired per question,
+  cluster bootstrap over source SESSIONS, evaluated with the unchanged section-5 WIN / FAIL
+  rules (verbatim thresholds; every "nc" in them reads "nc-graph"; rule 3 is
+  `nc-graph - nc-note-only`; the dead-memory FAIL rule is `nc-graph` vs `nc-note-only`). One
+  primary test, no multiplicity correction. Verdict INCONCLUSIVE below MIN_CHAINS = 8 distinct
+  sessions (unchanged).
+- *Descriptive ablation:* `nc-chunks` (the old nc arm). Reported in every table, never tested
+  against baseline, never enters the verdict.
+- *SECONDARY family (fixed, m = 5), Holm step-down at one-sided alpha = 0.025* (= the two-sided
+  95% CIs used everywhere). Tests use the cluster bootstrap over sessions; one-sided p = (1 +
+  #{bootstrap mean <= theta0}) / (N + 1) on the same resamples as the CIs; a cell with no data
+  counts as p = 1 (the family never shrinks); an underpowered run (< 8 sessions) labels every
+  secondary INCONCLUSIVE regardless of p. Metric: `clean_anchor_hit` (raw `anchor_hit` only on the
+  loud fallback). Decision is on the Holm-adjusted p.
+  - S1 H-graph: `nc-graph - nc-chunks`, B = 1536; H0 delta <= 0. Descriptive label from the plan's
+    thresholds: *graph helps* = (Δanchor >= +5 pp and CI95 lower > 0) or (Δscore >= +0.10 and CI95
+    lower > 0); *graph dead* = |Δanchor| < 3 pp and |Δscore| < 0.05; *graph harms* = Δanchor CI95
+    upper < 0. (Score is reported, the test is on anchor.)
+  - S2 token saving @1024: `nc-graph@1024` non-inferior to `baseline@1536`.
+  - S3 token saving @512: `nc-graph@512` non-inferior to `baseline@1536`.
+  - S4 multi-hop: `nc-graph - baseline`, B = 1536, multi-hop stratum only (`qtype` multihop).
+  - S5 multi-hop graph: `nc-graph - nc-chunks`, B = 1536, multi-hop stratum only.
+- *Exploratory (no inference claimed):* everything else, in particular lag 1/2/3, HEAD/TAIL,
+  anchor type, per-budget dose-response, nc-chunks vs baseline, mechanism readouts.
+
+**C4a. Non-inferiority margins (S2, S3), frozen.** Margin Δanchor = 0.10 (10 pp of
+clean_anchor_hit) AND margin Δscore = 0.15 (judge score, 0-2 scale); non-inferior iff BOTH
+one-sided cluster-bootstrap tests reject H0 delta <= -margin (intersection-union: p = max of the
+two, no extra multiplicity cost). Justification: (i) the pairing +0.15 score <-> +0.10 anchor is
+the protocol's own equivalence (WIN rule 3), so the margins are not new magnitudes; (ii) it is twice
+the equal-cost FAIL line (Δanchor < -5 pp): at B = 1024 / 512 the arm carries 1/3 / 2/3 fewer
+memory tokens, so a larger loss than at equal cost is tolerated, but not one that erases the
++10 pp the memory channel must show over the note alone; (iii) precision: with ~14 sessions the
+paired session-cluster CI half-width on anchor is of the order of 0.08-0.12 (batch 1: ±0.25 on 3
+clusters, scaled by sqrt(3/14)), so a margin much below 0.10 could not be demonstrated even for a
+zero true loss. The same margin applies at 512 (it is NOT widened for the larger saving). Both
+tests are expected to be power-limited; an interval wider than the margin is INCONCLUSIVE, not a
+failure of the claim. The margin was fixed before any amended record existed and is not tuned.
+
+**C5. Packer v2 frozen**, including the 70/30 chunk/graph split when a KG section is present,
+`PACK_FACTS_BONUS`, `PACK_QUERY_BONUS = 1.0`; no per-arm tuning. The graph arm therefore trades its
+KG share for the last ~30% of chunk tokens, and that trade IS the treatment.
+
+**C6. Budget sweep (same run).** `mem_budget` B in {1536, 1024, 512} for EVERY memory arm; every
+B-dependent quantity is a frozen function of B (Python `round`; no value of this table sits on a .5 tie):
+
+| B | baseline summary trim | note cap `round(640*B/1536)` | recall floor `round(256*B/1536)` | recall ceiling `round(1024*B/1536)` |
+|---|---|---|---|---|
+| 1536 | 1536 | 640 | 256 | 1024 |
+| 1024 | 1024 | 427 | 171 | 683 |
+| 512 | 512 | 213 | 85 | 341 |
+
+recall cap = `clamp(B - realized_C3_note_tokens, floor(B), ceil(B))` (realized note, never the
+configured cap; the baseline's realized size is reported only). At B = 1536 these are exactly the
+pre-amendment constants. Each B is an independent set of sessions (replays, compactions, HARS
+sessions `cr-...-b<B>-...`); the primary B runs first. The PRIMARY decision is taken at B = 1536
+only; B = 1024 / 512 feed S2 / S3 and descriptive dose-response tables. Cost multiplier (explicit,
+vs one 3-arm run at one B): replays and summarizer/persist compactions x3; ask turns x4 (4 arms x 3
+B vs 3); memory_recall calls x6 (2 recall arms x 3 B), half of them with one extra keyword LLM
+call; HARS extraction x3 plus ~20% from M3 (more chunks per compaction); judge calls x4.
+Combined with 14 sessions instead of 10 chains and Haiku list prices (≈7x qwen-flash input, ≈10x
+output; haiku-5-5 price unverified, haiku-4-5 used as proxy) the run costs of the order of 30x
+the old $2.50 ceiling. This is an order-of-magnitude estimate, not a quote; `--dry-run
+--mem-budgets 1536,1024,512` prints the projection and the owner sets the ceiling before launch.
+
+**C7. Parity.** The run-mean realized-memory ratio gate [0.80, 1.05] is evaluated separately per B
+and per treatment (nc-graph and nc-chunks vs the baseline of the same B); only the B = 1536
+nc-graph ratio enters the primary WIN rule 4. Per-chain deviations remain warnings.
+
+**C8. Validity gates for nc-graph.** A chain is `valid = false` (RECALL FAIL (nc-graph)) when ANY
+nc-graph ask has `session_graph.status` in {error, skipped, unknown_session}, a missing
+`session_graph` block (a server that ignored the flag would silently make the arm nc-chunks), or
+any generic recall failure. An empty KG result (`status = empty`, 0 entities and 0 relations) is NOT
+invalidating; `kg_empty_rate` is reported per budget and > 30% of asks raises the diagnostic
+"graph not exercised". Validity is per (chain, B) cell; incomplete arm quadruplets are dropped.
+
+**C9. M3 fix in force for every nc compaction.** The whole serialized dropped span (still capped
+at `RAW_CAP = 60000`, identical to the baseline summarizer's input) is cut at message boundaries
+into pieces of at most 8000 chars (oversized single messages split at whitespace) and sent in
+order as the `dropped_context` items of the compaction's `memory_compact` call. Deviation from the
+lead brief ("one memory_compact call per piece"): ONE call per compaction, because each call
+allocates a new compaction seq and re-indexes the summary, which would break the
+`compactions == 3` persistence gate and duplicate the note in the store; the pieces are still
+indexed separately, in order. `NC_DROP_MODE=headtail` reproduces the old design for measurement
+only. Step 0 ($0, `scripts/m3_anchor_report.py`): anchors present in the persisted compaction
+documents vs the span, reported alongside the results.
+
+**C10. Frozen extraction / model configuration (this run).** Agent, replay, compactor and answer
+model: `claude-haiku-5-5` via `pi --provider anthropic`, reasoning off. HARS extractor and
+session-graph keyword model: `claude-haiku-5-5` via Anthropic. This DIFFERS from the pre-amendment
+glm extractor (`z-ai/glm-5.3-flash`), so graphs are not comparable with any earlier run.
+Gleaning (`HARS_MEMORY_MAX_GLEANING`), chunk size/overlap, `HARS_MEMORY_SESSION_INDEX_BS` and the
+server revision are recorded in the MANIFEST at launch and may not change within the run.
+**Embedder: only the hash bag-of-words shim exists in this environment (HuggingFace is blocked);
+it is a frozen configuration and a limitation: retrieval quality of both recall arms (and the
+vector part of the graph arm) is lexical, a real embedding model may change every recall number.**
+
+**C11. Funnel redefinitions.** `anchor_in_graph` = anchor in the session KG (entity names,
+entity/relation descriptions); `anchor_in_recall` is split into KG section vs chunk section (and
+the per-ask records carry `anchor_in_kg_recall` / `anchor_in_chunk_recall`); the "kill graph" rule
+becomes `nc-graph` vs `nc-chunks` (S1), the BM25 comparison is kept for the chunk channel.
+(Implementation of the funnel changes is outside this amendment's commit and is listed as an open
+item.)
+
+**C12. Dataset (B4) and tuning chains (M7).** The dataset is rebuilt from public OpenHands
+SWE-bench Verified sessions: 14 independent sessions, at most 3 per repository.
+`MIN_CHAINS = 8` distinct sessions stays. Questions target TRANSCRIPT specifics (file paths,
+command outputs, intermediate errors), never the known SWE-bench fix (the agent model may have
+seen the benchmark; a question answerable from the fix alone would measure contamination). A new
+item type `qtype = multihop` (cross-compaction: facts spanning two compactions, e.g. "the value
+after the change") is declared a pre-registered SECONDARY stratum (S4, S5); such items carry an
+`evidence_spans` list, every leg of which the runner re-verifies verbatim in its span. The
+old tuning chains (`qq8Vqbow_c0`, `y062eGZR_c0`) belong to the retired dataset and are not in the
+decision set; the packer was tuned on them only.
+
+**C13. Strata (diagnostic only):** lag 1/2/3, HEAD/TAIL, anchor type, budget; the multi-hop stratum
+is the only stratum with inferential endpoints (S4, S5).
+
+**C14. Judge.** One fixed judge for all arms, blind and evidence-grounded as in section 3, with
+the runner's family-refusal intact: the judge must be of a different model family than the agent
+(`claude-haiku-5-5`, family anthropic). **OPEN ISSUE, not resolved here:** in the build
+environment only `api.anthropic.com` is reachable (`openrouter.ai` is blocked), so every reachable
+judge is the agent's family and `run_chainreplay.py` refuses it by design; `judge_v2.py` also only
+speaks to OpenRouter. The check is not weakened. A non-anthropic judge route (or an explicit
+owner amendment with bias controls) is a precondition for judging; generation runs may proceed
+and be judged later from the archived artifacts.
+
+**C15. Hygiene.** Run artifacts follow CLAUDE.md ("never lose a run"): per-ask raw outputs,
+recall payload summaries, keyword sources, usage and the exact command line are archived under
+`/mnt/datasets/ft/artifacts/<UTC>-<name>/`. Retrieval is nondeterministic across calls (section
+6): run-time records are authoritative, never offline refetches.
+
 ## 5. Measurement stack
 
 **Recall packer v2** (run_chainreplay.py, frozen after the gate-212839 offline eval):
@@ -202,8 +381,10 @@ review)**:
    falls back to the repo default `localhost:8080` — a dead 405-nginx — and produces
    `ok=true` compactions with empty graphs. The as-found :8305 instance is in this state
    (INFRA-NOTES.md).
-5. **Open protocol issues** (not resolved by the harness fixes; details and owner questions in
-   HANDOFF.md "OPEN PROTOCOL ISSUES"): B4 (10 chains = 5 independent sessions; shared probe in
+5. **Open protocol issues** (status after Amendment C, section 4a: B4 -> dataset rebuild (C12),
+   M2 -> nc-graph arm (C1-C3), M3 -> full-span persistence (C9), M7 -> retired dataset; the text
+   below is the pre-amendment record; still open: judge family reachability (C14), the funnel
+   changes (C11), M5): B4 (10 chains = 5 independent sessions; shared probe in
    7/10 unanswerables; MIN_CHAINS over sessions unreachable), M2 (recall called without
    `ll_keywords`: graph branch probably skipped, nc may be chunk-RAG; unverified), M3
    (`neurocompact.ts` sends only the first and last 12k chars of each dropped span to HARS,
@@ -219,7 +400,8 @@ review)**:
 [NUMBERS: pending full run]
 
 This section is intentionally empty until the decisive run completes. It will contain:
-per-arm (baseline / nc / nc-note-only) score mean, hallucination rate, clean anchor_hit,
+per-arm (baseline / nc-chunks / nc-graph / nc-note-only) and per mem_budget (1536 primary;
+1024, 512 secondary) score mean, hallucination rate, clean anchor_hit,
 unanswerable false-answer rate, median ask latency, realized memory tokens and parity ratio,
 persisted-compaction rate; per-lag (3/2/1) slices; cluster-bootstrap CIs for the paired
 deltas; the WIN/FAIL/INCONCLUSIVE verdict per the gates in section 5; and the kill/blame

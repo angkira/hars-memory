@@ -3,6 +3,41 @@
 Written 2026-10-26 by the interim agent. Read with: RUNBOOK-gate.md, REPORT-PROTOCOL.md,
 INFRA-NOTES.md, REPORT-forensics-gate212839.md.
 
+## STATE UPDATE 2026-10-26 (Protocol Amendment C) — READ THIS FIRST
+
+The protocol was amended before any new result: REPORT-PROTOCOL.md section 4a (C1-C15),
+RUNBOOK-gate.md "AMENDMENT C". Consequences for everything below this section:
+
+- **All earlier nc numbers (batch 1 `runs/full-20261026T021613`, `fullB-075703`, gates 1-7, calib)
+  are chunk-RAG (M2 confirmed from code) and EXPLORATORY ONLY; the "IN FLIGHT" batches and the
+  batch-B plan below are RETIRED, do not continue them.** The decisive run is a fresh run of the
+  amended design on the rebuilt dataset.
+- Design: arms baseline / nc-chunks / nc-graph / nc-note-only; primary = nc-graph vs baseline at
+  B=1536 (old WIN/FAIL rules, verbatim); secondary family S1-S5 with Holm; budget sweep B in
+  {1536, 1024, 512} with frozen formulas (note cap 640/427/213, recall floor/ceil 256-1024 /
+  171-683 / 85-341); NI margins anchor 0.10 / score 0.15 for the token-saving claim.
+- Code state: `run_chainreplay.py` (nc-chunks rename + alias, nc-graph fork arm, `--mem-budgets`,
+  `--extractor-model`, per-B records), `metrics_v2.py` (4 arms, per-B cells, Holm secondaries,
+  non-inferiority, multi-hop stratum, legacy mode), `export_judge_input.py`, `judge_v2.py`
+  (masking), `visible_context.py`, `pi-agent/extensions/neurocompact.ts` (M3 splitter),
+  `scripts/m3_anchor_report.py`, tests in `scripts/tests/test_amendment_c.py`. The server side
+  (`session_graph` flag, `keyword_source`) is `hars_memory/mcp_server.py` (other agent); the
+  dataset side (`import_openhands.py`, `select_openhands.py`, `oh_pipeline.py`) is another agent.
+- Environment facts of the amended run: agent/answer/extractor `claude-haiku-5-5` via Anthropic
+  (`pi --provider anthropic`); embedder = hash bag-of-words shim (HF blocked) — frozen limitation;
+  only `api.anthropic.com` is reachable (openrouter.ai blocked).
+- **OPEN ISSUES (owner):** (1) JUDGE FAMILY: every reachable judge is anthropic = the agent's
+  family and the runner refuses it (not weakened); `judge_v2.py` only speaks OpenRouter. Need a
+  non-anthropic judge route or an explicit amendment. (2) `merge_runs.py` and `funnel_chains.py`
+  still hard-code arms `nc` / dir `nc` and the 3-arm shape: they need the nc-chunks/nc-graph
+  update (C11) before use on amended runs. (3) Cost ceiling for the ~30x run (RUNBOOK). (4)
+  `evidence_spans` schema for multi-hop items is an interface assumption (runner checks each leg)
+  until the dataset agent fixes it. (5) M3 deviation: one memory_compact call per compaction (not
+  per piece) — see C9; confirm. (6) Keyword token usage is only counted if the server reports it
+  (`session_graph.keyword_usage`); otherwise a flagged estimate is used.
+- Run-artifact rule (CLAUDE.md): archive every amended run under
+  `/mnt/datasets/ft/artifacts/<UTC>-<name>/` with samples/summary/run.log/inputs/scripts/MANIFEST.
+
 ## Code locations (where this lives)
 
 - **Home repo:** `github.com/angkira/hars-memory` (private), branch
@@ -20,7 +55,7 @@ INFRA-NOTES.md, REPORT-forensics-gate212839.md.
   concurrent perception agent there on 2026-10-26 (resolved: their branch restored
   to their tip, eval content removed).
 
-## Mission (3 lines)
+## Mission (3 lines) — pre-amendment text; superseded by the STATE UPDATE above
 
 Test whether HARS externalized graph memory (short note + packed recall) matches or beats an
 in-context 1536-token summary on 10 chained-compaction sessions, 3 arms (baseline / nc /
@@ -274,7 +309,11 @@ curl -s -m 15 https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $OP
 - Judge calibration kappa on the `unsupported` flag alone is 0.624 (score kappa 0.956) —
   mention as a caveat in the final report.
 
-## OPEN PROTOCOL ISSUES (owner decision needed)
+## OPEN PROTOCOL ISSUES (owner decision needed) — status after Amendment C
+
+B4 -> dataset rebuilt (14 sessions, C12); M2 -> nc-graph arm + nc-chunks rename (C1-C3); M3 ->
+full-span persistence (C9) + `m3_anchor_report.py`; M7 -> retired with the old dataset; M5 and the
+judge/funnel items remain open (see STATE UPDATE). The original texts follow as the audit trail.
 
 Found by the code review; NOT fixed by the harness fixes (no dataset rebuild, no runs).
 Until decided, treat any full-run number as exploratory.

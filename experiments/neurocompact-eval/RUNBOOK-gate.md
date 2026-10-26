@@ -1,5 +1,12 @@
 # RUNBOOK — chained long-replay A/B (pre-freeze gate + full run)
 
+> **AMENDMENT C (2026-10-26) governs every new run; see "AMENDMENT C" at the end of this file and
+> REPORT-PROTOCOL.md section 4a.** Arms are now baseline / nc-chunks / nc-graph / nc-note-only
+> (`nc` = nc-chunks, alias), `--mem-budgets 1536,1024,512` sweeps the budget, the decision is
+> nc-graph vs baseline at B=1536. The commands and numbers below this banner are the
+> pre-amendment record; where the two differ, Amendment C wins. All earlier runs are
+> exploratory chunk-RAG and are not in the decision set.
+
 Protocol owner notes, 2026-10-25. Design follows the external review (argon_answer_r1.md):
 10 chains x C=3 chained compactions, ask only after C3, arms `baseline` / `nc` / `nc-note-only`,
 realized-token budget parity B=1536, blind evidence-grounded judge, chain-cluster bootstrap gates.
@@ -200,3 +207,85 @@ Kill/blame funnel (offline, $0, on archived artifacts):
 3. If INCONCLUSIVE: check the drift test first — baseline anchor on lag-3 spans vs lag-1 spans;
    if baseline loses < 10 pp across two re-summarizations, 3 compactions are below the
    information-loss cliff (say so; do not spin).
+
+# AMENDMENT C (2026-10-26) — written and committed before any amended run
+
+Full text and rationale: REPORT-PROTOCOL.md section 4a (C1-C15). Operational form:
+
+## Invariants that changed
+
+1. Arms: `baseline`, `nc-chunks` (live, persists, 3 compactions), `nc-graph` and `nc-note-only`
+   (forks `cp -a` of the nc-chunks post-C3 session; they keep its session id; 0 replays, 0
+   compactions). `nc-graph` asks inject a packed `memory_recall` made with
+   `{session_id, question, top_k: 8, session_graph: true, session_graph_mode: "hybrid"}`; nc-chunks
+   with `{session_id, question, top_k: 8}`. Same note, session dir, packer v2, cap. Runner flag
+   `--arms` defaults to all four; `nc` is accepted as `nc-chunks`.
+2. Budget sweep `--mem-budgets 1536,1024,512` (primary 1536 runs first): per B baseline trim = B,
+   note cap `round(640*B/1536)` = 640 / 427 / 213, recall cap `clamp(B - realized note,
+   round(256*B/1536), round(1024*B/1536))` = floor/ceil 256/1024, 171/683, 85/341. Session ids
+   `cr-<model>-<chain>-<arm>-b<B>-<run>`, dirs `sessions/<chain>__b<B>/`. Records carry
+   `mem_budget`, `rid = <qid>::<arm>::b<B>`, `b_tag`, `qtype`.
+3. Validity per (chain, B): RECALL FAIL also on nc-graph `session_graph.status` in {error,
+   skipped, unknown_session}, a missing `session_graph` block, or any generic recall failure of
+   either recall arm. Empty KG results are not invalidating (`kg_empty_rate`, diagnostic when >
+   30%). Incomplete arm quadruplets are dropped by metrics/export.
+4. Keyword policy: the runner sends none; the server does LLM keyword extraction (extractor model,
+   cached) with question fallback; `keyword_source`, keywords, KG entity/relation counts, status and
+   keyword usage are logged per nc-graph ask. Ask latency (metrics) = `latency_s` + `recall_seconds`
+   for every arm, so the keyword call is inside the 20 s / 30 s latency rules; cost/question adds the
+   keyword tokens (flagged estimate if the server reports none).
+5. M3: the extension persists the whole span (<= RAW_CAP 60000) as <= 8000-char message-aligned
+   `dropped_context` pieces of one `memory_compact` call per compaction. `NC_SELFTEST=1` covers
+   the splitter. Offline sizing: `scripts/m3_anchor_report.py --chains ... --sessions-root ...`.
+6. Metrics/export: duplicates keyed (qid, arm, mem_budget); legacy `nc` records read as
+   `nc-chunks`; a run without nc-graph rows is a LEGACY 3-arm run (exploratory banner).
+   Blindness masking covers `-nc-chunks-` / `-nc-graph-` id parts, `nc-chunks` / `nc-graph`
+   words, `Knowledge Graph Data (...)`, `Document Chunks (...)`, `### Direct relations / entities`
+   headers and `session_graph`.
+
+## Frozen configuration of the amended run
+
+- Agent / replay / compactor / answers: `claude-haiku-5-5`, `--provider anthropic`
+  (`ANTHROPIC_API_KEY`), reasoning off. HARS extractor and keyword model: `claude-haiku-5-5` via
+  Anthropic (DIFFERS from the earlier glm extractor: graphs not comparable). Embedder: hash
+  bag-of-words shim only (HF blocked): a limitation and a frozen config. Gleaning, chunk size,
+  `HARS_MEMORY_SESSION_INDEX_BS`, server git sha: record in the MANIFEST before launch.
+- Dataset: OpenHands SWE-bench Verified rebuild, 14 independent sessions, <= 3 per repo, QA on
+  transcript specifics (never the SWE-bench fix), `qtype = multihop` secondary stratum.
+  `MIN_CHAINS = 8` distinct sessions.
+- Judge: different family from the agent, enforced by the runner. **OPEN: no non-anthropic judge is
+  reachable from the build environment (see REPORT-PROTOCOL.md C14); do not run the judge until
+  resolved; do not weaken the check.**
+
+## Launch (after the owner sets the cost ceiling; every command preceded by `--dry-run`)
+
+```
+export ANTHROPIC_API_KEY=...                      # never print or log it
+python3 run_chainreplay.py --dry-run --chains chains.jsonl --mem-budgets 1536,1024,512 \
+  --provider anthropic --agent-model claude-haiku-5-5 --extractor-model claude-haiku-5-5 \
+  --mcp http://127.0.0.1:<port>/mcp --require-no-clip
+python3 run_chainreplay.py --chains chains.jsonl --mem-budgets 1536,1024,512 \
+  --out /mnt/datasets/ft/artifacts/<UTC>-nc-amC/run \
+  --provider anthropic --agent-model claude-haiku-5-5 --extractor-model claude-haiku-5-5 \
+  --mcp http://127.0.0.1:<port>/mcp --require-no-clip
+python3 export_judge_input.py --records "<run>/records.jsonl" --chains chains.jsonl --out <run>/judge-input.jsonl
+python3 judge_v2.py --in <run>/judge-input.jsonl --model <non-anthropic judge> ...     # BLOCKED, see above
+python3 metrics_v2.py --records <run>/records.jsonl --judge <run>/judged.jsonl \
+  --judge-input <run>/judge-input.jsonl --json <run>/metrics.json --out REPORT-chains.md
+```
+
+Cost multiplier vs the old single-B 3-arm run: replays and compactions x3, ask turns x4, recalls
+x6 (half with a keyword LLM call), HARS extraction x3 (+~20% from M3), judge x4; 14 sessions vs
+10 chains; Haiku vs qwen-flash prices. Order-of-magnitude ~30x the old $2.50 ceiling: set an
+explicit ceiling and abort rule before launch; the primary B=1536 cell is complete after the
+first third of the run (B-major order), so a budget stop still leaves a decision cell.
+
+## Decision rules (Amendment C)
+
+- PRIMARY: the WIN / FAIL rules above, verbatim, with nc := nc-graph, at B=1536 only
+  (metrics_v2 gates on the B=1536 cell; other cells are descriptive).
+- SECONDARY (Holm, family of 5, one-sided alpha 0.025): S1 `nc-graph - nc-chunks` @1536 (anchor);
+  S2 `nc-graph@1024` non-inferior to `baseline@1536`; S3 same @512; S4 multi-hop `nc-graph -
+  baseline` @1536; S5 multi-hop `nc-graph - nc-chunks` @1536. Non-inferiority margins: clean
+  anchor 0.10 AND score 0.15 (both must hold; p = max). Underpowered (< 8 sessions) = INCONCLUSIVE.
+- `nc-chunks` is a descriptive ablation; legacy runs are exploratory.
