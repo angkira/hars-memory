@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """QA generator for longsession/1 sessions that carry no questions (e.g. Claude Code imports).
 
-Provider-agnostic (OpenRouter | Anthropic | mock via longsession.LLM). Builds on the machinery of
+Provider-agnostic: any providers.py profile (anthropic | openrouter | gemini | custom) or the offline mock,
+via longsession.LLM (role qa_generator; prices/keys/hard budget from providers.py). Builds on the machinery of
 make_chains.py instead of re-inventing the gates:
   * text helpers  make_chains.norm_ws / has_verbatim / anchor_re / strip_wrappers / probe_tokens
   * multi-hop gate (validate_multihop below = the gates of multihop.validate_multihop, the FROZEN
@@ -23,8 +24,10 @@ windows so lags vary. Every LLM prompt + raw answer is appended to ``<out>/qa-ra
 (full artifacts), accepted/rejected counts go to ``<out>/qa-manifest.json``.
 
 Usage
-  EVAL_API_KEY=... python3 gen_longsession_qa.py --sessions DIR --out OUT --provider anthropic \\
-      --model claude-haiku-5-5 --n-single 12 --n-multihop 4 --budget-usd 1.0
+  ANTHROPIC_API_KEY=... python3 gen_longsession_qa.py --sessions DIR --out OUT --profile anthropic \\
+      --model-qa-generator claude-sonnet-5-5 --n-single 12 --n-multihop 4 --budget-usd 5.0
+  (--budget-usd = HARD cap for the whole run, mandatory for a live run; --session-budget-usd
+   optionally caps one session; --provider / --model are kept as aliases)
   python3 gen_longsession_qa.py --sessions DIR --out OUT --dry-run        # no network
 """
 from __future__ import annotations
@@ -40,6 +43,7 @@ import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
+import providers as P  # noqa: E402
 from longsession import (LLM, LLMError, compute_boundaries, fmt_usd,  # noqa: E402
                          load_sessions, message_tokens, save_session, serialize, validate_session)
 
@@ -430,10 +434,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--sessions", nargs="+", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--provider", default="openrouter", choices=("openrouter", "anthropic", "mock"))
-    ap.add_argument("--model", default="claude-haiku-5-5")
-    ap.add_argument("--key-env", default=None)
-    ap.add_argument("--base-url", default=None)
+    P.add_profile_args(ap, roles=("qa_generator",))
+    ap.add_argument("--provider", default=None, choices=P.PROFILE_NAMES + ("mock",),
+                    help="alias of --profile (also: mock = offline, no network)")
+    ap.add_argument("--model", default=None, help="alias of --model-qa-generator")
+    ap.add_argument("--key-env", default=None, help="env var holding the API key (never printed)")
     ap.add_argument("--window-tokens", type=int, default=150000)
     ap.add_argument("--keep-tail", type=int, default=20000)
     ap.add_argument("--reserve", type=int, default=1536)
@@ -443,7 +448,11 @@ def main(argv=None) -> int:
     ap.add_argument("--excerpt-tokens", type=int, default=8000)
     ap.add_argument("--per-call", type=int, default=3)
     ap.add_argument("--max-calls", type=int, default=60, help="per session")
-    ap.add_argument("--budget-usd", type=float, default=1.0, help="per session")
+    P.add_budget_arg(ap)
+    ap.add_argument("--session-budget-usd", type=float, default=None,
+                    help="optional cap per session (default: the remaining --budget-usd)")
+    ap.add_argument("--price-in", type=float, default=None, help="USD/MTok override of the profile price")
+    ap.add_argument("--price-out", type=float, default=None)
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--keep-existing", action="store_true", help="append to existing questions")
     ap.add_argument("--dry-run", action="store_true")
@@ -453,11 +462,34 @@ def main(argv=None) -> int:
         raise SystemExit("no sessions found")
     os.makedirs(a.out, exist_ok=True)
     raw_log = os.path.join(a.out, "qa-raw.jsonl")
-    llm = LLM(a.provider, a.model, key_env=a.key_env, base_url=a.base_url)
+    provider = a.profile or a.provider or "anthropic"
+    try:
+        profile = None if provider == "mock" else P.load_profile(provider, base_url=a.base_url,
+                                                                  pi_provider=a.pi_provider)
+    except P.ProviderError as e:
+        raise SystemExit(f"!!! {e}")
+    a.model = a.model_qa_generator or a.model or (profile.default_model("qa_generator") if profile
+                                                  else "mock")
+    if not a.model:
+        raise SystemExit(f"!!! no qa_generator model for profile {provider}: pass --model-qa-generator")
+    budget = None
+    if not a.dry_run and provider != "mock":
+        try:
+            budget = P.Budget(a.budget_usd)
+        except P.ProviderError as e:
+            raise SystemExit(f"!!! {e} (--budget-usd is mandatory for a paid generation run)")
+    override = (a.price_in, a.price_out) if (a.price_in is not None and a.price_out is not None) else None
+    llm = LLM(provider, a.model, role="qa_generator", profile=profile, budget=budget,
+              key_env=a.key_env, price=override)
     if not a.dry_run and llm.key_problem():
         raise SystemExit(llm.key_problem())
+    a.provider = provider
     manifest = {"started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "model": a.model,
-                "provider": a.provider, "argv": sys.argv[1:], "sessions": []}
+                "provider": a.provider, "argv": sys.argv[1:], "sessions": [],
+                "budget_usd": a.budget_usd,
+                "price_usd_per_mtok": list(llm.price),
+                "price_status": ((profile.price(a.model) or {}).get("status") if profile else None)}
+    est_total = 0.0
     for s in sessions:
         bad = validate_session(s)
         if bad:
@@ -468,13 +500,16 @@ def main(argv=None) -> int:
             calls = estimate_calls(a.n_single, a.n_multihop, a.per_call)
             pin, pout = llm.price
             est = calls * (a.excerpt_tokens * 1.3 * pin + 1500 * pout) / 1e6
+            est_total += est
             print(f"{s['sid']}: {len(wins)} windows, ~{calls} calls, est {fmt_usd(est)} "
                   f"({a.model} @ {llm.price} USD/MTok in,out)")
             continue
         qs, st = generate(s, llm, window=a.window_tokens, keep_tail=a.keep_tail, reserve=a.reserve,
                           use_real=a.use_real_compactions, n_single=a.n_single,
                           n_multihop=a.n_multihop, excerpt_tokens=a.excerpt_tokens, seed=a.seed,
-                          per_call=a.per_call, max_calls=a.max_calls, budget_usd=a.budget_usd,
+                          per_call=a.per_call, max_calls=a.max_calls,
+                          budget_usd=min(a.session_budget_usd or float("inf"),
+                                         budget.remaining if budget else float("inf")),
                           raw_log=raw_log)
         old = s.get("questions") or [] if a.keep_existing else []
         s["questions"] = old + qs
@@ -483,9 +518,14 @@ def main(argv=None) -> int:
         print(f"{s['sid']}: {st['single_ok']} single + {st['multi_ok']} multihop accepted "
               f"({st['calls']} calls, {fmt_usd(st['cost_usd'])}); rejected single={st['single_rejected']} "
               f"multi={st['multi_rejected']}")
+    if a.dry_run:
+        cap = f" vs --budget-usd {fmt_usd(a.budget_usd)}" if a.budget_usd else ""
+        print(f"DRY RUN total estimate {fmt_usd(est_total)} (upper-ish bound: max calls per session){cap}"
+              + ("  [OVER CAP]" if a.budget_usd and est_total > a.budget_usd else ""))
     if not a.dry_run:
         manifest["ended"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         manifest["total_cost_usd"] = round(llm.cost, 6)
+        manifest["unpriced_calls"] = llm.unpriced_calls
         with open(os.path.join(a.out, "qa-manifest.json"), "w") as f:
             json.dump(manifest, f, indent=1)
     return 0

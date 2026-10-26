@@ -52,8 +52,10 @@ COST (see README-longsession.md): printed per arm by --dry-run from token counts
 
 Usage
   python3 run_longsession.py --sessions DIR --dry-run --mem-budgets 1536 --window 150000
-  EVAL_API_KEY=... python3 run_longsession.py --sessions DIR --provider anthropic \\
-      --agent-model claude-haiku-5-5 --mcp http://127.0.0.1:8307/mcp --name beam1M
+  ANTHROPIC_API_KEY=... python3 run_longsession.py --sessions DIR --profile anthropic \\
+      --agent-model claude-haiku-5-5 --mcp http://127.0.0.1:8307/mcp --name beam1M --budget-usd 30
+  (--budget-usd is a HARD cap and mandatory for a live run; it also carries the flagged ESTIMATE of
+   the HARS-side extraction per ingested piece; --max-cost-usd / --provider are kept aliases)
   python3 run_longsession.py --sessions DIR --resume /mnt/datasets/ft/artifacts/<dir> ...
 """
 from __future__ import annotations
@@ -81,6 +83,7 @@ from collections import Counter, defaultdict
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import longsession as L  # noqa: E402
+import providers as P  # noqa: E402  (profiles, the single price source, hard --budget-usd)
 from longsession import (LLM, LLMError, count_tokens, fmt_usd, note_cap_formula,  # noqa: E402
                          recall_ceil_formula, recall_floor_formula)
 
@@ -392,12 +395,26 @@ def build_plan(session: dict, args) -> dict:
 # =============================================================================
 # cost estimate (offline)
 # =============================================================================
+def usd_for(args, kind: str, tin: float, tout: float) -> float:
+    """USD of ONE request of `kind` (sum | qa | ext) with tin prompt / tout completion tokens:
+    the profile's tier-aware price (Haiku 5.5: 0.10/0.50, 0.50/2.50 above 100k prompt tokens)
+    unless a --price-in/--price-out override is active, else the flat (in, out) tuple."""
+    prices = getattr(args, "prices_cache", None) or {}
+    flat = prices.get(kind, (0.0, 0.0))
+    ov = (args.extractor_price_in, args.extractor_price_out) if kind == "ext" else (args.price_in, args.price_out)
+    prof = getattr(args, "profile_obj", None)
+    model = {"sum": args.sum_model, "qa": args.qa_model, "ext": args.extractor_model}[kind]
+    if prof is not None and None in ov:
+        c = prof.cost_usd(model, int(tin), int(tout))
+        if c is not None:
+            return c
+    return (tin * flat[0] + tout * flat[1]) / 1e6
+
+
 def estimate_cost(plan: dict, args, prices: dict) -> dict:
     """Per-B, per-arm USD estimate from token counts only (formulas in README-longsession.md)."""
     msgs = plan["session"]["messages"]
     bs = plan["boundaries"]
-    sp = prices["sum"]
-    qp = prices["qa"]
     ep = prices["ext"]
     out: dict = {"per_budget": {}, "hars": {}}
     ser_chars = [sum(len(L.serialize_message(m)) + 2 for m in msgs[b["drop_start"]:b["at_idx"]]) for b in bs]
@@ -406,7 +423,7 @@ def estimate_cost(plan: dict, args, prices: dict) -> dict:
     pieces = [max(1, L.ceil_div(c, args.piece_chars)) for c in ser_chars]
     chunks = [max(1, L.ceil_div(b["dropped_tokens"], CHUNK_TOKENS)) for b in bs]
     calls = [L.ceil_div(p, args.pieces_per_call) for p in pieces]
-    ext_usd = sum(chunks) * (args.extract_in_per_chunk * ep[0] + args.extract_out_per_chunk * ep[1]) / 1e6
+    ext_usd = sum(chunks) * usd_for(args, "ext", args.extract_in_per_chunk, args.extract_out_per_chunk)
     out["hars"] = {"pieces": sum(pieces), "memory_compact_calls": sum(calls), "extract_chunks": sum(chunks),
                    "extract_usd": ext_usd, "est_ingest_hours": sum(pieces) * args.extract_s_per_piece / 3600.0}
     for B in args.budgets:
@@ -414,17 +431,19 @@ def estimate_cost(plan: dict, args, prices: dict) -> dict:
         res: dict[str, float] = {}
         for kind, cap, arm in (("baseline", B, ARM_BASELINE), ("note", ncap, "note")):
             p0 = count_tokens(summarizer_prompt(kind, cap, "", ""))
-            tin = tout = 0.0
+            tin = tout = usd = 0.0
             prev = 0.0
             for b in bs:
                 slices = max(1, L.ceil_div(b["dropped_tokens"], max(1, args.sum_max_input - p0 - cap)))
                 tin += slices * (p0 + prev) + b["dropped_tokens"]
                 tout += slices * cap * FILL
+                per_req_in = p0 + prev + b["dropped_tokens"] / slices      # tier is chosen per request
+                usd += slices * usd_for(args, "sum", per_req_in, cap * FILL)
                 prev = cap * FILL
-            res[arm] = (tin * sp[0] + tout * sp[1]) / 1e6
+            res[arm] = usd
             res[arm + "_tokens_in"] = tin
             res[arm + "_tokens_out"] = tout
-        asks = {a: [0, 0.0] for a in ALL_ARMS}          # arm -> [n asks, input tokens]
+        asks = {a: [0, 0.0, 0.0] for a in ALL_ARMS}     # arm -> [n asks, input tokens, usd]
         for j, ql in plan["ask"].items():
             b = bs[j - 1]
             for q, _lag in ql:
@@ -433,15 +452,17 @@ def estimate_cost(plan: dict, args, prices: dict) -> dict:
                 for a in (ARM_BASELINE, ARM_CHUNKS, ARM_GRAPH, ARM_NOTE):
                     asks[a][0] += 1
                     asks[a][1] += base_in + B
+                    asks[a][2] += usd_for(args, "qa", base_in + B, ANSWER_OUT_EST)
                 if b.get("original_summary") and B == max(args.budgets):     # orig runs once (reference B)
                     asks[ARM_ORIG][0] += 1
                     asks[ARM_ORIG][1] += base_in + count_tokens(b["original_summary"])
+                    asks[ARM_ORIG][2] += usd_for(args, "qa", base_in + count_tokens(b["original_summary"]),
+                                                 ANSWER_OUT_EST)
         n_recalls = sum(len(ql) for ql in plan["ask"].values())
-        kw = (n_recalls * (rc_kw_in() * ep[0] + rc_kw_out() * ep[1])) / 1e6
+        kw = n_recalls * usd_for(args, "ext", rc_kw_in(), rc_kw_out())
         arm_usd = {}
         for a in ALL_ARMS:
-            n, tin = asks[a]
-            ask_usd = (tin * qp[0] + n * ANSWER_OUT_EST * qp[1]) / 1e6
+            n, tin, ask_usd = asks[a]
             owner = next((x for x in NOTE_ARMS if x in args.arms_list), None)   # carries the shared note cost
             if a == ARM_BASELINE:
                 arm_usd[a] = res["baseline"] + ask_usd
@@ -478,6 +499,7 @@ def total_usd(est: dict, arms: list[str], hars_sessions_factor: int = 1) -> floa
 
 
 def print_dry_run(plans: list[dict], args, prices: dict, *, as_json: bool = False) -> dict:
+    args.prices_cache = prices
     res = {"config": {"window": args.window, "keep_tail": args.keep_tail, "reserve": args.reserve,
                       "budgets": args.budgets, "checkpoints": args.checkpoints, "arms": args.arms_list,
                       "real": bool(args.use_real_compactions), "tokenizer": L.TOKENIZER,
@@ -538,7 +560,20 @@ def print_dry_run(plans: list[dict], args, prices: dict, *, as_json: bool = Fals
         lines.append(f"  session total (arms {arms}, HARS extraction included once"
                      f"{' per budget' if args.hars_per_budget else ''}): {fmt_usd(tot)}")
     res["grand_total_usd"] = round(grand, 6)
-    lines.append(f"\nGRAND TOTAL {fmt_usd(grand)} over {len(plans)} session(s)")
+    lines.append(f"\nGRAND TOTAL {fmt_usd(grand)} over {len(plans)} session(s)"
+                 " (includes the flagged estimate of HARS extraction, charged to the cap at run time)")
+    unpriced = [m for m in {args.sum_model, args.qa_model, args.extractor_model}
+                if args.provider != L.MOCK and P.price_tuple(m, getattr(args, "profile_obj", None)) is None
+                and args.price_in is None]
+    res["unpriced_models"] = sorted(unpriced)
+    if unpriced:
+        lines.append(f"WARNING unpriced model(s) {sorted(unpriced)}: add them to the profile or pass "
+                     "--price-in/--price-out (a live run with --budget-usd refuses an unpriced call)")
+    if args.budget_usd:
+        res["budget_check"] = {"budget_usd": args.budget_usd, "estimate_usd": round(grand, 6),
+                               "ok": grand <= args.budget_usd}
+        lines.append(f"BUDGET CHECK: estimate {fmt_usd(grand)} vs --budget-usd {fmt_usd(args.budget_usd)}: "
+                     + ("OK" if grand <= args.budget_usd else "OVER THE CAP (the run would stop early)"))
     if as_json:
         print(json.dumps(res, indent=1, sort_keys=True))
     else:
@@ -665,8 +700,10 @@ class Tee:
 class Ctx:
     """Shared run state: models, HARS handle, artifact dir, locks, done set."""
 
-    def __init__(self, args, out: str, hars, sum_llm, qa_llm, run_id: str):
+    def __init__(self, args, out: str, hars, sum_llm, qa_llm, run_id: str, budget=None):
         self.args, self.out, self.hars, self.sum_llm, self.qa_llm, self.run_id = args, out, hars, sum_llm, qa_llm, run_id
+        self.budget = budget                  # providers.Budget (hard cap) or None (mock/dry)
+        self.est_hars_usd = 0.0               # flagged ESTIMATE of the HARS-side extraction
         self.lock = threading.Lock()
         self.done: set[tuple[str, str, int]] = set()
         self.totals = Counter()
@@ -718,10 +755,9 @@ class BudgetExceeded(RuntimeError):
 
 class SessionRun:
     def check_budget(self):
-        cap = self.a.max_cost_usd
-        spent = self.c.sum_llm.cost + self.c.qa_llm.cost
-        if cap and spent > cap:
-            raise BudgetExceeded(f"LLM spend {spent:.4f} USD > --max-cost-usd {cap}")
+        b = self.c.budget
+        if b is not None and b.spent >= b.limit:
+            raise BudgetExceeded(f"spend ${b.spent:.4f} reached --budget-usd ${b.limit:.4f}")
 
     def __init__(self, ctx: Ctx, plan: dict):
         self.c, self.plan, self.a = ctx, plan, ctx.args
@@ -857,9 +893,22 @@ class SessionRun:
                 self.log_comp({"j": b["j"], "arm": "hars", "ok": False, "error": err})
                 return
         self.mem.put(key, {"ok": True, "calls": n_calls, "seqs": seqs})
+        self.charge_extraction_estimate(b, dropped)
         self.log_comp({"j": b["j"], "arm": "hars", "ok": True, "cached": False, "pieces": len(pieces),
                        "calls": n_calls, "seconds": round(time.time() - t0, 2),
                        "drop_chars": sum(len(x) for x in pieces)})
+
+    def charge_extraction_estimate(self, b: dict, dropped: list[dict]):
+        """The HARS server bills its own extractor calls; this run charges a flagged ESTIMATE
+        (extract_in/out_per_chunk x chunks at the extractor model's profile price) to the same
+        hard cap so --budget-usd covers the whole run."""
+        ep = self.a.prices_cache["ext"]
+        chunks = max(1, L.ceil_div(sum(L.message_tokens(dropped)), CHUNK_TOKENS))
+        usd = chunks * (self.a.extract_in_per_chunk * ep[0] + self.a.extract_out_per_chunk * ep[1]) / 1e6
+        with self.c.lock:
+            self.c.est_hars_usd += usd
+        if self.c.budget is not None:
+            self.c.budget.charge(usd)
 
     # ------------------------------------------------------------- asking
     def tail_text(self, b: dict) -> str:
@@ -940,7 +989,7 @@ class SessionRun:
             mem_tokens = count_tokens(memory) + (count_tokens(injected) if injected else 0)
             kg_txt, ch_txt = (rcm.split_packed_sections(packed.get("text", "")) if arm in NC_ARMS else ("", ""))
             row = {
-                "run_id": self.c.run_id, "chain_id": self.sid, "sid": self.sid, "session_id": self.hars_sid(B) if arm in NC_ARMS else self.sid,
+                "run_id": self.c.run_id, "chain_id": self.sid, "sid": self.sid, "cluster_session": self.sid, "session_id": self.hars_sid(B) if arm in NC_ARMS else self.sid,
                 "source": self.s.get("source"), "qid": qid_row, "base_qid": q["qid"], "arm": arm, "mem_budget": B, "b_tag": True, "rid": rid,
                 "checkpoint": j, "is_end": is_end, "n_boundaries": len(self.plan["boundaries"]),
                 "lag": lag, "in_tail": lag == 0, "span_idx": j, "slice": None,
@@ -952,6 +1001,7 @@ class SessionRun:
                 "cost_usd": r["cost_usd"],
                 "memory_tokens": mem_tokens, "memory_tokens_injected": count_tokens(injected) if injected else 0,
                 "arm_note_tokens": note_tokens, "arm_memory_total": mem_tokens, "tail_tokens": tail_tokens,
+                "tail_from": b["at_idx"], "tail_to": b["trigger_idx"],
                 "memory_text": memory, "injected": injected, "prompt_sha256": L.sha256_text(prompt),
                 "anchor_hit": bool(pat.search(answer)) if pat else None,
                 "anchor_in_recall": bool(pat.search(packed.get("text", ""))) if (pat and arm in NC_ARMS) else None,
@@ -1211,19 +1261,28 @@ def parse_args(argv=None):
     ap.add_argument("--max-questions", type=int, default=0, help="per session per checkpoint (0 = all)")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--limit", type=int, default=0, help="max sessions")
-    ap.add_argument("--provider", default="openrouter", choices=("openrouter", "anthropic", "mock"))
-    ap.add_argument("--agent-model", default="claude-haiku-5-5", help="summariser + answer model")
-    ap.add_argument("--sum-model", default=None)
-    ap.add_argument("--qa-model", default=None, help="answer model (default = agent model)")
+    P.add_profile_args(ap, roles=("agent", "answer", "summarizer", "extractor"))
+    ap.add_argument("--provider", dest="provider_legacy", default=None,
+                    choices=tuple(P.PROFILE_NAMES) + ("mock",),
+                    help="alias of --profile (also: mock = offline LLM, no network). Default profile: "
+                         "anthropic (Amendment C.1)")
+    ap.add_argument("--agent-model", default=None,
+                    help="alias of --model-agent: summariser + answer model unless "
+                         "--sum-model/--qa-model (or --model-summarizer/--model-answer) are given")
+    ap.add_argument("--sum-model", default=None, help="alias of --model-summarizer")
+    ap.add_argument("--qa-model", default=None, help="alias of --model-answer (default = agent model)")
+    ap.add_argument("--extractor-model", default=None,
+                    help="alias of --model-extractor: HARS extractor, RECORDED + priced only "
+                         "(the server is configured by `providers.py hars-env`)")
     ap.add_argument("--key-env", default=None, help="env var holding the API key (never printed)")
-    ap.add_argument("--base-url", default=None)
     ap.add_argument("--reasoning-effort", default=None, help="openrouter reasoning.effort passthrough")
     ap.add_argument("--anthropic-thinking", choices=("disabled", "default"), default="disabled",
-                    help="disabled sends thinking={type:disabled}: adaptive thinking otherwise eats the "
-                         "summariser's max_tokens (stop=length, empty text)")
-    ap.add_argument("--price-in", type=float, default=None, help="USD/MTok override (agent model)")
+                    help="disabled sends thinking={type:disabled} on the anthropic endpoint: adaptive "
+                         "thinking otherwise eats the summariser's max_tokens (stop=length, empty text)")
+    ap.add_argument("--price-in", type=float, default=None,
+                    help="USD/MTok override of the profile price (agent models; the profile tables "
+                         "in profiles/*.json are the default and only table)")
     ap.add_argument("--price-out", type=float, default=None)
-    ap.add_argument("--extractor-model", default="claude-haiku-5-5", help="HARS extractor (cost estimate only)")
     ap.add_argument("--extractor-price-in", type=float, default=None)
     ap.add_argument("--extractor-price-out", type=float, default=None)
     ap.add_argument("--extract-in-per-chunk", type=float, default=EXTRACT_IN_PER_CHUNK)
@@ -1236,9 +1295,10 @@ def parse_args(argv=None):
     ap.add_argument("--sum-max-tokens-slack", type=float, default=SUM_MAX_TOKENS_SLACK,
                     help="summariser max_tokens = cap * slack + 64 (the cap itself is enforced by the trimmer)")
     ap.add_argument("--answer-max-tokens", type=int, default=400)
-    ap.add_argument("--max-cost-usd", type=float, default=0.0,
-                    help="hard stop when summariser + answer LLM spend exceeds this (0 = off; HARS extraction "
-                         "is billed by the HARS process and not counted); resume with a higher cap")
+    P.add_budget_arg(ap)
+    ap.add_argument("--max-cost-usd", dest="budget_usd", type=float, default=None,
+                    help="alias of --budget-usd (HARD cap: summariser + answers + flagged estimate of "
+                         "the HARS extraction; the run stops at the cap, resume with a higher one)")
     ap.add_argument("--allow-degraded", action="store_true")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--preflight-session", default=None)
@@ -1262,9 +1322,28 @@ def parse_args(argv=None):
         raise SystemExit("arm 'orig' needs --use-real-compactions (real summaries)")
     if a.keep_tail + a.reserve >= a.window and not a.use_real_compactions:
         raise SystemExit(f"--keep-tail {a.keep_tail} + --reserve {a.reserve} must be < --window {a.window}")
-    a.sum_model = a.sum_model or a.agent_model
-    a.qa_model = a.qa_model or a.agent_model
+    resolve_models_into(a)
     return a
+
+
+def resolve_models_into(a) -> None:
+    """Profile + per-role models (agent -> summariser/answer fallback), profile object, budget."""
+    a.provider = a.profile or a.provider_legacy or "anthropic"
+    a.profile_obj = None
+    if a.provider != L.MOCK:
+        try:
+            a.profile_obj = P.load_profile(a.provider, base_url=a.base_url, pi_provider=a.pi_provider)
+        except P.ProviderError as e:
+            raise SystemExit(f"!!! {e}")
+    dflt = (lambda r: a.profile_obj.default_model(r)) if a.profile_obj else (lambda r: "mock")
+    ag = a.model_agent or a.agent_model
+    a.agent_model = ag or dflt("agent")
+    a.sum_model = a.model_summarizer or a.sum_model or ag or dflt("summarizer")
+    a.qa_model = a.model_answer or a.qa_model or ag or dflt("answer")
+    a.extractor_model = a.model_extractor or a.extractor_model or dflt("extractor") or "claude-haiku-5-5"
+    missing = [n for n, m in (("agent", a.agent_model), ("summarizer", a.sum_model), ("answer", a.qa_model)) if not m]
+    if missing:
+        raise SystemExit(f"!!! no model for role(s) {missing} in profile {a.provider}: pass --model-<role>")
 
 
 def model_prices(a) -> dict:
@@ -1308,6 +1387,7 @@ def main(argv=None) -> int:
         print("no usable sessions", file=sys.stderr)
         return 2
     prices = model_prices(a)
+    a.prices_cache = prices
     if a.dry_run:
         print_dry_run(plans, a, prices, as_json=a.json)
         return 0
@@ -1346,20 +1426,31 @@ def main(argv=None) -> int:
 def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
     compact_sem, recall_sem = threading.Semaphore(a.compact_concurrency), threading.Semaphore(a.recall_concurrency)
     hars = FakeHars() if a.fake_hars else Hars(a.mcp, compact_sem, recall_sem)
-    sum_llm = LLM(a.provider, a.sum_model, key_env=a.key_env, base_url=a.base_url, price=(a.price_in, a.price_out) if (a.price_in is not None and a.price_out is not None) else None, reasoning_effort=a.reasoning_effort, thinking=a.anthropic_thinking)
-    qa_llm = LLM(a.provider, a.qa_model, key_env=a.key_env, base_url=a.base_url, price=(a.price_in, a.price_out) if (a.price_in is not None and a.price_out is not None) else None, reasoning_effort=a.reasoning_effort, thinking=a.anthropic_thinking)
-    ctx = Ctx(a, out, hars, sum_llm, qa_llm, run_id)
+    budget = None
+    if a.provider != L.MOCK and a.budget_usd:
+        budget = P.Budget(a.budget_usd)
+    override = (a.price_in, a.price_out) if (a.price_in is not None and a.price_out is not None) else None
+    mk = lambda role, model: LLM(a.provider, model, role=role, profile=a.profile_obj, budget=budget,  # noqa: E731
+                                 key_env=a.key_env, price=override, reasoning_effort=a.reasoning_effort,
+                                 thinking=a.anthropic_thinking)
+    sum_llm, qa_llm = mk("summarizer", a.sum_model), mk("answer", a.qa_model)
+    ctx = Ctx(a, out, hars, sum_llm, qa_llm, run_id, budget)
     ctx.load_done()
     print(f"run {run_id} -> {out} (tokenizer {L.TOKENIZER}, resume={resuming}, sessions={len(plans)})", flush=True)
     write_inputs_and_scripts(ctx, a, sessions)
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    fails = []
+    if a.provider != L.MOCK and not a.budget_usd:
+        fails.append("--budget-usd is mandatory for a paid run (hard cap; Amendment C.1-5); "
+                     "`--dry-run` prints the estimate to pick it from")
     if not a.no_preflight:
-        fails = preflight(ctx, a)
-        if fails:
-            for f in fails:
-                print(f"[preflight] FAIL: {f}", file=sys.stderr, flush=True)
-            print("preflight failed - nothing spent. Fix the above or pass --no-preflight.", file=sys.stderr)
-            return 3
+        fails += preflight(ctx, a)
+    if fails:
+        for f in fails:
+            print(f"[preflight] FAIL: {f}", file=sys.stderr, flush=True)
+        print("preflight failed - nothing spent. Fix the above (the budget check cannot be skipped).",
+              file=sys.stderr)
+        return 3
     failed: list[str] = []
 
     def run_one(plan):
@@ -1382,15 +1473,28 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
         summary = {"run_id": run_id, "rows": len(rows), "by_arm_budget": summarize_rows(rows),
                    "failed_sessions": failed, "llm_cost_usd": {"summariser": round(sum_llm.cost, 6),
                                                               "answer": round(qa_llm.cost, 6)},
-                   "llm_cost_usd_all_invocations": total_cost, "tokenizer": L.TOKENIZER}
+                   "llm_cost_usd_all_invocations": total_cost, "tokenizer": L.TOKENIZER,
+                   "hars_extraction_estimated_usd": round(ctx.est_hars_usd, 6),
+                   "budget_usd": a.budget_usd}
         atomic_write(ctx.path("summary.json"), json.dumps(summary, indent=1))
         rcm = L.rc()
         manifest = {"run_id": run_id, "started": started, "ended": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "machine": {"node": platform.node(), "platform": platform.platform(), "python": sys.version.split()[0],
                                 "cpus": os.cpu_count()},
                     "models": {"summariser": a.sum_model, "answer": a.qa_model, "extractor_assumed": a.extractor_model,
-                               "provider": a.provider}, "prices_usd_per_mtok": {k: list(v) for k, v in prices.items()},
-                    "params": {k: v for k, v in vars(a).items() if k not in ("key_env",)},
+                               "agent": a.agent_model, "provider": a.provider},
+                    "profile": ({"name": a.profile_obj.name, "base_url": a.profile_obj.base_url,
+                                 "file": os.path.join(P.PROFILES_DIR, f"{a.profile_obj.name}.json"),
+                                 "price_status": {m: (a.profile_obj.price(m) or {}).get("status", "unpriced")
+                                                  for m in {a.sum_model, a.qa_model, a.extractor_model}}}
+                                if a.profile_obj else None),
+                    "budget_usd": a.budget_usd,
+                    "spend_usd": {"llm_measured": round(sum_llm.cost + qa_llm.cost, 6),
+                                  "hars_extraction_estimated": round(ctx.est_hars_usd, 6),
+                                  "unpriced_calls": sum_llm.unpriced_calls + qa_llm.unpriced_calls,
+                                  "budget_spent_total": round(budget.spent, 6) if budget else None},
+                    "prices_usd_per_mtok": {k: list(v) for k, v in prices.items()},
+                    "params": {k: v for k, v in vars(a).items() if k not in ("key_env", "profile_obj", "prices_cache")},
                     "cost_usd": summary["llm_cost_usd"], "git_head": git_rev(),
                     "run_chainreplay": {"importable": rcm is not None, "error": L.rc_error(),
                                         "sha256": L.sha256_file(os.path.join(BASE, "run_chainreplay.py"))
@@ -1404,10 +1508,14 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
                 manifest["started"] = old.get("started", manifest["started"])
                 manifest["previous_invocations"] = old.get("previous_invocations", []) + [
                     {"started": old.get("started"), "ended": old.get("ended"), "cost_usd": old.get("cost_usd"),
-                     "failed_sessions": old.get("failed_sessions")}]
+                     "spend_usd": old.get("spend_usd"), "failed_sessions": old.get("failed_sessions")}]
             except (OSError, ValueError):
                 pass
         manifest["cost_usd_all_invocations"] = total_cost
+        prev_spent = sum(((i.get("spend_usd") or {}).get("budget_spent_total") or 0.0)
+                         for i in manifest.get("previous_invocations", []))
+        manifest["budget_spent_all_invocations"] = round(
+            prev_spent + ((manifest["spend_usd"] or {}).get("budget_spent_total") or 0.0), 6)
         atomic_write(mp, json.dumps(manifest, indent=1, default=str))
     print(f"done: {len(rows)} rows; cost summariser {fmt_usd(sum_llm.cost)} answers {fmt_usd(qa_llm.cost)}; "
           f"failed sessions {len(failed)}", flush=True)

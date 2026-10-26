@@ -270,13 +270,9 @@ HARS_EXTRACT_OUT = 1200.0   # per memory_compact: extractor completion tokens (e
 MICRO_KEYWORD_S = float(os.environ.get("NC_PROJ_KEYWORD_S") or 2.0)   # nc-graph keyword LLM call
 KEYWORD_IN, KEYWORD_OUT = 450.0, 80.0    # per nc-graph recall: keyword-extraction tokens (est)
 
-# USD per 1M tokens: the price tables live in profiles/<name>.json (providers.py, each entry
-# carries status confirmed|catalog_only|unverified + source). PRICES is only the last-resort
-# fallback for ids no profile knows.
-PRICES = {
-    "qwen/qwen3.8-flash": (0.15, 0.47),
-    "z-ai/glm-5.3-flash": (0.15, 0.50),
-}
+# USD per 1M tokens: the ONLY price source is profiles/<name>.json (providers.py; each entry
+# carries status confirmed|catalog_only|unverified + source). No table lives in this file; an
+# id no profile knows is unpriced (price_for -> None).
 ACTIVE_PROFILE = None      # providers.Profile of the run (main() sets it)
 BUDGET = None              # providers.Budget of the run (main() sets it; None in dry-run/tests)
 STOP_RUN = False           # set when the --budget-usd cap is reached: no new chain starts
@@ -287,7 +283,7 @@ def price_for(model: str) -> tuple[float, float] | None:
     hit = providers.lookup_price(model, ACTIVE_PROFILE)
     if hit:
         return float(hit[1]["in"]), float(hit[1]["out"])
-    return PRICES.get(model)
+    return None
 
 
 def charge_pi_spend(pi_argv: list[str], stdout: str) -> None:

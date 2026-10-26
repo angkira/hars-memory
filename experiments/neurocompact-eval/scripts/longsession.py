@@ -46,7 +46,7 @@ Conventions
 This module also holds: token counting (same estimator as run_chainreplay), message
 serialisation (``[User]: ...`` like pi's serializeConversation), the 8k-char piece splitter
 (port of splitDroppedPieces in neurocompact.ts), the arm-independent BOUNDARY computation, a
-provider-agnostic LLM client (openrouter | anthropic | mock) and a lazy shim to
+provider-agnostic LLM client (providers.py profiles + mock) and a lazy shim to
 run_chainreplay (imported, never copied; tolerant to that file being mid-edit).
 """
 from __future__ import annotations
@@ -59,8 +59,6 @@ import re
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 if BASE not in sys.path:
@@ -449,28 +447,25 @@ def question_eligible(q: dict, b: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# LLM client (openrouter | anthropic | mock) - urllib only, key never printed
+# LLM client: a thin wrapper over providers.chat (profiles anthropic | openrouter | gemini |
+# custom) + the offline `mock` provider. Prices, key variables, sampling policy and the hard
+# --budget-usd cap all come from providers.py; there is no price table here.
 # ---------------------------------------------------------------------------
-# USD per 1M tokens (in, out). Haiku 5.5 = the $0.10/$0.50 that oh_pipeline.install_anthropic
-# uses; run_chainreplay.PRICES carries a 1.00/5.00 placeholder for the same id - UNVERIFIED,
-# override with --price-in/--price-out.
-PRICES = {
-    "claude-haiku-5-5": (0.10, 0.50),
-    "claude-haiku-4-5": (1.00, 5.00),
-    "qwen/qwen3.8-flash": (0.15, 0.47),
-    "z-ai/glm-5.3-flash": (0.15, 0.50),
-    "mock": (0.0, 0.0),
-}
-KEY_ENV_DEFAULT = {"openrouter": "OPENROUTER_API_KEY", "anthropic": "EVAL_API_KEY", "mock": ""}
+import providers as P  # noqa: E402  (single provider layer)
+
+MOCK = "mock"
+PROVIDER_NAMES = tuple(P.PROFILE_NAMES) + (MOCK,)
 
 
 def price_for(model: str, override: tuple[float, float] | None = None) -> tuple[float, float]:
+    """USD/MTok (in, out): the explicit override, else the providers.py profile tables (the one
+    price source), else (0, 0): a model with no price is UNPRICED and a Budget refuses its calls."""
     if override and override[0] is not None:
         return override
-    if model in PRICES:
-        return PRICES[model]
-    m = rc_attr("PRICES", {}) or {}
-    return tuple(m.get(model, (0.0, 0.0)))  # type: ignore[return-value]
+    hit = P.price_tuple(model)
+    if hit:
+        return hit
+    return (0.0, 0.0)
 
 
 class LLMError(RuntimeError):
@@ -478,121 +473,85 @@ class LLMError(RuntimeError):
 
 
 class LLM:
-    """One chat completion. ``complete()`` returns a dict: text, input_tokens, output_tokens,
-    cost_usd, stop_reason ("stop"|"length"|...), latency_s, model."""
+    """One chat completion for a ROLE through a providers.py profile (or the offline mock).
+    ``complete()`` returns a dict: text, input_tokens, output_tokens, cost_usd, stop_reason
+    ("stop"|"length"|...), latency_s, model. Spend is charged to the shared ``budget``
+    (providers.Budget, hard cap) when one is given."""
 
-    def __init__(self, provider: str, model: str, *, key_env: str | None = None,
-                 base_url: str | None = None, timeout: int = 600, retries: int = 3,
+    def __init__(self, provider: str, model: str, *, role: str = "agent", profile=None,
+                 budget=None, key_env: str | None = None, base_url: str | None = None,
+                 timeout: int = 600, retries: int = 3,
                  price: tuple[float, float] | None = None, reasoning_effort: str | None = None,
-                 thinking: str = "disabled"):
-        if provider not in KEY_ENV_DEFAULT:
-            raise ValueError(f"unknown provider {provider!r} (openrouter|anthropic|mock)")
-        self.provider, self.model = provider, model
-        self.key_env = key_env or KEY_ENV_DEFAULT[provider]
-        self.base_url = (base_url or "").rstrip("/") or None
+                 thinking: str = "disabled", transport=None):
+        if provider not in PROVIDER_NAMES:
+            raise ValueError(f"unknown provider {provider!r} ({'|'.join(PROVIDER_NAMES)})")
+        self.provider, self.model, self.role = provider, model, role
+        self.key_env = key_env
         self.timeout, self.retries = timeout, retries
-        self.price = price_for(model, price)
+        self.price_override = tuple(price) if price and price[0] is not None else None
         self.reasoning_effort = reasoning_effort
-        # anthropic: "disabled" sends thinking={"type":"disabled"} (adaptive thinking would eat the whole
-        # max_tokens of a short summary: stop=length with empty text); "default" leaves the model default.
+        # "disabled" sends thinking={"type":"disabled"} on the anthropic endpoint (adaptive
+        # thinking would eat the whole max_tokens of a short summary); "default" leaves it
         self.thinking = thinking
+        self.budget = budget
+        self.transport = transport
+        self.profile = None
+        if provider != MOCK:
+            self.profile = profile or P.load_profile(provider, base_url=base_url)
+        self.price = price_for(model, self.price_override)
         self.calls = 0
         self.cost = 0.0
+        self.unpriced_calls = 0
         self._lock = threading.Lock()
 
     def key_problem(self) -> str | None:
-        if self.provider == "mock":
+        if self.provider == MOCK:
             return None
-        if not os.environ.get(self.key_env, "").strip():
-            return (f"{self.key_env} is not set (required by --provider {self.provider}); "
-                    "export it before a live run")
-        return None
-
-    def _key(self) -> str:
-        k = os.environ.get(self.key_env, "").strip()
-        if not k:
-            raise LLMError(f"{self.key_env} is not set")
-        return k
-
-    def _request(self, user: str, system: str | None, max_tokens: int) -> tuple[str, str]:
-        if self.provider == "anthropic":
-            base = self.base_url or os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/") \
-                or "https://api.anthropic.com"
-            body = {"model": self.model, "max_tokens": int(max_tokens),
-                    "messages": [{"role": "user", "content": user}]}
-            if system:
-                body["system"] = system
-            if self.thinking == "disabled":
-                body["thinking"] = {"type": "disabled"}
-            headers = {"content-type": "application/json", "x-api-key": self._key(),
-                       "anthropic-version": "2023-06-01"}
-            return base + "/v1/messages", json.dumps(body) + "\n" + json.dumps(headers)
-        base = self.base_url or "https://openrouter.ai/api/v1"
-        msgs = ([{"role": "system", "content": system}] if system else []) \
-            + [{"role": "user", "content": user}]
-        body = {"model": self.model, "max_tokens": int(max_tokens), "temperature": 0,
-                "usage": {"include": True}, "messages": msgs}
-        if self.reasoning_effort:
-            body["reasoning"] = {"effort": self.reasoning_effort}
-        headers = {"content-type": "application/json", "authorization": "Bearer " + self._key(),
-                   "user-agent": "neurocompact-eval/longsession"}
-        return base + "/chat/completions", json.dumps(body) + "\n" + json.dumps(headers)
+        return P.key_problem(self.profile, self.key_env)
 
     def complete(self, user: str, *, system: str | None = None, max_tokens: int = 1024) -> dict:
-        if self.provider == "mock":
+        if self.provider == MOCK:
             with self._lock:
                 self.calls += 1
             return mock_complete(user, system, max_tokens, self.model)
-        url, packed = self._request(user, system, max_tokens)
-        body_s, headers_s = packed.split("\n", 1)
-        t0 = time.time()
-        last = ""
-        for attempt in range(self.retries + 1):
-            req = urllib.request.Request(url, data=body_s.encode(), headers=json.loads(headers_s))
+        if self.budget is not None:
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    raw = json.loads(r.read().decode())
-                break
-            except urllib.error.HTTPError as e:
-                last = f"HTTP {e.code}: {e.read().decode()[:300]}"
-                if e.code == 400 and "thinking" in last.lower() and self.thinking == "disabled" \
-                        and self.provider == "anthropic":
-                    self.thinking = "default"            # model refuses the knob: retry once without it
-                    url, packed = self._request(user, system, max_tokens)
-                    body_s, headers_s = packed.split("\n", 1)
-                    continue
-                if e.code < 500 and e.code not in (408, 429):
-                    raise LLMError(last) from None
-            except Exception as e:  # noqa: BLE001 - transport
-                last = f"{type(e).__name__}: {e}"
-            if attempt < self.retries:
-                time.sleep(min(60, 5 * 2 ** attempt))
-        else:
-            raise LLMError(f"{self.provider} call failed after {self.retries + 1} tries: {last}")
-        if self.provider == "anthropic":
-            text = "".join(b.get("text", "") for b in raw.get("content", []) if b.get("type") == "text")
-            u = raw.get("usage") or {}
-            tin = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0) \
-                + int(u.get("cache_creation_input_tokens") or 0)
-            tout = int(u.get("output_tokens") or 0)
-            stop = {"end_turn": "stop", "max_tokens": "length"}.get(raw.get("stop_reason"),
-                                                                     raw.get("stop_reason") or "stop")
-            cost = (tin * self.price[0] + tout * self.price[1]) / 1e6
-        else:
-            ch = (raw.get("choices") or [{}])[0]
-            text = ((ch.get("message") or {}).get("content")) or ""
-            u = raw.get("usage") or {}
-            tin, tout = int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0)
-            stop = {"stop": "stop", "length": "length"}.get(ch.get("finish_reason"),
-                                                           ch.get("finish_reason") or "stop")
-            cost = u.get("cost")
-            cost = float(cost) if isinstance(cost, (int, float)) else \
-                (tin * self.price[0] + tout * self.price[1]) / 1e6
+                self.budget.check()
+            except P.BudgetExceeded as e:
+                raise LLMError(str(e)) from None
+        msgs = ([{"role": "system", "content": system}] if system else []) \
+            + [{"role": "user", "content": user}]
+        extra = {"reasoning": {"effort": self.reasoning_effort}} if self.reasoning_effort else None
+        try:
+            res = P.chat(self.role, msgs, profile=self.profile, model=self.model,
+                         max_tokens=int(max_tokens), temperature=0, budget=None,
+                         key_env=self.key_env, timeout=self.timeout, retries=self.retries + 1,
+                         extra_body=extra,
+                         soft_extra_body=P.thinking_soft_extra(self.profile, self.thinking),
+                         transport=self.transport)
+        except P.ProviderError as e:
+            raise LLMError(str(e)) from None
+        tin, tout = res.usage["prompt_tokens"], res.usage["completion_tokens"]
+        cost = res.cost_usd
+        if self.price_override is not None and res.cost_source != "reported":
+            cost = (tin * self.price_override[0] + tout * self.price_override[1]) / 1e6
         with self._lock:
             self.calls += 1
-            self.cost += cost
-        return {"text": text, "input_tokens": tin, "output_tokens": tout, "cost_usd": cost,
-                "stop_reason": stop, "latency_s": round(time.time() - t0, 3), "model": self.model}
+            if cost is None:
+                self.unpriced_calls += 1
+            else:
+                self.cost += cost
+        if self.budget is not None:
+            self.budget.charge(cost)
+            if cost is None:
+                raise LLMError(f"{self.profile.name}/{self.model} has no price entry and the "
+                               "provider reported no cost: cannot enforce --budget-usd "
+                               "(add it to the profile or pass --price-in/--price-out)")
+        stop = {"stop": "stop", "length": "length", "end_turn": "stop", "max_tokens": "length"}.get(
+            res.finish_reason, res.finish_reason or "stop")
+        return {"text": res.text, "input_tokens": tin, "output_tokens": tout,
+                "cost_usd": cost if cost is not None else 0.0, "stop_reason": stop,
+                "latency_s": round(res.latency_s, 3), "model": self.model}
 
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]*\d[A-Za-z0-9_./:-]*|\b\d+(?:[.,]\d+)*%?|"

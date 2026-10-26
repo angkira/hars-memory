@@ -11,18 +11,24 @@ explicitly, outside git.
 Usage:
   python3 -I oh_pipeline.py --sessions-dir DIR make   [make_chains.py args...]
   python3 -I oh_pipeline.py --sessions-dir DIR verify [verify_chains.py args...]
-Paid QA generation through Anthropic instead of OpenRouter (make only):
-  EVAL_API_KEY=... python3 -I oh_pipeline.py --sessions-dir DIR --qa-provider anthropic \\
-      make --model claude-haiku-5-5 ...
+Paid QA generation goes through the provider layer (providers.py profiles; role qa_generator):
+  ANTHROPIC_API_KEY=... python3 -I oh_pipeline.py --profile anthropic --sessions-dir DIR \\
+      make --budget-usd 2.0 --out chains.jsonl --manifest chains-manifest.json ...
+Options BEFORE --sessions-dir: `--profile NAME` (anthropic | openrouter | gemini | custom),
+`--model-qa-generator ID` (default: the profile's; a subcommand's own `--model` wins),
+`--base-url`/`--pi-provider` (custom), `--key-env VAR`, `--qa-thinking disabled|default`.
+`--qa-provider anthropic|openrouter` is the legacy alias (anthropic = `--profile anthropic`;
+openrouter with no --profile keeps make_chains' original OpenRouter call byte-identical).
+`--budget-usd` is MANDATORY on every live `make` / `multihop` / `salvage` (hard cap, Amendment
+C.1-5; `--dry-run` / `--offline` need none). Prices come from the profile tables (one source):
+there is no price table in this file.
 `make` and `multihop` also widen the evidence windows / suggested anchors (install_anchor_help).
-Option `--qa-thinking disabled` (before --sessions-dir, like --qa-provider) turns adaptive
-thinking off: with it on, Haiku 5.5 spent the whole 4000-token repair budget on thinking and
+Option `--qa-thinking disabled` (default for the anthropic profile) turns adaptive thinking
+off: with it on, Haiku 5.5 spent the whole 4000-token repair budget on thinking and
 returned no text (2026-10-26, 32 of 42 calls hit max_tokens); verbatim copying needs none.
-make_chains.llm() is replaced in-process by an Anthropic Messages adapter (official SDK;
-no temperature/top_p/top_k -- they 400 on current models; adaptive thinking at the model
-default; reasoning tokens count against max_tokens).  Prices are set to Haiku 5.5 list
-($0.10 / $0.50 per MTok, prompts <= 100K tokens).  The key is read from --key-env
-(default EVAL_API_KEY) and never printed.
+make_chains.llm() is replaced in-process by the providers.chat adapter (no temperature/top_p
+on Anthropic -- they 400 on current models; the profile sampling policy drops them).  The key
+is read from the profile's variable (or --key-env) and never printed.
 
 The contamination guard (install_guard) is always on for `make`.
 
@@ -51,19 +57,28 @@ import sys
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
+import providers  # noqa: E402  (profiles, the single price source)
+
+
+def parse_pre(argv: list[str]) -> tuple[dict, list[str]]:
+    """Options that precede --sessions-dir (provider selection)."""
+    opt = {"profile": None, "key_env": None, "thinking": None, "model": None,
+           "base_url": None, "pi_provider": None}
+    flags = {"--qa-provider": "profile", "--profile": "profile", "--key-env": "key_env",
+             "--qa-thinking": "thinking", "--model-qa-generator": "model",
+             "--base-url": "base_url", "--pi-provider": "pi_provider"}
+    while argv and argv[0] in flags and len(argv) > 1:
+        if argv[0] == "--qa-provider" and argv[1] == "openrouter":
+            pass                    # legacy: make_chains' original OpenRouter call, unchanged
+        else:
+            opt[flags[argv[0]]] = argv[1]
+        argv = argv[2:]
+    return opt, argv
 
 
 def main() -> int:
-    argv = sys.argv[1:]
-    provider, key_env, thinking = "openrouter", "EVAL_API_KEY", "default"
-    while argv and argv[0] in ("--qa-provider", "--key-env", "--qa-thinking") and len(argv) > 1:
-        if argv[0] == "--qa-provider":
-            provider = argv[1]
-        elif argv[0] == "--qa-thinking":
-            thinking = argv[1]
-        else:
-            key_env = argv[1]
-        argv = argv[2:]
+    opt, argv = parse_pre(sys.argv[1:])
+    profile_name, key_env, thinking = opt["profile"], opt["key_env"], opt["thinking"]
     if len(argv) < 3 or argv[0] != "--sessions-dir" or argv[2] not in ("make", "verify", "multihop", "salvage", "reprobe"):
         print(__doc__)
         return 2
@@ -81,8 +96,12 @@ def main() -> int:
             py_probes.install(make_chains)
     if which in ("make", "multihop", "salvage"):
         install_anchor_help(make_chains)
-    if which in ("make", "multihop", "salvage") and provider == "anthropic":
-        install_anthropic(make_chains, key_env, thinking)
+    if which in ("make", "multihop", "salvage"):
+        live = "--dry-run" not in rest and "--offline" not in rest and which != "reprobe"
+        if live and not args_has(rest, "--budget-usd"):
+            raise SystemExit("--budget-usd is mandatory for a live paid run (hard cap, Amendment "
+                             "C.1-5); pass --dry-run / --offline to skip the LLM")
+        rest = use_profile(make_chains, profile_name, opt, rest, live)
     if which == "multihop":
         import multihop  # noqa: PLC0415
         return multihop.main(rest)
@@ -220,60 +239,89 @@ def install_anchor_help(mc, windows: int = 16, suggestions: int = 10, retries: i
     mc.MAX_RETRIES_PER_SLOT = retries
 
 
-def install_anthropic(mc, key_env: str, thinking: str = "default") -> None:
-    """Replace make_chains.llm with an Anthropic Messages adapter (same signature/returns)."""
-    import hashlib  # noqa: PLC0415
-    import time  # noqa: PLC0415
-    secret = os.environ.get(key_env, "")
-    if not secret:
-        raise SystemExit(f"--qa-provider anthropic: env {key_env} is not set")
+def rest_value(rest: list, flag: str) -> str | None:
+    for i, a in enumerate(rest):
+        if a == flag and i + 1 < len(rest):
+            return rest[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def use_profile(mc, profile_name: str | None, opt: dict, rest: list, live: bool) -> list:
+    """Route the QA generator through providers.py when a profile is selected; returns `rest`
+    with `--model <qa_generator model>` injected when the subcommand got none."""
+    if not profile_name:
+        return rest
+    try:
+        prof = providers.load_profile(profile_name, base_url=opt.get("base_url"),
+                                      pi_provider=opt.get("pi_provider"))
+    except providers.ProviderError as e:
+        raise SystemExit(f"!!! {e}")
+    model = rest_value(rest, "--model") or opt.get("model") or prof.default_model("qa_generator")
+    if not model:
+        raise SystemExit(f"!!! no qa_generator model for profile {profile_name}: pass --model-qa-generator")
+    if rest_value(rest, "--model") is None:
+        rest = rest + ["--model", model]
+    thinking = opt.get("thinking") or ("disabled" if profile_name == "anthropic" else "default")
+    if live:
+        install_profile(mc, prof, model, opt.get("key_env"), thinking)
+    return rest
+
+
+def install_profile(mc, prof, model: str, key_env: str | None = None, thinking: str = "default",
+                    transport=None) -> None:
+    """Replace make_chains.llm with a providers.chat adapter (same signature/returns). Cost is the
+    provider-reported one (OpenRouter) or the profile price table; an unpriced model without a
+    reported cost is refused up front (the hard --budget-usd cannot be enforced blind)."""
+    kp = providers.key_problem(prof, key_env)
+    if kp:
+        raise SystemExit(f"!!! {kp}")
+    pt = providers.price_tuple(model, prof)
+    if pt is None and not prof.data.get("usage_include"):
+        raise SystemExit(f"!!! model {model!r} has no price in profile {prof.name} and the profile "
+                         "does not report cost: add it to the profile table (no hard cap otherwise)")
     # make_chains.main() insists on a non-empty OPENROUTER_API_KEY and llm() on its prefix;
     # the adapter below never uses that value.
-    os.environ["OPENROUTER_API_KEY"] = "sk-or-unused-anthropic-adapter"
-    mc.PRICE_IN, mc.PRICE_OUT = 0.10e-6, 0.50e-6          # claude-haiku-5-5, <=100K prompt
-    import anthropic  # noqa: PLC0415
-    client = anthropic.Anthropic(api_key=secret, max_retries=2, timeout=300.0)
+    os.environ["OPENROUTER_API_KEY"] = "sk-or-unused-profile-adapter"
+    if pt:                                  # per-token, only for make_chains' pre-call estimates
+        mc.PRICE_IN, mc.PRICE_OUT = pt[0] / 1e6, pt[1] / 1e6
+    import hashlib  # noqa: PLC0415
+    import time  # noqa: PLC0415
+    soft = providers.thinking_soft_extra(prof, thinking)
+    extra = {"reasoning": {"max_tokens": 300}} if (
+        prof.name == "openrouter" and providers.model_family(model) == "zai") else None
 
-    def llm(prompt, key, model, spend, max_tokens=10000, est_cost=0.02, temperature=0.2,
+    def llm(prompt, key, model_, spend, max_tokens=10000, est_cost=0.02, temperature=0.2,
             retry_waits=(10, 30)):
         if not spend.can_afford(est_cost):
             print(f"  [spend] refused: est ${est_cost:.4f} would exceed ${spend.budget:.2f}")
             return "", {}
-        last = ""
-        for attempt in range(len(retry_waits) + 1):
-            t0 = time.time()
-            try:
-                extra = {"thinking": {"type": "disabled"}} if thinking == "disabled" else {}
-                r = client.messages.create(model=model, max_tokens=max_tokens,
-                                           messages=[{"role": "user", "content": prompt}],
-                                           **extra)
-            except anthropic.APIStatusError as e:
-                last = f"HTTP {e.status_code}: {str(e.message)[:300]}"
-                if e.status_code < 500 and e.status_code != 429:
-                    break
-            except anthropic.APIConnectionError as e:
-                last = f"connection: {e}"
-            else:
-                content = "".join(b.text for b in r.content if b.type == "text")
-                usage = {"prompt_tokens": r.usage.input_tokens,
-                         "completion_tokens": r.usage.output_tokens}
-                spend.add(usage)
-                mc.log_raw({"kind": "llm", "model": model, "prompt_chars": len(prompt),
-                            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-                            "prompt": prompt, "raw": content, "finish_reason": r.stop_reason,
-                            "usage": usage, "latency_s": round(time.time() - t0, 3),
-                            "cost_usd": round(usage["prompt_tokens"] * mc.PRICE_IN
-                                              + usage["completion_tokens"] * mc.PRICE_OUT, 6)})
-                if not content:
-                    print(f"  llm returned no content (stop_reason={r.stop_reason})", flush=True)
-                return content, usage
-            print(f"  llm {last} (attempt {attempt + 1})", flush=True)
-            if attempt < len(retry_waits):
-                time.sleep(retry_waits[attempt])
-        mc.log_raw({"kind": "llm_failed", "model": model, "prompt_chars": len(prompt),
-                    "prompt": prompt, "error": last})
-        print(f"  llm failed: {last[:200]}", flush=True)
-        return "", {}
+        t0 = time.time()
+        try:
+            res = providers.chat("qa_generator", [{"role": "user", "content": prompt}],
+                                 profile=prof, model=model_, max_tokens=max_tokens,
+                                 temperature=temperature, key_env=key_env, timeout=300,
+                                 retries=len(retry_waits) + 1, extra_body=extra,
+                                 soft_extra_body=soft, transport=transport)
+        except providers.ProviderError as e:
+            mc.log_raw({"kind": "llm_failed", "model": model_, "prompt_chars": len(prompt),
+                        "prompt": prompt, "error": str(e)[:400]})
+            print(f"  llm failed: {str(e)[:200]}", flush=True)
+            return "", {}
+        usage = {"prompt_tokens": res.usage["prompt_tokens"],
+                 "completion_tokens": res.usage["completion_tokens"]}
+        if res.cost_usd is not None:
+            usage["cost"] = res.cost_usd
+        spend.add(usage)
+        mc.log_raw({"kind": "llm", "model": model_, "prompt_chars": len(prompt),
+                    "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "prompt": prompt, "raw": res.text, "finish_reason": res.finish_reason,
+                    "usage": usage, "latency_s": round(time.time() - t0, 3),
+                    "cost_usd": round(res.cost_usd or 0.0, 6), "profile": prof.name})
+        if not res.text:
+            print(f"  llm returned no content (finish={res.finish_reason})", flush=True)
+        return res.text, usage
 
     mc.llm = llm
 

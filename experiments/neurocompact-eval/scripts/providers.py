@@ -147,6 +147,24 @@ def lookup_price(model: str, profile: "Profile | None" = None) -> tuple["Profile
     return None
 
 
+def price_tuple(model: str, profile: "Profile | None" = None) -> tuple[float, float] | None:
+    """(USD/MTok in, out) of a model id from the profile price tables (the ONE price source),
+    or None when no shipped profile prices it. Prompts above a tier threshold are not
+    represented here (use Profile.cost_usd for exact per-request cost)."""
+    hit = lookup_price(model, profile)
+    return (float(hit[1]["in"]), float(hit[1]["out"])) if hit else None
+
+
+def thinking_soft_extra(profile: "Profile", mode: str = "disabled") -> dict:
+    """`soft_extra_body` for chat(): Anthropic's endpoint otherwise runs adaptive thinking that
+    can eat a short answer's whole max_tokens (stop=length, empty text). Only for the anthropic
+    endpoint; a model that rejects the knob falls back to the default (see chat())."""
+    host = (profile.base_url or "")
+    if mode == "disabled" and (profile.name == "anthropic" or "api.anthropic.com" in host):
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
 def load_profile(name: str, profiles_dir: str | None = None, *, base_url: str | None = None,
                  key_env: str | None = None, pi_provider: str | None = None) -> Profile:
     """Load profiles/<name>.json. Overrides (custom endpoint): base_url, key_env, pi_provider."""
@@ -356,6 +374,7 @@ class ChatResult:
     profile: str
     latency_s: float
     raw: dict | None = None
+    finish_reason: str | None = None     # provider's finish_reason (stop | length | ...)
 
 
 def _urlopen_transport(req: urllib.request.Request, timeout: float) -> tuple[int, dict]:
@@ -406,13 +425,15 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
          model: str | None = None, max_tokens: int = 700, temperature=None, top_p=None,
          budget: Budget | None = None, key_env: str | None = None, environ=None,
          timeout: float = 180, retries: int = 3, extra_body: dict | None = None,
-         transport=None, sleep=time.sleep) -> ChatResult:
+         soft_extra_body: dict | None = None, transport=None, sleep=time.sleep) -> ChatResult:
     """One chat/completions call for `role` through `profile`.
 
     Model = `model` arg, else models[role], else the profile default. Sampling params are
     filtered by the profile's policy. Cost = provider-reported when present (OpenRouter),
     else the profile price table; with a Budget an unpriced model without reported cost
     raises UnpricedModel (a hard cap cannot be enforced blind). Retries 429/5xx/network.
+    `soft_extra_body` fields (e.g. anthropic `thinking`) are sent first; an HTTP 400 that names
+    one of them drops exactly those fields and retries once (a model that refuses the knob).
     """
     if role not in ROLES:
         raise ProviderError(f"unknown role {role!r}")
@@ -422,13 +443,18 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
     if budget is not None:
         budget.check()
     key = resolve_key(profile, key_env, environ)
+    eb = dict(extra_body or {})
+    eb.update(soft_extra_body or {})
     url, headers, body = build_request(profile, mid, messages, max_tokens=max_tokens,
                                        temperature=temperature, top_p=top_p, key=key,
-                                       extra_body=extra_body)
+                                       extra_body=eb)
     send = transport or _urlopen_transport
     t0 = time.time()
     last = ""
-    for attempt in range(max(1, retries)):
+    soft_left = bool(soft_extra_body)
+    attempt = -1
+    while True:
+        attempt += 1
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
         try:
             status, raw = send(req, timeout)
@@ -437,7 +463,14 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
         if status == 200:
             break
         last = f"HTTP {status}: {str((raw.get('error') or {}).get('message') or raw)[:200]}"
-        if status not in (0, 408, 429, 500, 502, 503, 504) or attempt == retries - 1:
+        if (status == 400 and soft_left
+                and any(k in last.lower() for k in (soft_extra_body or {}))):
+            for k in soft_extra_body:
+                body.pop(k, None)
+            soft_left = False
+            attempt -= 1                      # the knob retry does not consume a network retry
+            continue
+        if status not in (0, 408, 429, 500, 502, 503, 504) or attempt >= retries - 1:
             raise ProviderError(f"{profile.name}/{mid}: {last}")
         sleep(min(30, 4 * (attempt + 1)))
     choice = ((raw.get("choices") or [{}])[0].get("message") or {})
@@ -459,7 +492,8 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
                                 "reported no cost: cannot enforce --budget-usd")
         budget.charge(cost)
     return ChatResult(text=text, usage=u, cost_usd=cost, cost_source=src, model=mid,
-                      profile=profile.name, latency_s=time.time() - t0, raw=None)
+                      profile=profile.name, latency_s=time.time() - t0, raw=None,
+                      finish_reason=(raw.get("choices") or [{}])[0].get("finish_reason"))
 
 
 # -------------------------------------------------------------------- pi side
