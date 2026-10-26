@@ -60,7 +60,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import providers  # noqa: E402  (profiles, prices, family check, hard budget)
 
-JUDGE_MODEL_DEFAULT = "openai/gpt-6-luna"     # legacy default (no --profile): OpenRouter
+JUDGE_MODEL_DEFAULT = "claude-sonnet-5-5"     # default (no --profile = the anthropic profile)
 TRANSPORT = None                               # tests inject a fake HTTP transport
 FIXTURES = os.path.join(BASE, "judge_v2_fixtures.json")
 WINDOW = 500                     # chars either side of the evidence
@@ -502,7 +502,7 @@ def main() -> int:
     providers.add_profile_args(ap, roles=("judge",))
     ap.add_argument("--model", default=None,
                     help="alias of --model-judge (default: the profile's judge; legacy "
-                         f"{JUDGE_MODEL_DEFAULT} on the openrouter profile)")
+                         f"{JUDGE_MODEL_DEFAULT} on the default anthropic profile)")
     ap.add_argument("--key-env", default=None, metavar="VAR",
                     help="read the API key from env var VAR instead of the profile's variable")
     ap.add_argument("--agent-model", action="append", default=[],
@@ -523,13 +523,13 @@ def main() -> int:
     ap.add_argument("--show-prompt", action="store_true",
                     help="print the first prompt verbatim (blindness check)")
     args = ap.parse_args()
-    prof_name = args.profile or "openrouter"      # no --profile = the historical OpenRouter judge
+    prof_name = args.profile or "anthropic"      # no --profile = the anthropic profile (2026-10-26)
     try:
         prof = providers.load_profile(prof_name, base_url=args.base_url, pi_provider=args.pi_provider)
     except providers.ProviderError as e:
         raise SystemExit(f"!!! {e}")
     judge_model = (getattr(args, "model_judge", None) or args.model
-                   or (JUDGE_MODEL_DEFAULT if prof_name == "openrouter" else prof.default_model("judge")))
+                   or prof.default_model("judge") or JUDGE_MODEL_DEFAULT)
     if not judge_model:
         raise SystemExit(f"!!! no judge model for profile {prof_name}: pass --model-judge")
     args.model = judge_model

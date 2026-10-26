@@ -502,14 +502,29 @@ class LLM:
         self.calls = 0
         self.cost = 0.0
         self.unpriced_calls = 0
+        # prompt-cache accounting (Amendment C.3: cost-only): tokens and the saving vs plain input price
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
+        self.cache_calls = 0
+        self.cost_nocache = 0.0
         self._lock = threading.Lock()
+
+    def cache_stats(self) -> dict:
+        return {"enabled": bool(self.profile and self.profile.cache_enabled),
+                "cached_calls": self.cache_calls, "read_tokens": self.cache_read_tokens,
+                "write_tokens": self.cache_write_tokens,
+                "cost_usd": round(self.cost, 6), "cost_without_cache_usd": round(self.cost_nocache, 6),
+                "saved_usd": round(self.cost_nocache - self.cost, 6)}
 
     def key_problem(self) -> str | None:
         if self.provider == MOCK:
             return None
         return P.key_problem(self.profile, self.key_env)
 
-    def complete(self, user: str, *, system: str | None = None, max_tokens: int = 1024) -> dict:
+    def complete(self, user: str, *, system: str | None = None, max_tokens: int = 1024,
+                 cache_prefix_chars: int | None = None) -> dict:
+        """`cache_prefix_chars`: the first N characters of `user` are the stable prefix shared by
+        several calls (provider prompt cache, cost-only; ignored when caching is off)."""
         if self.provider == MOCK:
             with self._lock:
                 self.calls += 1
@@ -528,7 +543,7 @@ class LLM:
                          key_env=self.key_env, timeout=self.timeout, retries=self.retries + 1,
                          extra_body=extra,
                          soft_extra_body=P.thinking_soft_extra(self.profile, self.thinking),
-                         transport=self.transport)
+                         transport=self.transport, cache_prefix_chars=cache_prefix_chars)
         except P.ProviderError as e:
             raise LLMError(str(e)) from None
         tin, tout = res.usage["prompt_tokens"], res.usage["completion_tokens"]
@@ -537,10 +552,15 @@ class LLM:
             cost = (tin * self.price_override[0] + tout * self.price_override[1]) / 1e6
         with self._lock:
             self.calls += 1
+            if res.cached:
+                self.cache_calls += 1
+            self.cache_read_tokens += int(res.usage.get("cached_tokens") or 0)
+            self.cache_write_tokens += int(res.usage.get("cache_write_tokens") or 0)
             if cost is None:
                 self.unpriced_calls += 1
             else:
                 self.cost += cost
+                self.cost_nocache += res.cost_nocache_usd if res.cost_nocache_usd is not None else cost
         if self.budget is not None:
             self.budget.charge(cost)
             if cost is None:
@@ -551,7 +571,9 @@ class LLM:
             res.finish_reason, res.finish_reason or "stop")
         return {"text": res.text, "input_tokens": tin, "output_tokens": tout,
                 "cost_usd": cost if cost is not None else 0.0, "stop_reason": stop,
-                "latency_s": round(res.latency_s, 3), "model": self.model}
+                "latency_s": round(res.latency_s, 3), "model": self.model,
+                "cache_read_tokens": int(res.usage.get("cached_tokens") or 0),
+                "cache_write_tokens": int(res.usage.get("cache_write_tokens") or 0)}
 
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]*\d[A-Za-z0-9_./:-]*|\b\d+(?:[.,]\d+)*%?|"

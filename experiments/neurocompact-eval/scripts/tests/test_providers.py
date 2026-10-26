@@ -363,7 +363,8 @@ class JudgeCli(unittest.TestCase):
 
     def test_openrouter_cross_family_needs_no_flag(self):
         tr = FakeTransport()
-        rcode, log, mp, _ = self._run(["--budget-usd", "1"], tr, env={"OPENROUTER_API_KEY": "k"})
+        rcode, log, mp, _ = self._run(["--profile", "openrouter", "--budget-usd", "1"], tr,
+                                      env={"OPENROUTER_API_KEY": "k"})
         self.assertEqual(rcode, 0, log)
         self.assertFalse(mp["judge_same_family"])
         self.assertEqual(mp["judge_model"], "openai/gpt-6-luna")
@@ -401,11 +402,18 @@ class RunnerWiring(unittest.TestCase):
         self.assertIn("pi --provider gemini --model gemini-3.7-flash", g.stdout)
         self.assertIn("key env GEMINI_API_KEY", g.stdout)
 
-    def test_legacy_flags_unchanged(self):
-        d = self._dry("--agent-model", "qwen/qwen3.8-flash")
+    def test_defaults_are_the_anthropic_profile_haiku_5_5(self):
+        """No flag at all = the anthropic profile: agent/extractor/keyword claude-haiku-5-5 (2026-10-26)."""
+        d = self._dry("--allow-same-family-judge")
+        self.assertEqual(d.returncode, 0, d.stderr)
+        self.assertIn("agent model: claude-haiku-5-5 | sum model: claude-haiku-5-5 | qa model: claude-haiku-5-5", d.stdout)
+        self.assertIn("judge claude-sonnet-5-5 | extractor claude-haiku-5-5 | keyword claude-haiku-5-5", d.stdout)
+        self.assertNotIn("qwen", d.stdout)
+
+    def test_explicit_agent_model_still_wins(self):
+        d = self._dry("--profile", "openrouter", "--agent-model", "qwen/qwen3.8-flash")
         self.assertEqual(d.returncode, 0, d.stderr)
         self.assertIn("agent model: qwen/qwen3.8-flash", d.stdout)
-        self.assertIn("judge openai/gpt-6-luna", d.stdout)
 
     def test_per_role_override(self):
         d = self._dry("--profile", "openrouter", "--model-judge", "google/gemini-3.7-flash",

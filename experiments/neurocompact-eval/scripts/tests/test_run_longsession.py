@@ -157,7 +157,8 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("GRAND TOTAL", a[1])
 
     def test_dry_run_cost_scales_with_price_and_arms(self):
-        base = ["--sessions", self.sd, "--dry-run", "--json", "--limit", "1"] + COMMON
+        # cache off: the price scaling is exact (cache-priced answers are covered in test_prompt_cache)
+        base = ["--sessions", self.sd, "--dry-run", "--json", "--limit", "1", "--prompt-cache", "off"] + COMMON
         c1 = json.loads(call(base)[1])["grand_total_usd"]
         c2 = json.loads(call(base + ["--price-in", "0.2", "--price-out", "1.0", "--extractor-price-in", "0.2",
                                      "--extractor-price-out", "1.0"])[1])["grand_total_usd"]

@@ -171,13 +171,13 @@ NATIVE_TRIGGER = CTX_WINDOW - RESERVE_TOKENS   # 30768: the effective native tri
 # `--provider NAME` is the legacy alias of `--profile NAME`; the key `gemini` maps to pi's
 # `google` provider (GEMINI_API_KEY). Profile `custom` is registered at runtime (--pi-provider).
 PROVIDERS = providers.runner_provider_table()
-DEFAULT_PROVIDER = "openrouter"
+DEFAULT_PROVIDER = "anthropic"
 PROVIDER = DEFAULT_PROVIDER      # active provider; main() sets it from --provider
 CTX_WINDOW_OVERRIDE: int | None = None   # --ctx-window
 AGENT_THINKING: str | None = None        # --agent-thinking (None = pi default, no flag)
 # Judge default mirrors judge_v2.JUDGE_MODEL_DEFAULT (do not import: judge_v2 pulls
 # network helpers); override with --judge-model / NC_JUDGE_MODEL.
-JUDGE_MODEL_DEFAULT = "openai/gpt-6-luna"
+JUDGE_MODEL_DEFAULT = "claude-sonnet-5-5"
 
 
 def provider_cfg(provider: str | None = None) -> dict:
@@ -227,7 +227,7 @@ FORCE_FLOOR = 400           # boundary threshold floor (measured ctx * 0.8 wins)
 BOUNDARY_PROMPT = ("Context check: list the single most recent concrete action you absorbed, "
                    "in one short sentence.")
 
-DEFAULT_AGENT_MODEL = "qwen/qwen3.8-flash"
+DEFAULT_AGENT_MODEL = "claude-haiku-5-5"
 DEFAULT_MCP = "http://127.0.0.1:8307/mcp"   # HARS nc-hars-chain-glm (glm extractor).
 # :8305 is nc-hars-ch-small: repo-default extractor (dead localhost:8080) -> silently
 # ingests 0 entities; :8306 reserved. See INFRA-NOTES.md.
@@ -276,6 +276,7 @@ KEYWORD_IN, KEYWORD_OUT = 450.0, 80.0    # per nc-graph recall: keyword-extracti
 ACTIVE_PROFILE = None      # providers.Profile of the run (main() sets it)
 BUDGET = None              # providers.Budget of the run (main() sets it; None in dry-run/tests)
 STOP_RUN = False           # set when the --budget-usd cap is reached: no new chain starts
+PROMPT_CACHE = False       # provider prompt caching of the pi agent loop (cost-only, Amendment C.3); main() sets it
 SPEND = {"pi_usd": 0.0, "est_hars_usd": 0.0, "est_keyword_usd": 0.0, "unpriced_turns": 0}
 
 
@@ -1408,6 +1409,16 @@ def sum_reasoning_default(model: str, provider: str | None = None) -> str:
     return "off"
 
 
+def cache_env() -> dict:
+    """Cache-related env of the active profile (same for every arm). PI_CACHE_RETENTION is only
+    set for "long" (pi's default is already "short" and it has no env value for "none")."""
+    c = (ACTIVE_PROFILE.cache_cfg if ACTIVE_PROFILE else {}) or {}
+    out = {"NC_SUM_CACHE_RETENTION": str(c.get("summarizer_retention") or "none") if PROMPT_CACHE else "none"}
+    if PROMPT_CACHE and str(c.get("pi_retention") or "short") == "long":
+        out["PI_CACHE_RETENTION"] = "long"
+    return out
+
+
 def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str | None,
              cap: int | None = None, provider: str | None = None) -> dict:
     """Exact env per arm (printed verbatim by --dry-run).
@@ -1445,7 +1456,15 @@ def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str 
                                                              provider)),
         "NC_FORCE_COMPACT_THRESHOLD": str(FORCE_OFF),
         "NC_INJECT_RECALL": "1" if arm in RECALL_ARMS else "0",
+        # provider prompt caching: cost-only, IDENTICAL for every arm (Amendment C.3). pi 1.4.0 marks
+        # the agent loop with cache_control by default (retention "short" = 5 min); "long" (1 h) is
+        # opt-in through PI_CACHE_RETENTION. The extension's one-shot summarizer call stays uncached
+        # (a write that is never read costs 1.25x) unless NC_SUM_CACHE_RETENTION says otherwise.
+        "NC_PROMPT_CACHE": "on" if PROMPT_CACHE else "off",
+        "NC_SUM_CACHE_RETENTION": cache_env()["NC_SUM_CACHE_RETENTION"],
     })
+    env.pop("PI_CACHE_RETENTION", None)
+    env.update({k: v for k, v in cache_env().items() if k == "PI_CACHE_RETENTION"})
     env.pop("NC_ORIG_SUMMARY_FILE", None)
     env.pop("NC_DEBUG", None)
     return env
@@ -1454,7 +1473,8 @@ def base_env(arm: str, agent_model: str, sid: str, mcp_url: str, sum_model: str 
 NC_ENV_KEYS = ("NC_PROVIDER", "NC_MODEL_ID", "NC_PERSIST", "NC_NOTE_ONLY", "NC_SESSION_ID",
                "NC_MCP_URL", "NC_SUM_PROVIDER", "NC_SUM_MODEL_ID", "NC_SUM_MAX_TOKENS",
                "NC_SUM_SECTION_TRIM",
-               "NC_SUM_REASONING_EFFORT", "NC_FORCE_COMPACT_THRESHOLD", "NC_INJECT_RECALL")
+               "NC_SUM_REASONING_EFFORT", "NC_FORCE_COMPACT_THRESHOLD", "NC_INJECT_RECALL",
+               "NC_PROMPT_CACHE", "NC_SUM_CACHE_RETENTION")
 
 
 # WHY write_settings also sets compaction.enabled=False: pi's NATIVE
@@ -2990,19 +3010,24 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
                                     float(os.environ.get("NC_PRICE_OUT") or 0.47))
 
     pin, pout = prices(agent_model)
-    gin, gout = prices(getattr(args, "extractor_model", None) or "z-ai/glm-5.3-flash")
+    gin, gout = prices(getattr(args, "extractor_model", None) or "claude-haiku-5-5")
     est = {"replay_in": 0, "replay_out": 0, "comp_in": 0, "comp_out": 0,
            "ask_in": 0, "ask_out": 0, "replay_s": 0.0, "comp_s": 0.0, "ask_s": 0.0,
            "compactions": 0, "asks": 0, "recall_s": 0.0}
     ctx = 500.0  # system prompt + tools scaffolding
+    est["replay_new"] = 0       # tokens that are NEW in a replay turn (cache write); the rest is a cache read
+    est["ask_first"] = 0        # prompt tokens of the first ask per (arm): cache write; later asks read
+    est["ask_cached"] = 0
     for i, sp in enumerate(spans):
         for _ in sp["segments"]:
             ctx += 350.0          # one turn per segment, context grows
             est["replay_in"] += int(ctx)
+            est["replay_new"] += 350
             est["replay_out"] += 6
             est["replay_s"] += MICRO_REPLAY_S
         ctx += 150.0              # boundary turn
         est["replay_in"] += int(ctx)
+        est["replay_new"] += 150
         est["replay_out"] += 30
         est["replay_s"] += MICRO_REPLAY_S
     for arm in arms:
@@ -3029,12 +3054,31 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
         # asks see: C3 note + kept tail + question (+ packed recall for nc)
         note_est = int(CAPS["baseline"] * 0.55) if arm == "baseline" else est_note_nc
         post_ctx = note_est + KEEP_RECENT + (recall_cap_est if arm in RECALL_ARMS else 0)
-        for _ in range(asks):
+        for k in range(asks):
+            if k == 0:
+                est["ask_first"] += int(post_ctx)
+            else:
+                est["ask_cached"] += int(post_ctx)
             est["ask_in"] += int(post_ctx + 300)
             est["ask_out"] += 120
             est["ask_s"] += MICRO_ASK_S
     usd_agent = (est["replay_in"] + est["comp_in"] + est["ask_in"]) / 1e6 * pin + \
                 (est["replay_out"] + est["comp_out"] + est["ask_out"]) / 1e6 * pout
+    usd_agent_nocache = usd_agent
+    if PROMPT_CACHE:
+        # Amendment C.3: same tokens, cache-priced. Replay turn t re-reads the previous context
+        # (cache read) and writes only its new tokens; asks of one arm share note + tail + recall
+        # (first ask writes, the rest read); compaction summarizer calls are not cached (retention none).
+        hit = providers.lookup_price(agent_model, ACTIVE_PROFILE)
+        e = hit[1] if hit else {}
+        rd = float(e.get("cache_read", pin * 0.1)) / max(pin, 1e-12)
+        wr = float(e.get("cache_write", pin * 1.25)) / max(pin, 1e-12)
+        rep_read = max(0, est["replay_in"] - est["replay_new"])
+        usd_agent = ((est["comp_in"] + (est["ask_in"] - est["ask_first"] - est["ask_cached"]))
+                     / 1e6 * pin
+                     + (est["replay_new"] + est["ask_first"]) / 1e6 * pin * wr
+                     + (rep_read + est["ask_cached"]) / 1e6 * pin * rd
+                     + (est["replay_out"] + est["comp_out"] + est["ask_out"]) / 1e6 * pout)
     usd_hars = 0.0
     if ARM_CHUNKS in arms:
         n = 3
@@ -3043,6 +3087,7 @@ def project(chain: dict, arms: list[str], agent_model: str, sum_model: str,
         usd_hars += (est.get("keyword_in", 0) / 1e6 * gin + est.get("keyword_out", 0) / 1e6 * gout)
     return {"seg_chars": seg_chars, "seg_count": seg_count, "span_tokens": span_tokens,
             "est": est, "usd_agent": usd_agent, "usd_hars": usd_hars,
+            "usd_agent_nocache": usd_agent_nocache, "prompt_cache": PROMPT_CACHE,
             "usd_total": usd_agent + usd_hars, "pin": pin, "pout": pout,
             "agent_model": agent_model, "sum_model": sum_model, "qa_model": qa_model,
             "mcp": mcp_url, "mem_budget": mem_budget,
@@ -3133,6 +3178,10 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
         print(f"  projected cost: agent ${pr['usd_agent']:.4f} "
               f"({pr['agent_model']} ${pr['pin']:.2f}/${pr['pout']:.2f} per 1M) + HARS extractor "
               f"${pr['usd_hars']:.4f} ({args.extractor_model}) = ${pr['usd_total']:.4f}")
+        if pr.get("prompt_cache"):
+            print(f"  prompt cache ON (cost-only, Amendment C.3): agent ${pr['usd_agent']:.4f} vs "
+                  f"${pr['usd_agent_nocache']:.4f} uncached (saves ${pr['usd_agent_nocache'] - pr['usd_agent']:.4f})")
+        totals["cache_saving"] = totals.get("cache_saving", 0.0) + (pr["usd_agent_nocache"] - pr["usd_agent"])
         totals["compactions"] += sum(per_arm.values())
         totals["asks"] += len(c["qa"]) * len(arms)
         totals["wall"] += e["replay_s"] + e["comp_s"] + e["ask_s"] + e["recall_s"]
@@ -3140,6 +3189,8 @@ def print_dry_run(chains: list[dict], skipped: list[tuple[str, str]], arms: list
         if bad:
             print(f"  !!! {c['chain_id']}: alignment gate FAILS — a real run refuses this chain")
     print()
+    print(f"prompt cache {'ON' if PROMPT_CACHE else 'off'}: projected saving vs uncached "
+          f"${totals.get('cache_saving', 0.0):.4f} (included in the totals below)")
     print(f"TOTAL projected: {totals['compactions']} compactions, {totals['asks']} asks, "
           f"~{totals['wall'] / 60:.1f} min, ${totals['usd']:.4f}")
 
@@ -3393,17 +3444,18 @@ def main() -> int:
                          "memory_recall preflight; then an EMPTY recall also aborts "
                          "(default: a throwaway id, only errors abort)")
     args = ap.parse_args()
-    global PROVIDER, CTX_WINDOW_OVERRIDE, AGENT_THINKING, ACTIVE_PROFILE, BUDGET
+    global PROVIDER, CTX_WINDOW_OVERRIDE, AGENT_THINKING, ACTIVE_PROFILE, BUDGET, PROMPT_CACHE
     # ---- profile + per-role model resolution (--model-<role> > legacy flag > profile) ----
     # --provider NAME (no --profile) = legacy alias: provider only, role defaults as before
-    legacy_profile = args.profile is None
+    legacy_profile = False      # 2026-10-26: no pre-profile role defaults any more (all from the profile)
     if args.profile and args.provider and args.profile != args.provider:
         print(f"--profile {args.profile} and --provider {args.provider} disagree", file=sys.stderr)
         return 2
     prof_name = args.profile or args.provider or DEFAULT_PROVIDER
     try:
         prof = providers.load_profile(prof_name, base_url=args.base_url,
-                                      pi_provider=args.pi_provider)
+                                      pi_provider=args.pi_provider,
+                                      cache=providers.cache_override(args))
     except providers.ProviderError as e:
         print(f"!!! {e}", file=sys.stderr)
         return 2
@@ -3414,6 +3466,7 @@ def main() -> int:
         PROVIDERS["custom"] = {"pi_flags": prof.pi["provider"], "nc_provider": prof.pi["provider"],
                                "key_env": prof.pi["key_env"], "ctx_window": int(prof.pi["ctx_window"])}
     ACTIVE_PROFILE = prof
+    PROMPT_CACHE = bool(prof.cache_enabled)
     args.provider = prof_name
     pm = providers.resolve_models(prof, {})
     ov = providers.role_overrides(args, ("agent", "answer", "summarizer", "judge",

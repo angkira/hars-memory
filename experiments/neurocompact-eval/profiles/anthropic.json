@@ -47,8 +47,10 @@
     "in": 0.5,
     "out": 2.5,
     "cache_read": 0.05,
-    "cache_write": 0.625
-   }
+    "cache_write": 0.625,
+    "cache_write_1h": 1.0
+   },
+   "cache_write_1h": 0.2
   },
   "claude-sonnet-5-5": {
    "in": 2.0,
@@ -57,16 +59,17 @@
    "source": "WebSearch 2026-10-26 (techenclave, eesel, apidog, dev.to: agree) + pi-ai 1.4.0 catalog; Anthropic pricing page not fetched",
    "as_of": "2026-10-26",
    "cache_read": 0.1,
-   "cache_write": 2.5
-  },
-  "claude-haiku-4-5": {
-   "in": 1.0,
-   "out": 5.0,
-   "status": "catalog_only",
-   "source": "pi-ai 1.4.0 catalog",
-   "as_of": "2026-10-26",
-   "cache_read": 0.1,
-   "cache_write": 1.25
+   "cache_write": 2.5,
+   "cache_write_1h": 4.0
   }
+ },
+ "cache": {
+  "enabled": true,
+  "api": "anthropic_messages",
+  "anthropic_version": "2023-06-01",
+  "ttl": "5m",
+  "pi_retention": "short",
+  "summarizer_retention": "none",
+  "note": "Cost-only (Amendment C.3). Direct calls: native /v1/messages with cache_control on system + stable prefix. pi agent loop: pi-ai caches with cache_control (short=5m, long=1h via PI_CACHE_RETENTION). Multipliers (Anthropic docs, WebSearch 2026-10-26): 5m write 1.25x input, 1h write 2x, read 0.1x (Sonnet 5.5 read reported as 0.05x by third parties, unconfirmed)."
  }
 }

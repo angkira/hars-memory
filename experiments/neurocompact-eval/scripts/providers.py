@@ -87,6 +87,22 @@ class Profile:
     def family(self) -> str | None:
         return self.data.get("family")
 
+    # ---- prompt caching (cost-only; Amendment C.3)
+    @property
+    def cache_cfg(self) -> dict:
+        return self.data.get("cache") or {}
+
+    @property
+    def cache_enabled(self) -> bool:
+        """Provider prompt caching ON for this profile (profile `cache.enabled`, --prompt-cache)."""
+        return bool(self.cache_cfg.get("enabled")) and self.cache_cfg.get("api") == "anthropic_messages"
+
+    def cache_control(self) -> dict:
+        c = {"type": "ephemeral"}
+        if str(self.cache_cfg.get("ttl") or "5m") == "1h":
+            c["ttl"] = "1h"
+        return c
+
     def default_model(self, role: str) -> str | None:
         return (self.data.get("models") or {}).get(role)
 
@@ -111,9 +127,11 @@ class Profile:
         return (self.data.get("prices") or {}).get(model)
 
     def cost_usd(self, model: str, tokens_in: int, tokens_out: int, cache_read: int = 0,
-                 cache_write: int = 0) -> float | None:
+                 cache_write: int = 0, cache_ttl: str | None = None) -> float | None:
         """USD for one request; None when the model is not in the table.
-        `tokens_in` is the UNCACHED prompt remainder; the tier is chosen on the whole prompt."""
+        `tokens_in` is the UNCACHED prompt remainder; the tier is chosen on the whole prompt.
+        Cache reads/writes use the entry's `cache_read` / `cache_write` (5m) or `cache_write_1h`
+        (cache_ttl="1h") prices; absent = the plain input price."""
         p = self.price(model)
         if p is None:
             return None
@@ -124,7 +142,8 @@ class Profile:
             eff.update({k: v for k, v in t.items() if k != "input_above_tokens"})
         usd = (tokens_in * eff["in"] + tokens_out * eff["out"]
                + cache_read * eff.get("cache_read", eff["in"])
-               + cache_write * eff.get("cache_write", eff["in"])) / 1e6
+               + cache_write * (eff.get("cache_write_1h", eff.get("cache_write", eff["in"]))
+                                if cache_ttl == "1h" else eff.get("cache_write", eff["in"]))) / 1e6
         return usd
 
 
@@ -166,8 +185,10 @@ def thinking_soft_extra(profile: "Profile", mode: str = "disabled") -> dict:
 
 
 def load_profile(name: str, profiles_dir: str | None = None, *, base_url: str | None = None,
-                 key_env: str | None = None, pi_provider: str | None = None) -> Profile:
-    """Load profiles/<name>.json. Overrides (custom endpoint): base_url, key_env, pi_provider."""
+                 key_env: str | None = None, pi_provider: str | None = None,
+                 cache: bool | None = None) -> Profile:
+    """Load profiles/<name>.json. Overrides (custom endpoint): base_url, key_env, pi_provider;
+    cache=True/False forces prompt caching on/off (None = the profile's `cache.enabled`)."""
     d = profiles_dir or PROFILES_DIR
     path = os.path.join(d, f"{name}.json")
     if not os.path.isfile(path):
@@ -189,6 +210,8 @@ def load_profile(name: str, profiles_dir: str | None = None, *, base_url: str | 
         data["key_env_override"] = key_env
     if pi_provider:
         data["pi"]["provider"] = pi_provider
+    if cache is not None:
+        data.setdefault("cache", {})["enabled"] = bool(cache)
     return Profile(name, data)
 
 
@@ -375,6 +398,8 @@ class ChatResult:
     latency_s: float
     raw: dict | None = None
     finish_reason: str | None = None     # provider's finish_reason (stop | length | ...)
+    cost_nocache_usd: float | None = None  # same tokens at plain input price (savings = this - cost_usd)
+    cached: bool = False                 # request sent through the cache-enabled native path
 
 
 def _urlopen_transport(req: urllib.request.Request, timeout: float) -> tuple[int, dict]:
@@ -411,21 +436,81 @@ def build_request(profile: Profile, role_model: str, messages: list, *, max_toke
     return url, headers, body
 
 
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _msg_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "".join(str(b.get("text") or "") for b in (content or []) if isinstance(b, dict))
+
+
+def build_native_request(profile: Profile, model: str, messages: list, *, max_tokens: int, key: str,
+                         extra_body: dict | None = None, cache_prefix_chars: int | None = None
+                         ) -> tuple[str, dict, dict]:
+    """(url, headers, body) of one Anthropic /v1/messages call WITH prompt caching.
+
+    The model sees exactly the OpenAI-shaped `messages` text: system messages become the
+    `system` field (last block carries cache_control), user/assistant messages keep their order
+    and text, and the LAST user message is cut at `cache_prefix_chars` into two text blocks of
+    the same concatenated text, the first carrying cache_control (the stable prefix: long
+    context first, question last). Nothing is added, removed or reordered: caching is cost-only.
+    """
+    if not profile.base_url:
+        raise ProviderError(f"profile {profile.name}: no base_url (pass --base-url)")
+    url = profile.base_url.rstrip("/") + "/messages"
+    headers = {"Content-Type": "application/json", "User-Agent": "neurocompact-eval/3.0",
+               "x-api-key": key, "anthropic-version": profile.cache_cfg.get("anthropic_version")
+               or ANTHROPIC_VERSION}
+    cc = profile.cache_control()
+    sys_txt = [_msg_text(m.get("content")) for m in messages if m.get("role") == "system"]
+    sys_txt = [t for t in sys_txt if t]
+    msgs = [{"role": m["role"], "content": _msg_text(m.get("content"))}
+            for m in messages if m.get("role") in ("user", "assistant")]
+    last_user = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=None)
+    if last_user is not None:
+        t = msgs[last_user]["content"]
+        n = int(cache_prefix_chars or 0)
+        if 0 < n < len(t):
+            msgs[last_user]["content"] = [{"type": "text", "text": t[:n], "cache_control": cc},
+                                          {"type": "text", "text": t[n:]}]
+        elif n >= len(t) > 0:
+            msgs[last_user]["content"] = [{"type": "text", "text": t, "cache_control": cc}]
+    body: dict = {"model": model, "max_tokens": int(max_tokens), "messages": msgs}
+    if sys_txt:
+        blocks = [{"type": "text", "text": t} for t in sys_txt]
+        blocks[-1]["cache_control"] = cc
+        body["system"] = blocks
+    if extra_body:
+        body.update({k: v for k, v in extra_body.items() if k != "reasoning"})
+    return url, headers, body
+
+
 def parse_usage(raw: dict) -> dict:
+    """prompt_tokens = the WHOLE prompt (cached or not) for both wire formats; cached_tokens =
+    cache reads, cache_write_tokens = cache creation (Anthropic native only)."""
     u = raw.get("usage") or {}
+    if "prompt_tokens" not in u and "input_tokens" in u:           # Anthropic native /v1/messages
+        rd = int(u.get("cache_read_input_tokens") or 0)
+        wr = int(u.get("cache_creation_input_tokens") or 0)
+        return {"prompt_tokens": int(u.get("input_tokens") or 0) + rd + wr,
+                "completion_tokens": int(u.get("output_tokens") or 0),
+                "cached_tokens": rd, "cache_write_tokens": wr, "reported_cost": None}
     det = u.get("prompt_tokens_details") or {}
     cached = int(det.get("cached_tokens") or 0)
     pt = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
     return {"prompt_tokens": pt, "completion_tokens": int(u.get("completion_tokens")
                                                            or u.get("output_tokens") or 0),
-            "cached_tokens": cached, "reported_cost": u.get("cost") or u.get("total_cost")}
+            "cached_tokens": cached, "cache_write_tokens": 0,
+            "reported_cost": u.get("cost") or u.get("total_cost")}
 
 
 def chat(role: str, messages: list, *, profile: Profile, models: dict | None = None,
          model: str | None = None, max_tokens: int = 700, temperature=None, top_p=None,
          budget: Budget | None = None, key_env: str | None = None, environ=None,
          timeout: float = 180, retries: int = 3, extra_body: dict | None = None,
-         soft_extra_body: dict | None = None, transport=None, sleep=time.sleep) -> ChatResult:
+         soft_extra_body: dict | None = None, transport=None, sleep=time.sleep,
+         cache: bool | None = None, cache_prefix_chars: int | None = None) -> ChatResult:
     """One chat/completions call for `role` through `profile`.
 
     Model = `model` arg, else models[role], else the profile default. Sampling params are
@@ -434,6 +519,10 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
     raises UnpricedModel (a hard cap cannot be enforced blind). Retries 429/5xx/network.
     `soft_extra_body` fields (e.g. anthropic `thinking`) are sent first; an HTTP 400 that names
     one of them drops exactly those fields and retries once (a model that refuses the knob).
+    Prompt caching (`cache`, default = the profile's `cache.enabled`; anthropic profile only):
+    the call goes to the native /v1/messages endpoint with cache_control on the system prompt and
+    on the first `cache_prefix_chars` characters of the last user message; cost accounting then
+    uses the cache read/write prices. Same text reaches the model; only the bill changes.
     """
     if role not in ROLES:
         raise ProviderError(f"unknown role {role!r}")
@@ -445,9 +534,18 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
     key = resolve_key(profile, key_env, environ)
     eb = dict(extra_body or {})
     eb.update(soft_extra_body or {})
-    url, headers, body = build_request(profile, mid, messages, max_tokens=max_tokens,
-                                       temperature=temperature, top_p=top_p, key=key,
-                                       extra_body=eb)
+    use_cache = profile.cache_enabled if cache is None else (bool(cache) and profile.cache_enabled)
+    # only when there is a stable prefix to mark (a system prompt or an explicit prefix): a call
+    # with nothing to cache stays on the plain endpoint, byte-identical to the uncached run
+    use_cache = use_cache and bool(cache_prefix_chars or any(m.get("role") == "system" for m in messages))
+    if use_cache:
+        url, headers, body = build_native_request(profile, mid, messages, max_tokens=max_tokens,
+                                                  key=key, extra_body=eb,
+                                                  cache_prefix_chars=cache_prefix_chars)
+    else:
+        url, headers, body = build_request(profile, mid, messages, max_tokens=max_tokens,
+                                           temperature=temperature, top_p=top_p, key=key,
+                                           extra_body=eb)
     send = transport or _urlopen_transport
     t0 = time.time()
     last = ""
@@ -473,18 +571,27 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
         if status not in (0, 408, 429, 500, 502, 503, 504) or attempt >= retries - 1:
             raise ProviderError(f"{profile.name}/{mid}: {last}")
         sleep(min(30, 4 * (attempt + 1)))
-    choice = ((raw.get("choices") or [{}])[0].get("message") or {})
-    text = choice.get("content") or ""
+    if use_cache:
+        text = "".join(str(b.get("text") or "") for b in (raw.get("content") or [])
+                       if isinstance(b, dict) and b.get("type") == "text")
+        finish = raw.get("stop_reason")
+    else:
+        choice = ((raw.get("choices") or [{}])[0].get("message") or {})
+        text = choice.get("content") or ""
+        finish = (raw.get("choices") or [{}])[0].get("finish_reason")
     u = parse_usage(raw)
     cached = u["cached_tokens"]
-    cost, src = None, "none"
+    written = u.get("cache_write_tokens", 0)
+    ttl = str(profile.cache_cfg.get("ttl") or "5m")
+    cost, src, nocache = None, "none", None
     if u["reported_cost"] is not None:
         cost, src = float(u["reported_cost"]), "reported"
     else:
-        c = profile.cost_usd(mid, max(0, u["prompt_tokens"] - cached), u["completion_tokens"],
-                             cache_read=cached)
+        c = profile.cost_usd(mid, max(0, u["prompt_tokens"] - cached - written), u["completion_tokens"],
+                             cache_read=cached, cache_write=written, cache_ttl=ttl)
         if c is not None:
             cost, src = c, "table"
+            nocache = profile.cost_usd(mid, u["prompt_tokens"], u["completion_tokens"])
     if budget is not None:
         if cost is None:
             budget.charge(None)
@@ -493,7 +600,7 @@ def chat(role: str, messages: list, *, profile: Profile, models: dict | None = N
         budget.charge(cost)
     return ChatResult(text=text, usage=u, cost_usd=cost, cost_source=src, model=mid,
                       profile=profile.name, latency_s=time.time() - t0, raw=None,
-                      finish_reason=(raw.get("choices") or [{}])[0].get("finish_reason"))
+                      finish_reason=finish, cost_nocache_usd=nocache, cached=use_cache)
 
 
 # -------------------------------------------------------------------- pi side
@@ -577,9 +684,19 @@ def add_profile_args(ap: argparse.ArgumentParser, roles=ROLES) -> None:
                     help="custom OpenAI-compatible base URL (profile custom, or an override)")
     ap.add_argument("--pi-provider", default=None,
                     help="pi provider name for profile custom (must exist in pi's models.json)")
+    ap.add_argument("--prompt-cache", choices=("auto", "on", "off"), default="auto",
+                    help="provider prompt caching (cost-only, Amendment C.3): auto = the profile's "
+                         "`cache.enabled` (ON for anthropic), on/off force it. Caching never changes "
+                         "the text the model sees; every arm is cached identically")
     for r in roles:
         ap.add_argument(f"--model-{r.replace('_', '-')}", dest=f"model_{r}", default=None,
                         metavar="ID", help=f"model id for role '{r}' (default: the profile's)")
+
+
+def cache_override(args) -> bool | None:
+    """--prompt-cache auto|on|off -> None|True|False (for load_profile(cache=...))."""
+    v = getattr(args, "prompt_cache", "auto")
+    return None if v in (None, "auto") else v == "on"
 
 
 def role_overrides(args, roles=ROLES) -> dict:

@@ -411,6 +411,21 @@ def usd_for(args, kind: str, tin: float, tout: float) -> float:
     return (tin * flat[0] + tout * flat[1]) / 1e6
 
 
+def usd_ask(args, k: int, prefix_tok: float, suffix_tok: float, tout: float) -> float:
+    """USD of the k-th answer call of a group that shares `prefix_tok` prompt tokens (memory +
+    verbatim tail). Prompt caching ON (cost-only, Amendment C.3): the first call writes the prefix,
+    the rest read it; OFF or a price override: everything at plain input price."""
+    prof = getattr(args, "profile_obj", None)
+    ov = (args.price_in, args.price_out)
+    if prof is not None and prof.cache_enabled and None in ov:
+        c = prof.cost_usd(args.qa_model, int(suffix_tok), int(tout),
+                          cache_read=0 if k == 0 else int(prefix_tok),
+                          cache_write=int(prefix_tok) if k == 0 else 0, cache_ttl=str(prof.cache_cfg.get("ttl") or "5m"))
+        if c is not None:
+            return c
+    return usd_for(args, "qa", prefix_tok + suffix_tok, tout)
+
+
 def estimate_cost(plan: dict, args, prices: dict) -> dict:
     """Per-B, per-arm USD estimate from token counts only (formulas in README-longsession.md)."""
     msgs = plan["session"]["messages"]
@@ -443,26 +458,30 @@ def estimate_cost(plan: dict, args, prices: dict) -> dict:
             res[arm] = usd
             res[arm + "_tokens_in"] = tin
             res[arm + "_tokens_out"] = tout
-        asks = {a: [0, 0.0, 0.0] for a in ALL_ARMS}     # arm -> [n asks, input tokens, usd]
+        asks = {a: [0, 0.0, 0.0, 0.0] for a in ALL_ARMS}     # arm -> [n asks, input tokens, usd, usd without cache]
         for j, ql in plan["ask"].items():
             b = bs[j - 1]
-            for q, _lag in ql:
+            for k, (q, _lag) in enumerate(ql):
                 qtok = count_tokens(q["question"]) + 4
                 base_in = ask_p + b["tail_tokens"] + qtok
+                pre = b["tail_tokens"] + ASK_FRAME_TOKENS            # + the memory (B or the orig summary)
+                suf = base_in - pre
                 for a in (ARM_BASELINE, ARM_CHUNKS, ARM_GRAPH, ARM_NOTE):
                     asks[a][0] += 1
                     asks[a][1] += base_in + B
-                    asks[a][2] += usd_for(args, "qa", base_in + B, ANSWER_OUT_EST)
+                    asks[a][2] += usd_ask(args, k, pre + B, suf, ANSWER_OUT_EST)
+                    asks[a][3] += usd_for(args, "qa", base_in + B, ANSWER_OUT_EST)
                 if b.get("original_summary") and B == max(args.budgets):     # orig runs once (reference B)
+                    ot = count_tokens(b["original_summary"])
                     asks[ARM_ORIG][0] += 1
-                    asks[ARM_ORIG][1] += base_in + count_tokens(b["original_summary"])
-                    asks[ARM_ORIG][2] += usd_for(args, "qa", base_in + count_tokens(b["original_summary"]),
-                                                 ANSWER_OUT_EST)
+                    asks[ARM_ORIG][1] += base_in + ot
+                    asks[ARM_ORIG][2] += usd_ask(args, k, pre + ot, suf, ANSWER_OUT_EST)
+                    asks[ARM_ORIG][3] += usd_for(args, "qa", base_in + ot, ANSWER_OUT_EST)
         n_recalls = sum(len(ql) for ql in plan["ask"].values())
         kw = n_recalls * usd_for(args, "ext", rc_kw_in(), rc_kw_out())
         arm_usd = {}
         for a in ALL_ARMS:
-            n, tin, ask_usd = asks[a]
+            n, tin, ask_usd, _nc = asks[a]
             owner = next((x for x in NOTE_ARMS if x in args.arms_list), None)   # carries the shared note cost
             if a == ARM_BASELINE:
                 arm_usd[a] = res["baseline"] + ask_usd
@@ -475,7 +494,8 @@ def estimate_cost(plan: dict, args, prices: dict) -> dict:
         out["per_budget"][B] = {"usd": arm_usd, "asks": {a: asks[a][0] for a in ALL_ARMS},
                                 "ask_tokens_in": {a: asks[a][1] for a in ALL_ARMS},
                                 "summarizer": {k: v for k, v in res.items() if k.endswith(("_in", "_out"))},
-                                "note_cap": ncap, "graph_keyword_usd": kw}
+                                "note_cap": ncap, "graph_keyword_usd": kw,
+                                "cache_saving_usd": sum(asks[a][3] - asks[a][2] for a in ALL_ARMS if a in args.arms_list)}
     return out
 
 
@@ -526,7 +546,8 @@ def print_dry_run(plans: list[dict], args, prices: dict, *, as_json: bool = Fals
                 "per_budget": {str(B): {"usd": {a: round(v, 6) for a, v in d["usd"].items()},
                                         "asks": d["asks"], "note_cap": d["note_cap"]}
                                for B, d in est["per_budget"].items()},
-                "total_usd": round(tot, 6)}
+                "total_usd": round(tot, 6),
+                "cache_saving_usd": round(sum(d["cache_saving_usd"] for d in est["per_budget"].values()), 6)}
         res["sessions"].append(sess)
         lines.append(f"\n[{p['sid']}] {p['n_messages']} msgs, {p['total_tokens']:,} tokens, "
                      f"{len(p['boundaries'])} boundaries ({'real' if p['real'] else 'synthetic'}), "
@@ -560,8 +581,12 @@ def print_dry_run(plans: list[dict], args, prices: dict, *, as_json: bool = Fals
         lines.append(f"  session total (arms {arms}, HARS extraction included once"
                      f"{' per budget' if args.hars_per_budget else ''}): {fmt_usd(tot)}")
     res["grand_total_usd"] = round(grand, 6)
+    res["grand_cache_saving_usd"] = round(sum(x["cache_saving_usd"] for x in res["sessions"]), 6)
+    res["prompt_cache"] = bool(getattr(args, "profile_obj", None) and args.profile_obj.cache_enabled)
     lines.append(f"\nGRAND TOTAL {fmt_usd(grand)} over {len(plans)} session(s)"
                  " (includes the flagged estimate of HARS extraction, charged to the cap at run time)")
+    lines.append(f"prompt cache {'ON' if res['prompt_cache'] else 'off'} (cost-only, Amendment C.3): answer calls "
+                 f"estimated with cache write/read prices, saving vs uncached {fmt_usd(res['grand_cache_saving_usd'])}")
     unpriced = [m for m in {args.sum_model, args.qa_model, args.extractor_model}
                 if args.provider != L.MOCK and P.price_tuple(m, getattr(args, "profile_obj", None)) is None
                 and args.price_in is None]
@@ -914,11 +939,17 @@ class SessionRun:
     def tail_text(self, b: dict) -> str:
         return L.serialize(self.msgs[b["at_idx"]:b["trigger_idx"] + 1])
 
+    def prompt_parts(self, memory: str, tail: str, question: str, injected: str) -> tuple[str, str]:
+        """(stable prefix, per-question suffix); prefix + suffix is the whole prompt, byte for byte.
+        The prefix (memory + verbatim tail) is shared by every question asked at a boundary, so it
+        is the part the provider prompt cache can serve (cost-only, Amendment C.3)."""
+        prefix = ("You are continuing a long working session. Your earlier context was compacted; "
+                  "what you still have is below.\n\n[Session memory]\n" + (memory.strip() or "(none)")
+                  + "\n\n[Recent conversation, verbatim]\n" + (tail.strip() or "(none)") + "\n\n")
+        return prefix, L.ask_prompt() + question + injected
+
     def build_prompt(self, memory: str, tail: str, question: str, injected: str) -> str:
-        return ("You are continuing a long working session. Your earlier context was compacted; "
-                "what you still have is below.\n\n[Session memory]\n" + (memory.strip() or "(none)")
-                + "\n\n[Recent conversation, verbatim]\n" + (tail.strip() or "(none)") + "\n\n"
-                + L.ask_prompt() + question + injected)
+        return "".join(self.prompt_parts(memory, tail, question, injected))
 
     def recall_payload(self, j: int, q: dict, hsid: str, graph: bool) -> dict:
         p = self.c.path("recall", self.sid, f"j{j}", f"{q['qid']}.{'g' if graph else 'c'}.json")
@@ -980,9 +1011,10 @@ class SessionRun:
                     reasons.append(f"ingest failed: {self.ingest_err}")
                 if cap_info["recall_cap_clamped_low"] and note_tokens > B:
                     reasons.append(f"note alone busts the budget ({note_tokens} > {B})")
-            prompt = self.build_prompt(memory, tail, q["question"], injected)
+            prefix, suffix = self.prompt_parts(memory, tail, q["question"], injected)
+            prompt = prefix + suffix
             self.check_budget()
-            r = self.c.qa_llm.complete(prompt, max_tokens=a.answer_max_tokens)
+            r = self.c.qa_llm.complete(prompt, max_tokens=a.answer_max_tokens, cache_prefix_chars=len(prefix))
             answer = r["text"] or ""
             anc = (q.get("gold_anchor") or "").strip()
             pat = anchor_pattern(anc) if anc else None
@@ -1332,7 +1364,8 @@ def resolve_models_into(a) -> None:
     a.profile_obj = None
     if a.provider != L.MOCK:
         try:
-            a.profile_obj = P.load_profile(a.provider, base_url=a.base_url, pi_provider=a.pi_provider)
+            a.profile_obj = P.load_profile(a.provider, base_url=a.base_url, pi_provider=a.pi_provider,
+                                           cache=P.cache_override(a))
         except P.ProviderError as e:
             raise SystemExit(f"!!! {e}")
     dflt = (lambda r: a.profile_obj.default_model(r)) if a.profile_obj else (lambda r: "mock")
@@ -1473,6 +1506,7 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
         summary = {"run_id": run_id, "rows": len(rows), "by_arm_budget": summarize_rows(rows),
                    "failed_sessions": failed, "llm_cost_usd": {"summariser": round(sum_llm.cost, 6),
                                                               "answer": round(qa_llm.cost, 6)},
+                   "prompt_cache": {"summariser": sum_llm.cache_stats(), "answer": qa_llm.cache_stats()},
                    "llm_cost_usd_all_invocations": total_cost, "tokenizer": L.TOKENIZER,
                    "hars_extraction_estimated_usd": round(ctx.est_hars_usd, 6),
                    "budget_usd": a.budget_usd}
@@ -1489,6 +1523,9 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
                                                   for m in {a.sum_model, a.qa_model, a.extractor_model}}}
                                 if a.profile_obj else None),
                     "budget_usd": a.budget_usd,
+                    "prompt_cache": {"summariser": sum_llm.cache_stats(), "answer": qa_llm.cache_stats(),
+                                     "note": "cost-only (Amendment C.3): identical model input; "
+                                             "prefix = memory + verbatim tail"},
                     "spend_usd": {"llm_measured": round(sum_llm.cost + qa_llm.cost, 6),
                                   "hars_extraction_estimated": round(ctx.est_hars_usd, 6),
                                   "unpriced_calls": sum_llm.unpriced_calls + qa_llm.unpriced_calls,

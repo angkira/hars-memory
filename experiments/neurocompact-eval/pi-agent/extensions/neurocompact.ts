@@ -68,9 +68,12 @@ const SECTION_TRIM = (process.env.NC_SUM_SECTION_TRIM ?? (PERSIST ? "1" : "0")) 
 const SID = process.env.NC_SESSION_ID || "nc-unknown";
 const MCP_URL = process.env.NC_MCP_URL || "http://127.0.0.1:8301/mcp";
 const PROVIDER = process.env.NC_PROVIDER || "local-router";
-const MODEL_ID = process.env.NC_MODEL_ID || "muse-glimmer-30b";
+const MODEL_ID = process.env.NC_MODEL_ID || "claude-haiku-5-5";
 // Summaries can run on a faster no-think model; defaults to the conversation model.
 const SUM_PROVIDER = process.env.NC_SUM_PROVIDER || PROVIDER;
+const SUM_CACHE_RETENTION = ((v) => (v === "short" || v === "long" ? v : "none"))(
+	(process.env.NC_SUM_CACHE_RETENTION || "none").toLowerCase(),
+);
 const SUM_MODEL_ID = process.env.NC_SUM_MODEL_ID || MODEL_ID;
 
 const RAW_CAP = 60000; // cap on the serialized dropped context we look at (UNCHANGED: the
@@ -1043,7 +1046,9 @@ ${convText}
 			response = await ctx.modelRegistry.streamSimple(model, { messages: summaryMessages }, {
 				maxTokens: sumMaxTokens,
 				signal,
-				cacheRetention: "none",
+				// NC_SUM_CACHE_RETENTION=none|short|long (default none: the one-shot summarizer prompt is
+				// never re-read, a cache write would cost 1.25x for nothing). Cost-only (Amendment C.3).
+				cacheRetention: SUM_CACHE_RETENTION as any,
 				sessionId: uuidv7(),
 				// pi-ai's anthropic adapter (streamSimpleAnthropic) switches thinking ON for
 				// any truthy `reasoning`, including the string "off" (it only checks

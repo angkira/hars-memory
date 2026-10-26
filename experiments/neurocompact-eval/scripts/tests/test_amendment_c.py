@@ -164,7 +164,7 @@ class AlignmentAndDryRun(unittest.TestCase):
             run = lambda *a: subprocess.run(   # noqa: E731
                 [sys.executable, os.path.join(SCRIPTS, "run_chainreplay.py"), "--dry-run",
                  "--chains", path, "--agent-model", "claude-haiku-5-5", "--provider", "anthropic",
-                 *a], capture_output=True, text=True, check=True).stdout
+                 "--allow-same-family-judge", *a], capture_output=True, text=True, check=True).stdout
             out = run("--arms", "baseline,nc,nc-note-only")
             self.assertIn("arms: baseline,nc-chunks,nc-note-only", out)
             self.assertNotIn("BUDGET SWEEP", out)
@@ -175,7 +175,8 @@ class AlignmentAndDryRun(unittest.TestCase):
             self.assertIn("note cap 427 | recall cap = clamp(B - realized note, 171, 683)", out)
             self.assertIn('"session_graph": true', out)
             bad = subprocess.run([sys.executable, os.path.join(SCRIPTS, "run_chainreplay.py"),
-                                  "--dry-run", "--chains", path, "--arms", "baseline,nc-graph"],
+                                  "--dry-run", "--chains", path, "--allow-same-family-judge",
+                                  "--arms", "baseline,nc-graph"],
                                  capture_output=True, text=True)
             self.assertEqual(bad.returncode, 2)
 
@@ -306,7 +307,7 @@ class RunnerEndToEnd(unittest.TestCase):
         glob_state = (rc.PROVIDER, rc.CTX_WINDOW_OVERRIDE, rc.AGENT_THINKING, dict(rc.CAPS))
         argv = ["run_chainreplay.py", "--chains", cpath, "--out", out, "--run-id", "t1",
                 "--agent-model", "claude-haiku-5-5", "--provider", "anthropic",
-                "--mcp", "http://127.0.0.1:1/mcp", "--budget-usd", "5", *argv_extra]
+                "--allow-same-family-judge", "--mcp", "http://127.0.0.1:1/mcp", "--budget-usd", "5", *argv_extra]
         old_argv, old_key = sys.argv, os.environ.get("ANTHROPIC_API_KEY")
         sys.argv = argv
         os.environ["ANTHROPIC_API_KEY"] = "x"

@@ -33,7 +33,7 @@ def _read(path):
 def _args(**kw):
     base = dict(mem_budget=1536, recall_cap_min=256, recall_cap_max=1024,
                 baseline_sum_max_tokens=1536, note_sum_max_tokens=640,
-                agent_model="claude-haiku-4-5", provider="anthropic",
+                agent_model="claude-haiku-5-5", provider="anthropic",
                 judge_model="openai/gpt-6-luna", allow_degraded=False)
     base.update(kw)
     return types.SimpleNamespace(**base)
@@ -51,22 +51,22 @@ class ProviderConstruction(unittest.TestCase):
         rc.PROVIDER, rc.CTX_WINDOW_OVERRIDE, rc.AGENT_THINKING = self._prov
 
     def test_pi_args_openrouter_is_the_legacy_shape(self):
-        a = rc.pi_args("sid", "/d", "qwen/qwen3.8-flash", ["--no-mcp", "-nt"], "PROMPT")
+        a = rc.pi_args("sid", "/d", "qwen/qwen3.8-flash", ["--no-mcp", "-nt"], "PROMPT", provider="openrouter")
         self.assertEqual(a, ["-p", "--mode", "json", "--session-id", "sid", "--session-dir", "/d",
                              "--model", "openrouter/qwen/qwen3.8-flash", "--provider", "openrouter",
                              "--no-mcp", "-nt", "PROMPT"])
 
     def test_pi_args_anthropic(self):
-        a = rc.pi_args("sid", "/d", "claude-haiku-4-5", ["--no-mcp", "-nt"], "P", provider="anthropic")
+        a = rc.pi_args("sid", "/d", "claude-haiku-5-5", ["--no-mcp", "-nt"], "P", provider="anthropic")
         i = a.index("--provider")
-        self.assertEqual(a[i:i + 4], ["--provider", "anthropic", "--model", "claude-haiku-4-5"])
+        self.assertEqual(a[i:i + 4], ["--provider", "anthropic", "--model", "claude-haiku-5-5"])
         self.assertNotIn("openrouter", " ".join(a))
         self.assertEqual(a[-1], "P")
 
     def test_pi_args_follows_active_provider_and_thinking(self):
         rc.PROVIDER = "anthropic"
         rc.AGENT_THINKING = "off"
-        a = rc.pi_args("s", "/d", "claude-haiku-4-5", [], "P")
+        a = rc.pi_args("s", "/d", "claude-haiku-5-5", [], "P")
         self.assertIn("anthropic", a)
         self.assertEqual(a[a.index("--thinking") + 1], "off")
         rc.PROVIDER, rc.AGENT_THINKING = "openrouter", None
@@ -74,12 +74,12 @@ class ProviderConstruction(unittest.TestCase):
 
     def test_base_env_providers(self):
         rc.CAPS.update({"baseline": 1536, "nc": 640, "nc-note-only": 640})
-        e_or = rc.base_env("nc", "qwen/qwen3.8-flash", "s", "http://x/mcp", None)
+        e_or = rc.base_env("nc", "qwen/qwen3.8-flash", "s", "http://x/mcp", None, provider="openrouter")
         self.assertEqual((e_or["NC_PROVIDER"], e_or["NC_SUM_PROVIDER"]), ("openrouter", "openrouter"))
-        e_an = rc.base_env("nc", "claude-haiku-4-5", "s", "http://x/mcp", None, provider="anthropic")
+        e_an = rc.base_env("nc", "claude-haiku-5-5", "s", "http://x/mcp", None, provider="anthropic")
         self.assertEqual((e_an["NC_PROVIDER"], e_an["NC_SUM_PROVIDER"]), ("anthropic", "anthropic"))
-        self.assertEqual(e_an["NC_MODEL_ID"], "claude-haiku-4-5")
-        self.assertEqual(e_an["NC_SUM_MODEL_ID"], "claude-haiku-4-5")
+        self.assertEqual(e_an["NC_MODEL_ID"], "claude-haiku-5-5")
+        self.assertEqual(e_an["NC_SUM_MODEL_ID"], "claude-haiku-5-5")
         self.assertEqual(e_an["NC_SUM_REASONING_EFFORT"], "off")
         # everything protocol-relevant is identical across providers
         for k in ("NC_SUM_MAX_TOKENS", "NC_SUM_SECTION_TRIM", "NC_PERSIST", "NC_INJECT_RECALL",
@@ -89,7 +89,7 @@ class ProviderConstruction(unittest.TestCase):
     def test_glm_minimal_reasoning_only_on_openrouter(self):
         self.assertEqual(rc.sum_reasoning_default("z-ai/glm-5.3-flash", "openrouter"), "minimal")
         self.assertEqual(rc.sum_reasoning_default("qwen/qwen3.8-flash", "openrouter"), "off")
-        self.assertEqual(rc.sum_reasoning_default("claude-haiku-4-5", "anthropic"), "off")
+        self.assertEqual(rc.sum_reasoning_default("claude-haiku-5-5", "anthropic"), "off")
 
     def test_ctx_window_and_reserve_keep_the_native_line(self):
         self.assertEqual(rc.reserve_tokens_for("openrouter"), rc.RESERVE_TOKENS)   # 2000, unchanged
@@ -146,7 +146,7 @@ class ProviderConstruction(unittest.TestCase):
 class FamilyCheck(unittest.TestCase):
     def test_families(self):
         f = rc.model_family
-        self.assertEqual(f("claude-haiku-4-5"), "anthropic")
+        self.assertEqual(f("claude-haiku-5-5"), "anthropic")
         self.assertEqual(f("anthropic/claude-sonnet-4"), "anthropic")
         self.assertEqual(f("openai/gpt-6-luna"), "openai")
         self.assertEqual(f("qwen/qwen3.8-flash"), "qwen")
@@ -155,12 +155,12 @@ class FamilyCheck(unittest.TestCase):
         self.assertIsNone(f(""))
 
     def test_conflict(self):
-        self.assertIsNone(rc.family_conflict("claude-haiku-4-5", "openai/gpt-6-luna"))
+        self.assertIsNone(rc.family_conflict("claude-haiku-5-5", "openai/gpt-6-luna"))
         self.assertIsNone(rc.family_conflict("qwen/qwen3.8-flash", "openai/gpt-6-luna"))
         self.assertIsNotNone(rc.family_conflict("gpt-5", "openai/gpt-6-luna"))
-        self.assertIsNotNone(rc.family_conflict("anthropic/claude-haiku-4-5", "claude-opus-4"))
+        self.assertIsNotNone(rc.family_conflict("anthropic/claude-haiku-5-5", "claude-opus-4"))
         self.assertIsNone(rc.family_conflict("mystery-model", "openai/gpt-6-luna"))   # unknown -> no refusal
-        self.assertIsNone(rc.family_conflict("claude-haiku-4-5", None))
+        self.assertIsNone(rc.family_conflict("claude-haiku-5-5", None))
 
 
 def _sess(**kw):
@@ -218,7 +218,7 @@ class DegradedGating(unittest.TestCase):
 
     def test_chain_budget_row_records_model_and_provider(self):
         v = rc.chain_budget("c", _args(), _COMPS, [900], True)
-        self.assertEqual((v["agent_model"], v["agent_provider"]), ("claude-haiku-4-5", "anthropic"))
+        self.assertEqual((v["agent_model"], v["agent_provider"]), ("claude-haiku-5-5", "anthropic"))
         self.assertEqual(v["judge_model"], "openai/gpt-6-luna")
 
     def test_recall_fail_still_invalidates_alongside(self):
