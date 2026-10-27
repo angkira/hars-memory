@@ -495,6 +495,22 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
                     if s:
                         text = s
                         break
+            if text is None:
+                # Amendment C.6: run_longsession run dir - the per-boundary summaries live in memory/<sid>.json
+                # (`baseline|B<B>|j<j>` / `note|B<B>|j<j>`); C3 = the last boundary of the chain
+                mp = os.path.join(run, "memory", f"{cid}.json")
+                tried.append(f"memory/{cid}.json")
+                if os.path.isfile(mp):
+                    try:
+                        cache = json.load(open(mp, encoding="utf-8"))
+                    except ValueError:
+                        cache = {}
+                    kind = "baseline" if arm == "baseline" else "note"
+                    pre = f"{kind}|B{cell}|j" if cell is not None else None
+                    js = sorted(int(k.rsplit("|j", 1)[1]) for k in cache if pre and k.startswith(pre))
+                    ent = cache.get(f"{pre}{js[-1]}") if js else None
+                    if isinstance(ent, dict) and ent.get("text"):
+                        text = ent["text"]
             info[key] = text
             if text is None:
                 info["missing"]["anchor_in_" + key] = " and ".join(tried)

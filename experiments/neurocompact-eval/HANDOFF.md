@@ -3,7 +3,33 @@
 Written 2026-10-26 by the interim agent. Read with: RUNBOOK-gate.md, REPORT-PROTOCOL.md,
 INFRA-NOTES.md, REPORT-forensics-gate212839.md.
 
-## STATE UPDATE 2026-10-26 (Amendment C.5: native-token parity) — NEWEST, READ FIRST
+## STATE UPDATE 2026-10-27 (Amendment C.6: the OpenHands track runs on run_longsession) — NEWEST, READ FIRST
+
+EVAL-VERSION / HOME_RUN_VERSION `2026-10-27.c6`. Owner decision (final): no pi replay of the OH chains. REPORT-PROTOCOL.md 4a.6.
+
+- `scripts/chains_to_longsession.py`: `chains.jsonl` -> `longsession/1` (sid = chain_id, qids unchanged, boundaries = the chain's three span ends,
+  `at_idx = len(messages)` for C3 so the tail is empty as in the replay, `multihop` -> `xspan_locator`, char-exact evidence, gold anchors, `slice`
+  kept; deterministic; chains.jsonl is enough, the imported OH session JSONs are not read). Tests: `tests/test_chains_to_longsession.py`
+  (lags after C3 == the chain's 3/2/1 is asserted).
+- `home_run.py oh`: convert (`oh/ls-data`) -> parity check -> `run_longsession.py --use-real-compactions --keep-tail 0 --checkpoints end`
+  (4 arms, B=1536, sweep opt-in) -> `export_longsession_judge` -> `judge_v2` -> `metrics_v2 --track longsession --end-only` (+ the descriptive
+  `--track chains` reading `REPORT-oh-chains-family.md`) -> `funnel_chains` (best effort; it now also reads `memory/<sid>.json` of a
+  run_longsession run dir). `oh --legacy-replay` / `calibrate --legacy-replay` / `smoke --legacy-replay` / `dry-run --legacy-replay` /
+  `doctor --legacy-replay` keep the old pi path (C.4 caps, merge_runs, batches). `doctor` no longer needs pi / node unless `--legacy-replay`.
+- `calibrate` = cheap parity CHECK (C.6-4): k sessions (default 1, `--check-sessions`), compaction + 2 fixed probe asks (sid `parity-<chain>`),
+  valid + CLIP-free + ask-time ratio nc-chunks AND nc-graph in [0.80, 1.05]; no cap iteration; NOT excluded from the decision set (it asks no
+  decision-set question and tunes nothing); `oh` runs it when absent and refuses after a FAIL (`--accept-parity-fail`, `--skip-parity-check`).
+  `calibration.json` has `amendment: "C.6"`; anything older is VOID for `oh`.
+- Side changes: `run_longsession.py` records now carry the question's `slice` (HEAD/TAIL) instead of null; `funnel_chains.py` memory fallback.
+- Cost/time (dry-run, 14 chains, B=1536): run about $0.33 (incl. the 1-session parity check $0.02; the pi replay was $0.75 / 6.9 h), judge $1.90, ~2.3 h by
+  the model. First LIVE parity check (chain_ray_4687_c0, claude-haiku-5-5, hash-shim embedder, local HARS): PASS, native tokens, CLIP-free; memory tokens
+  baseline 1497 (fill 0.975 of B), nc-chunks 1529.5 (note 605 + recall 924.5), nc-graph 1518, nc-note-only 605; ratio nc-chunks 1.022 / nc-graph 1.014;
+  LLM+estimate spend $0.022. HARS ingest 146-164 s per boundary (~50 s/piece, model assumes 11) and 59-69 extraction chunks per boundary (model assumes ~6):
+  dry-run HARS dollars/hours are lower bounds (real wall-clock ~3 h for 14 chains). The real-question run (oh.run) was not exercised live (cost/time), only offline.
+- Consequence to remember: the secondary family is the long-session L1-L5 (Holm m=5, judge-score metric), not S1-S3 (m=3); L4/L5 are n/a on OH.
+- Tests: `tests/test_chains_to_longsession.py`, `tests/test_oh_c6.py` (FakeRunner for run_longsession; offline mock end-to-end), the legacy tests now pass `--legacy-replay`.
+
+## STATE UPDATE 2026-10-26 (Amendment C.5: native-token parity) — (previous)
 
 EVAL-VERSION / HOME_RUN_VERSION `2026-10-26.c5`. Cause: tokenizer exchange rate (cl100k/chars-3.6 budgets vs native `max_tokens`; measured
 native/cl100k 1.53-1.64 on claude-haiku-5-5, REPORT-PROTOCOL.md 4a.5). `scripts/tokcount.py` is the ONE counter (Anthropic/Gemini

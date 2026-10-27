@@ -19,24 +19,28 @@
    #   same thing by hand:  mkdir -p /mnt/datasets/ft/artifacts && tar -xzf oh-multihop-qa-20261026T144511Z.tar.gz -C /mnt/datasets/ft/artifacts
    #   -> /mnt/datasets/ft/artifacts/20261026T144511Z-oh-multihop-qa/chains.jsonl  (found automatically; or set [oh] artifact_dir)
    ```
+   Amendment C.6: `oh` reads **`chains.jsonl` only** (the chain records carry the raw span events; `chains_to_longsession.py` turns them
+   into long sessions). The `sessions/` imports of the dataset are not needed and not read. **No pi agent, no Node**: the OpenHands
+   track runs on the same streaming runner as BEAM and Claude Code (`REPORT-PROTOCOL.md` 4a.6).
 5. **Small and cheap by default** (Amendment C.3, budget USD 20-30 in total): OpenHands 14 chains at B=1536 only; BEAM-1M 10 seeded chats at
    B=1536 only; Claude Code: the session(s) you pick. Sweeps (1536,1024,512) are opt-in in `home_run.toml`. Prompt caching is ON for the
    anthropic profile (cost-only, same model inputs). `home_run.py dry-run` prints the all-tracks total against USD 30 before any spend.
 6. **Minimal sequence** (after `cp home_run.toml.example ../../home_run.toml`, the only edits are paths):
    ```bash
    cd experiments/neurocompact-eval/scripts
-   uv run python home_run.py doctor --deep          # 0 FAIL (stale_copy, keys, real embedder, pi, models table)
+   uv run python home_run.py doctor --deep          # 0 FAIL (stale_copy, keys, real embedder, tokcount.native, models table)
    uv run python home_run.py dry-run --find "HARS Experts Research"     # total vs $30, nothing spent
-   uv run python home_run.py oh && uv run python home_run.py beam
+   uv run python home_run.py calibrate              # C.6: cheap parity CHECK on 1 OH session (cents); must say PASS
+   uv run python home_run.py oh && uv run python home_run.py beam      # oh: convert -> run_longsession -> judge -> metrics
    uv run python home_run.py cc --find "HARS Experts Research"          # prints candidates, you pick; then import -> QA -> run -> judge
    uv run python home_run.py bundle                 # send the ONE .tar.gz back
    ```
 
 ---
 
-Written 2026-10-26. You run everything here with your HARS, your real embedder and your Anthropic key
+Written 2026-10-26, updated 2026-10-27 (Amendment C.6: no pi). You run everything here with your HARS, your real embedder and your Anthropic key
 (later maybe OpenRouter / Gemini through a profile), and send ONE file back: the bundle (step 9).
-The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, C.2, C.3, C.4, **C.5**). Nothing in this
+The protocol is frozen in `REPORT-PROTOCOL.md` section 4a (Amendments C, C.1, C.2, C.3, C.4, C.5, **C.6**). Nothing in this
 runbook changes a metric or a rule; the tooling is `scripts/home_run.py` (one entry point) on top of the
 existing scripts. All paths below are relative to the repo root.
 
@@ -56,7 +60,7 @@ they were computed; with tiktoken they move by roughly +-15%).
 
 | Track | what | run (replay/compaction/answers + flagged HARS estimate) | judge (Sonnet) | gen (QA) | wall-clock |
 |---|---|---|---|---|---|
-| `oh` DEFAULT: B=1536 only | 14 chains x 10 items x 4 arms | **$0.75** with prompt cache (uncached $3.64) | $1.90 (560 items) | - | ~7 h |
+| `oh` DEFAULT: B=1536 only (Amendment C.6: `run_longsession`, no pi) | 14 chains x 3 boundaries, 10 items x 4 arms | **$0.33** with prompt cache (main run $0.31 + the 1-session parity check $0.02; the pi replay was $0.75 / ~7 h); the HARS-extraction share is a LOWER bound (see below) | $1.90 (560 items) | - | model ~2.3 h; **measured ~3 h** (HARS ingest ~50 s per 8000-char piece, ~2 h of it) |
 | `beam` DEFAULT: B=1536 only, **N=10 seeded chats** | BEAM-1M, ~13M tokens, ~100 boundaries, ~5.7k HARS pieces | **~$9.8** (of which HARS extraction ~$6.0, an ESTIMATE; scaled from the 35-chat figure, `dry-run` gives the real one; answer-call cache saving not included) | ~$1.4 (400 items) | - | ~19 h (~17 h HARS ingest at the guessed 11 s/piece) |
 | `cc` DEFAULT: the session(s) you pick (`cc --find`) | per session with ~7 real boundaries, 54 generated questions (40 single + 10 multihop + 4 unanswerable; menu mode), every:3 checkpoints | ~$1-1.5 / session | ~$0.3-0.7 / session | ~$1-2 / session (Sonnet, upper-ish bound) | ~2-3 h / session |
 | **DEFAULT TOTAL, one cc session** | | **~$12** | **~$3.7** | **~$1.5** | **~$17**; caps 3 / 20 / 5, total 30 |
@@ -65,22 +69,24 @@ Opt-in (not run by default; `dry-run` prices them from your `[oh]/[beam]` budget
 
 | Opt-in | what | run | judge | wall-clock |
 |---|---|---|---|---|
-| `oh` sweep `budgets = [1536,1024,512]` | same x 3 B | $10.91 (about $2.3 cached) | $5.71 | ~21 h |
+| `oh` sweep `budgets = [1536,1024,512]` | same x 3 B | ~$0.62 (main run $0.59 + parity check) | $5.71 | ~5.6 h |
 | `beam` all 35 chats (`chats = "all"`) | 45M tokens, 360 boundaries, 20k HARS pieces | $34.29 (HARS extraction $21.07, an ESTIMATE) | $4.76 | ~68 h |
 | `beam` sweep (L2/L3) | asks x3 | + about 75% of the run, judge x3 | $14.28 (35 chats) | + |
 
 **Prompt caching (Amendment C.3, cost-only):** Anthropic bills a cached prompt prefix at 0.1x the input price (cache read) after one
 write at 1.25x (5 min) or 2x (1 h). The model inputs are byte-identical; only the bill changes, and every arm is cached identically.
-Where it applies: the pi agent's growing replay context (the OH track, where it removes about 80% of the agent cost) and the memory + tail
-prefix of the long-session answers. The one-shot summariser / compaction calls are not cached. `--prompt-cache off` (or
+Where it applies: the memory + tail prefix of the long-session answers (OH since C.6, BEAM, CC; the pi agent's growing replay context
+only under `--legacy-replay`). The one-shot summariser / compaction calls are not cached. `--prompt-cache off` (or
 `cache.enabled=false` in `profiles/anthropic.json`) shows the uncached figures; the run MANIFEST records `prompt_cache` (cached calls,
 read/write tokens, cost, cost without cache).
 
 Formulas (also in `README-longsession.md`): judge = items x (1300 in x $2 + 80 out x $10)/1e6 = $0.0034 per
 item; BEAM/CC run = baseline summaries + note summaries + `chunks x (2700 in, 600 out)` HARS extraction +
-asks; OH run = `run_chainreplay --dry-run` projection (agent turns + extractor + keyword calls).
-**Two numbers are guesses and dominate the BEAM wall-clock: HARS ingest seconds per piece (11 s) and extractor
-tokens per chunk.** Calibrate on the first session (`<campaign>/beam/run/compactions.jsonl`, rows with
+asks; OH run = the same `run_longsession --dry-run` projection on the converted chains (Amendment C.6; `dry-run --legacy-replay`
+prices the old pi replay with `run_chainreplay --dry-run`).
+**Two numbers are guesses and dominate the BEAM (and OH) wall-clock: HARS ingest seconds per piece (11 s) and extractor
+tokens per chunk.** (First live OH check, 2026-10-27, one chain, hash-shim embedder: 146-164 s per boundary = ~50 s per piece, and HARS
+made 59-69 extraction chunks per boundary where `run_longsession` assumes ~6: the dry-run HARS dollars are a lower bound, the hours too.) Calibrate on the first session (`<campaign>/beam/run/compactions.jsonl`, rows with
 `"arm": "hars"` have `seconds`) and re-run `dry-run`. (Measured in the build container with a Haiku extractor: 6.4-7.1 s per 4000-char piece;
 BEAM pieces are 8000 chars, so 11 s/piece is a plausible middle, but it is a guess.) If ~19 h is too much, the BEAM run is **resumable**
 (Ctrl-C, re-run the same command). The default N=10 chats is fixed in `[beam] n_chats` (seeded sample, written to
@@ -92,9 +98,8 @@ BEAM pieces are 8000 chars, so 11 s/piece is a plausible middle, but it is a gue
 git clone <your hars-memory remote> && cd hars-memory && git checkout claude/youthful-thompson-yv6xqd
 uv sync --extra dev                       # NOT `--group dev`; python >= 3.13; tiktoken is a core dependency
 uv run python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); print('tiktoken ok')"   # warms the BPE cache
-npm i -g @earendil-works/pi-coding-agent@1.4.0     # only the `oh` track needs pi; 1.4.x is pinned (event parser)
-#   no global npm?  npm i --prefix ~/.local/pi @earendil-works/pi-coding-agent@1.4.0 && export PATH=~/.local/pi/node_modules/.bin:$PATH
-pi --version && node --version             # 1.4.x and Node >= 20
+#   Amendment C.6: NO pi / Node needed. Only for the legacy replay (`oh --legacy-replay`, reproducing old numbers):
+#     npm i -g @earendil-works/pi-coding-agent@1.4.0 ; pi --version && node --version    # 1.4.x and Node >= 20
 cp experiments/neurocompact-eval/home_run.toml.example home_run.toml     # defaults are the small run + suggested caps; edit paths only
 ```
 
@@ -127,14 +132,14 @@ uv run python $S/home_run.py doctor --deep                          # in another
 behavioural paraphrase probe** (a tiny `memory_compact` + `memory_recall`; a hash/shim or broken embedder FAILS it -
 `memory_status` alone cannot be trusted: it reports `HARS_MEMORY_EMBED_MODEL` even when `HARS_MEMORY_EMBED_PROVIDER=http`
 serves a different model, see the findings in `HANDOFF.md`); the cents-level liveness ping of every profile model;
-the server's extractor/keyword model vs the profile; keys; **`tokcount.native` (Amendment C.5: one free `count_tokens` call on the answering model must succeed; FAIL = a run would be refused)**; pi 1.4.x; node; free disk; tiktoken; your inputs.
+the server's extractor/keyword model vs the profile; keys; **`tokcount.native` (Amendment C.5: one free `count_tokens` call on the answering model must succeed; FAIL = a run would be refused)**; free disk (pi 1.4.x and node only with `doctor --legacy-replay`); tiktoken; your inputs.
 Do not run two clients against the HARS engine at once (1 thread / queue 32 by design; the host has an OOM history).
 
 ## 4. Inputs
 
 * **OpenHands chains**: the tarball `oh-multihop-qa-20261026T144511Z.tar.gz` (14 chains, single + `xspan_locator` + unanswerable; not in git;
   public SWE-bench sessions, no secrets). `home_run.py --oh-tar PATH.tar.gz <subcommand>` unpacks it into the artifact root
-  (`/mnt/datasets/ft/artifacts/20261026T144511Z-oh-multihop-qa/`: `chains.jsonl`, `chains-manifest.json`, `verify-report.md`);
+  (`/mnt/datasets/ft/artifacts/20261026T144511Z-oh-multihop-qa/`: `chains.jsonl`, `chains-manifest.json`, `verify-report.md`; only `chains.jsonl` is read);
   `[oh] artifact_dir` empty = auto-detect the newest `<artifact_root>/*-oh-multihop-qa`; or set it (`--oh-dir`) to a directory you unpacked yourself.
 * **BEAM**: `git clone https://github.com/mohammadtavakoli78/BEAM ~/data/BEAM` (4 GB). Set `[beam] repo`.
   Only the JSON files are read (never pickles); `chats/1M/` has 35 chats. Default: **10 of them**, drawn once with
@@ -167,11 +172,13 @@ command lines included. Re-running a subcommand skips finished steps and resumes
 
 ```bash
 HR dry-run [--find "TITLE"]      # zero spend: per-track gen/run/judge estimate, ALL-TRACKS TOTAL vs $30, cache saving, wall-clock
-HR smoke                         # 1 cheapest OH chain (incl. its baseline-cap calibration) + 1 tiny synthetic long session, ~$0.5-0.8 plus the calibration runs, cents each (own campaign); must PASS
-HR calibrate                     # Amendment C.4, ONCE per decision set, BEFORE `oh`: baseline cap on the calibration chain
-                                 #   (first chain in seeded order; no QA asks, ~cents) -> <campaign>/calibration.json; must say PASS
-HR oh                            # OpenHands chains (add --oh-tar TAR the first time): batches of 4, B-major, retries invalid cells once,
-                                 #   merge -> export -> judge -> metrics_v2 -> funnel
+HR smoke                         # 1 smallest OH chain (parity check + the whole streaming flow) + 1 tiny synthetic long session, cents-level
+                                 #   (own campaign); must PASS
+HR calibrate                     # Amendment C.6: cheap parity CHECK on the run_longsession path (1 session of the seeded order, compaction + 2 fixed
+                                 #   probe asks, ~cents; spends no decision-set answer, so nothing is excluded) -> <campaign>/calibration.json; must say PASS
+HR oh                            # OpenHands chains (add --oh-tar TAR the first time): chains_to_longsession -> parity check (if not done) ->
+                                 #   run_longsession (4 arms, end checkpoint, B=1536) -> export_longsession_judge -> judge -> metrics_v2 --track longsession
+                                 #   (+ the descriptive chain-family reading) -> funnel. `--legacy-replay` = the old pi path (not the decision runner)
 HR beam                          # BEAM-1M: seeded 10-chat import -> run_longsession (end checkpoint, B per [beam] budgets)
                                  #   -> export_longsession_judge -> judge (rubric) -> metrics_v2 --end-only --include-sid ^beam-1M-
 HR cc --find "TITLE"             # (or --session-id ID / --list): pick the session, then import (redacted) -> QA generation
@@ -179,27 +186,46 @@ HR cc --find "TITLE"             # (or --session-id ID / --list): pick the sessi
                                  #   -> judge -> metrics (all rows, and --end-only)
 HR bundle                        # step 9
 ```
-Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export, judge later), `--retries N`,
-`--resume DIR|latest`, `--new`, `--force-step NAME`, `--accept-partial`. The judge is always the profile's judge
+Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export, judge later), `--retries N` (legacy replay only),
+`--skip-parity-check` / `--accept-parity-fail` (oh, recorded), `--check-sessions K` (calibrate), `--resume DIR|latest`, `--new`, `--force-step NAME`, `--accept-partial`. The judge is always the profile's judge
 (`claude-sonnet-5-5`, same family as the Haiku agent, so `--allow-same-family-judge` is passed and the limitation is
 printed in every report, C.1-2). The vendor switch (OpenRouter / Gemini) is `--profile NAME` and a NEW decision set
 (C.1-4): never mix profiles or embedders inside one campaign.
 
-Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~7 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
+Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~2.3 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
 
-### 6.0 Amendment C.5 - tokens are native (read first)
+### 6.0 Amendment C.6 - the OpenHands track is a long-session run (read first)
+
+Owner decision 2026-10-27: no more pi replay of the OH chains. `HR oh` converts `chains.jsonl` to `longsession/1` sessions
+(`scripts/chains_to_longsession.py`, deterministic, into `<campaign>/oh/ls-data/`, manifest `.conversion.json`) and runs
+`run_longsession.py` (`--use-real-compactions --keep-tail 0 --checkpoints end`, arms baseline / nc-chunks / nc-graph / nc-note-only, B=1536,
+the sweep is opt-in). At each of the chain's three boundaries the summariser and HARS `memory_compact` see the dropped span; every question
+is asked once at the end. Outputs: `<campaign>/oh/run/` (`records.jsonl`, `compactions.jsonl`, `REPORT-oh.md` + `metrics.json` from
+`metrics_v2.py --track longsession --end-only`, `REPORT-oh-chains-family.md` = the descriptive chain-family reading, `funnel.md`).
+Restart from scratch with `--new`: old chain-replay campaigns/calibrations are void for this runner (`oh` says so).
+**Parity check, not calibration**: `HR calibrate` (also run by `oh` when `calibration.json` is absent) compacts `[oh] calibration_chains`
+(default 1; `--check-sessions K`) session(s) like the real run and asks only two fixed probe questions (sid `parity-<chain>`), then requires
+all rows valid, CLIP-free and the ask-time memory ratio of nc-chunks AND nc-graph vs baseline in [0.80, 1.05]. It tunes nothing, asks no
+decision-set question and therefore does NOT exclude any chain (14 sessions stay in the decision set). If it FAILS, `oh` refuses (before the
+main run); see `calibration.json` `stopped_because`. Do not hand-tune anything: send the bundle, or `HR oh --accept-parity-fail` to run
+anyway (recorded; the run's own `win_mem_token_ratio` gate will say the same). The old C.4 cap loop exists only as `calibrate --legacy-replay`.
+
+### 6.0a Amendment C.5 - tokens are native
 
 Parity and every budget are now counted in the answering model's NATIVE tokens (`count_tokens`, free; needs the same key; cached
 in `~/.cache/nc-tokcount/cache.jsonl`, override `NC_TOKCOUNT_CACHE`). Your bundle showed why: a baseline summary of 959 cl100k
 tokens hit `max_tokens=1536` (~1.6x). The calibration of `20261026T172729Z-homerun-home` is VOID: use a NEW campaign (`--new`),
-refresh the scripts (EVAL-VERSION `2026-10-26.c5`), run `doctor` (row `tokcount.native` must be OK), then `calibrate`. The cap
-defaults to cap(B) = B and should now calibrate at ~1.0; `[oh] calibration_chains = 3` (default 1) averages the fill over more
-chains (all excluded from the decision set; costs ~3x the cents-level calibration). `calibration.json` shows `ratio_ask_time`
-(the gate's quantity) and `ratio_pooled_all_compactions`. Offline: `NC_TOKCOUNT=estimate`; `--token-counter tiktoken` accepts a
+refresh the scripts (EVAL-VERSION `2026-10-27.c6`), run `doctor` (row `tokcount.native` must be OK), then `calibrate`. The cap
+defaults to cap(B) = B (the C.6 parity check uses it as is); `[oh] calibration_chains = 3` (default 1) checks more sessions.
+`calibration.json` (C.6) shows `per_b.<B>.ratio_nc_chunks / ratio_nc_graph` (the gate's quantity, ask-time memory in native tokens) and the
+pooled summary sizes. Offline: `NC_TOKCOUNT=estimate`; `--token-counter tiktoken` accepts a
 flagged non-native measurement (not for a decision set on Claude).
 
-### 6a. Baseline-cap calibration (Amendment C.4) - why `oh` refuses without it
+### 6a. LEGACY (`--legacy-replay` only): baseline-cap calibration (Amendment C.4) - why the pi `oh` refuses without it
+
+Everything in this section applies to `HR oh --legacy-replay` / `HR calibrate --legacy-replay` / `HR smoke --legacy-replay`
+(the pi chain replay of C to C.5), which exist to reproduce old numbers and need pi + Node (`doctor --legacy-replay`).
 
 With the baseline cap equal to B the baseline summaries can be cut at the cap (`stop=length`, CLIP FAIL) and the
 realized parity ratio nc/baseline can leave [0.80, 1.05] (your home smoke: 1.31). The cap is therefore a calibrated parity
@@ -231,8 +257,11 @@ tokens: send the bundle, do not hand-tune the cap on decision chains; (4) you ma
 
 ## 7. What each track gives you (and what it cannot)
 
-* `oh`: primary = nc-graph vs baseline at B=1536 on 13 sessions (the 14th is the calibration chain, C.4-4), S1-S3 Holm family (C.2-1). The old "multihop"
-  items are analysed as `xspan_locator` (descriptive S4d/S5d). `REPORT-chains.md`, `metrics.json`, `funnel.md`.
+* `oh`: primary = nc-graph vs baseline at B=1536 on 14 sessions (Amendment C.6: the parity check asks only probe questions, nothing is excluded),
+  computed by the long-session track: secondary L1-L3 (L4/L5 n/a: no `multi_session_reasoning` in OpenHands; L2/L3 need the sweep), Holm m=5 (C.6-3). The old
+  "multihop" items are analysed as `xspan_locator` (descriptive). `oh/run/REPORT-oh.md`, `metrics.json`, `REPORT-oh-chains-family.md` (descriptive S1-S3 reading), `funnel.md`.
+  What it cannot tell you: how an agent works WITH its memory while living the span (the pi replay did; C.6 dropped it): this is memory fidelity at
+  the end of three compactions, the same for every arm.
 * `beam`: the C.2-3 / C.3-2 long-session track: primary nc-graph vs baseline at B=1536 on the 10 seeded BEAM-1M chats, family L1-L5 (L2/L3 n/a without the sweep)
   on the rubric-graded score, genuine multi-hop = `multi_session_reasoning`. Only 34 of 350 items carry a
   deterministic anchor, so anchor-based rules are n/a or low-power by construction; the score legs carry the result.
@@ -241,12 +270,13 @@ tokens: send the bundle, do not hand-tune the cap on decision chains; (4) you ma
 ## 8. If something goes wrong
 
 * `doctor` FAIL on `hars.semantic_probe` or `hars.embedder`: you are on a shim/broken embedder. Fix HARS first.
-* A step fails: the message names the log (`<campaign>/logs/<step>.log`). Fix, re-run the same command. A crashed OH batch
-  dir is moved to `*.failed-<UTC>` (kept, never merged) and redone; a crashed BEAM/CC run is resumed with `--resume`.
+* A step fails: the message names the log (`<campaign>/logs/<step>.log`). Fix, re-run the same command. A crashed OH/BEAM/CC run is
+  resumed (`run_longsession --resume`, finished (session, arm, B) cells are skipped); with `--legacy-replay` a crashed batch dir is
+  moved to `*.failed-<UTC>` (kept, never merged) and redone.
 * `BUDGET STOP`: raise the cap in `home_run.toml`, re-run.
 * Anything that leaves HARS in a weird state: stop the server, move `<HARS_DATA_DIR>` aside, restart, `doctor --deep`,
   re-run (finished steps stay finished; the HARS store of a finished run is only needed for the funnel's graph stage).
-* Host OOM: keep `batch_chains = 4` and `session_concurrency = 1`.
+* Host OOM: keep `session_concurrency = 1` (`batch_chains = 4` for `--legacy-replay`).
 
 ## 9. What to send back
 

@@ -8,6 +8,9 @@ only. All outcome numbers are in the marked placeholder section at the end.
 the pre-amendment design and are kept as the audit trail of what the exploratory runs were. It
 was written and committed before any result of the amended design exists.
 
+**AMENDMENT C.6 (2026-10-27, section 4a.6)**: the OpenHands track runs on the streaming long-session runner
+(`chains_to_longsession.py` + `run_longsession.py`), not on the pi agent replay; chain-replay numbers are not comparable.
+
 ## 1. Claim under test
 
 For long coding-agent sessions, a short handoff note plus externalized searchable memory
@@ -646,6 +649,99 @@ memory by the tokenizer exchange rate on Claude models (~1.5x before the cap), s
 C.5 numbers; the `calibration.json` of the 20261026T172729Z home campaign (and any calibration without `amendment: "C.5"`) is
 VOID and `home_run.py oh` refuses to use it. Non-Anthropic/Gemini runs keep a flagged cl100k measurement (`native=false`),
 which is a documented limitation of those runs, not a parity claim in the model's tokens.
+
+### 4a.6 PROTOCOL AMENDMENT C.6 (2026-10-27, written before any decision-set result was seen)
+
+Provenance: owner decision of 2026-10-27 (final). The OpenHands track must NOT replay sessions through a pi agent turn by turn.
+For the memory question it is enough that, at each compaction boundary, the summariser (baseline) and HARS `memory_compact` + the short
+note (nc arms) see the dropped span, and that the questions are asked at the end with each arm's memory plus the same tail: exactly what
+`run_longsession.py` already does for BEAM and Claude Code. The pi replay (`run_chainreplay.py`) costs many agent turns and produced the
+calibration chain of C.4 and C.5 (cap iteration, tokenizer exchange rate, a calibration chain removed from the decision set). As with C
+to C.5, no record of any decision set exists at the time of writing (only offline fixtures and cents-level smoke runs), nothing below may
+be edited after the first decision-set record exists, and a deviation is Amendment D. C.6 changes the RUNNER of the OpenHands track and the
+meaning of its calibration; it changes no arm, no budget B, no formula, no prompt, no judge, no metric, no threshold, no window and no
+section-5 WIN / FAIL rule.
+
+**C.6-1. Runner.** The OpenHands track runs `chains.jsonl` through `run_longsession.py`:
+
+1. `scripts/chains_to_longsession.py` converts each valid chain to a `longsession/1` session. Input: `chains.jsonl` ONLY. A chain record
+   already carries the raw events of its three spans (`spans[k].segments = [{role, text}]`, the replay window the questions were verified
+   against); the imported OpenHands session JSONs are not read. `sid` = `chain_id`; `messages` = the events of span 1, 2, 3 in order
+   (empty texts skipped as in `split_segments`); `compactions` = the chain's synthetic boundaries, one per span end (`at_idx` = first
+   message of the next span, `at_idx = len(messages)` for C3 so nothing survives and the tail is empty, as in the replay where the
+   questions were asked right after C3); `original_summary = null` (no `orig` arm). Questions: every qa item with its `qid` unchanged,
+   `qtype = canon_qtype(stored)` (stored `multihop` -> `xspan_locator`, Amendment C.2; the stored label stays in `source_qtype`),
+   `answer` = `canonical_short_answer`, `answerable`, `gold_anchor` and `slice` (HEAD / TAIL / NONE) passed through; evidence = the
+   char-exact position(s) `[{msg_idx, start, end}]` of the verbatim evidence snippet(s) (multihop: `evidence_spans`, link hop in its span and
+   answer hop in its span); a snippet that cannot be located falls back to its anchor and, failing that, is a conversion ERROR (never a
+   silent drop); unanswerable probes get empty evidence. The conversion is deterministic (sorted keys, no clock), and `.conversion.json`
+   records sha256 of the input and of every output.
+2. `run_longsession.py --use-real-compactions --keep-tail 0 --checkpoints end --arms baseline,nc-chunks,nc-graph,nc-note-only
+   --mem-budgets 1536` (the sweep 1536,1024,512 stays opt-in). Boundaries are the converted ones; after C3 the lags are exactly the
+   chain's (span 1 -> 3, span 2 -> 2, span 3 -> 1; xspan_locator items 3), which a unit test asserts. Every question is asked once, at the
+   end checkpoint, to every arm. Summariser, HARS ingest (the whole dropped span in <= 8000-char pieces via `memory_compact`), note cap,
+   recall caps, recall call shapes (`nc-graph` differs from `nc-chunks` ONLY in `session_graph: true`), the ask prompt, native-token
+   measurement (C.5) and validity rules (CLIP, ingest, recall, status gate) are the long-session runner's, unchanged from C.1 to C.5.
+3. `export_longsession_judge.py` -> `judge_v2.py` (blind, same judge, same cap rules) -> `metrics_v2.py --track longsession --end-only`.
+   `visible_context` = memory + injected recall + the (empty) tail; `primed_hit` / `clean_anchor_hit` keep their definition.
+   `funnel_chains.py` is run best effort on the run directory (it reads the per-boundary summaries from `memory/<sid>.json`; the stages
+   that need pi session directories print n/a).
+
+**C.6-2. What this changes for the protocol, stated openly.**
+
+- The agent no longer "lives" the span. In the replay the model produced the span's turns, tool calls and replies, and the compaction was
+  triggered inside the agent loop (extension path); here the summariser and HARS ingest see the dropped span directly, the same text for
+  every arm, and the answer is a single call per (question, arm) with memory (+ empty tail) in the prompt. The comparison is therefore
+  about the fidelity of each arm's memory of the dropped text, not about an agent working with its own memory. The summariser prompts are
+  the hand-synced Python port of `neurocompact.ts` (`PROMPT_VERSION`), not the extension's runtime.
+- Boundaries are fixed by the dataset (three, at the span ends), not by a token window; there is no tail.
+- Cost and time drop by an order of magnitude (no agent turns); the 14 chains give 14 sessions x 3 compactions and 140 questions x 4 arms.
+- All earlier chain-replay numbers, including every gate, ratio and calibration of the pi replay (C.4 and C.5 calibrations, the home
+  campaigns, smoke runs), are NOT comparable to C.6 numbers and are not decision-set records. `--legacy-replay` (`home_run.py oh
+  --legacy-replay`, `calibrate --legacy-replay`, `smoke --legacy-replay`, `dry-run --legacy-replay`, `doctor --legacy-replay`) keeps the
+  pi path, with the C.4 cap iteration, for reproducing them; it is not the decision runner.
+
+**C.6-3. Hypotheses.** Unchanged in content, computed by `metrics_v2.py --track longsession --end-only`, one record per (question, arm, B):
+
+- Primary: the section-5 WIN / FAIL rules of C (`evaluate_gates`, B = 1536, treatment `nc-graph`) including the realized ask-time memory
+  ratio window [0.80, 1.05] in native tokens (C.5), MIN_CHAINS = 8 distinct sessions, cluster bootstrap over sessions (`sid` = chain id; the
+  14 chains come from 14 distinct OpenHands sessions, the converter warns if two chains ever share one). Unchanged.
+- Secondary: the contents are the same (graph vs chunks at B = 1536; token-saving non-inferiority of `nc-graph` at 1024 / 512 against
+  `baseline` at 1536, which needs the opt-in sweep and is `n/a` without it; the `xspan_locator` stratum is descriptive). The long-session
+  track evaluates them as its family L1 to L3 (L4 and L5, genuine multi-hop, have no data on OpenHands: `multi_session_reasoning` does not
+  occur) with the long-session test metric (judge score; clean-anchor is reported alongside) and Holm over the fixed family of m = 5 (C.2).
+  The only consequence for OpenHands is that the correction is over 5, not over the 3 of the chain track; this is the price of one
+  metrics path for all three tracks. `home_run oh` also writes the chain-track reading of the same records (`--track chains`: S1 to S3 on
+  clean_anchor_hit, m = 3) as `REPORT-oh-chains-family.md`: it is DESCRIPTIVE and never replaces the L-family; when the two differ, the
+  L-family is the reported inference.
+
+**C.6-4. Calibration semantics (C.4 and C.5 superseded for the default path).** With native token counting (C.5) and the long-session
+summariser with its hard trim to B, parity holds by construction, so there is no baseline-cap calibration and no cap iteration on the
+default path: `cap(B) = B` (C.5-2). `home_run.py calibrate` (and the parity step of `smoke`) is a cheap parity CHECK on the
+`run_longsession` path over k sessions (`[oh] calibration_chains`, `--check-sessions`, default 1; the first k of the seeded order of C.4-2):
+
+- It compacts the session exactly like the real run (baseline summaries, nc notes, HARS ingest) and asks ONLY two fixed, question-independent
+  probe questions per arm (sid `parity-<chain id>`, never a decision-set qid, no gold, never judged). It therefore spends no decision-set
+  answer and tunes nothing; it is NOT excluded from the decision set (all 14 chains stay in; the C.4-4 exclusion applies to
+  `--legacy-replay` only). Had it asked decision-set questions it would have to be excluded (C.4-4 reasoning); that is the reason for the
+  probe design.
+- Acceptance, per B: every row valid, CLIP-free (no arm with more than 1/6 unrepaired `stop=length` summaries: with three compactions,
+  none), native counting (`tokenizer_native`) on native providers, and the realized ask-time memory ratio (mean over sessions of
+  nc memory tokens / baseline memory tokens, memory = note + recall as injected) of BOTH `nc-chunks` and `nc-graph` inside [0.80, 1.05].
+  The probes are generic queries, so the check is a proxy of the real-question recall fill; the decision run's own gate
+  (`win_mem_token_ratio`, section 5) is authoritative and unchanged.
+- Result `calibration.json` (`amendment: "C.6"`, `mode: "parity-check"`). `oh` runs the check first when absent, refuses to run after a
+  FAILED check (no iteration is offered: investigate, or `--accept-parity-fail` which records the override and lets the run's own gate
+  report the same fact), and treats any calibration without `amendment: "C.6"` as VOID. `--skip-parity-check` skips it (recorded).
+
+**C.6-5. Cost and time** (offline `home_run.py dry-run --tracks oh`, 14 chains at B = 1536, prompt cache ON, 4 arms): run (summarisers,
+HARS extraction ESTIMATE, answers, incl. the parity check) about USD 0.33 (the pi replay projected 0.75); judge about USD 1.90 (560 items);
+wall-clock about 2.3 h by the runners' own model (the pi replay: 6.9 h). Two inputs of that model are guesses and the first live parity
+check (one chain, claude-haiku-5-5, a local HARS with a hash-shim embedder, 2026-10-27) contradicts both: HARS ingest took 146 / 163 / 164 s per
+boundary (3-4 pieces of 8000 chars each: about 50 s per piece, the model assumes 11 s), i.e. about 8 min per chain, about 2 h for 14 chains
+and about 3 h in total; and HARS made 59 / 64 / 69 extraction chunks per boundary (192 per chain) where the estimate assumes 18, so the
+HARS-extraction part of the run estimate (about USD 0.15 of the 0.33) is a lower bound, plausibly up to 10x too low (no extractor usage is
+logged on the client side: unverified). The run cap (USD 20) is unaffected. Opt-in sweep: about 3x the asks.
 
 ## 5. Measurement stack
 

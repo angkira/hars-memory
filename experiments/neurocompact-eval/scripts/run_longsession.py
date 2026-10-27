@@ -1075,7 +1075,7 @@ class SessionRun:
                 "run_id": self.c.run_id, "chain_id": self.sid, "sid": self.sid, "cluster_session": self.sid, "session_id": self.hars_sid(B) if arm in NC_ARMS else self.sid,
                 "source": self.s.get("source"), "qid": qid_row, "base_qid": q["qid"], "arm": arm, "mem_budget": B, "b_tag": True, "rid": rid,
                 "checkpoint": j, "is_end": is_end, "n_boundaries": len(self.plan["boundaries"]),
-                "lag": lag, "in_tail": lag == 0, "span_idx": j, "slice": None,
+                "lag": lag, "in_tail": lag == 0, "span_idx": j, "slice": q.get("slice"),
                 "qtype": q.get("qtype"), "source_qtype": q.get("source_qtype"), "answerable": q.get("answerable", True),
                 "question": q["question"], "canonical_short_answer": q.get("answer"), "gold_anchor": anc,
                 "evidence": q.get("evidence"), "rubric": q.get("rubric"),

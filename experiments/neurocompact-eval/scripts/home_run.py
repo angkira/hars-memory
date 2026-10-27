@@ -11,18 +11,22 @@ adds NO new LLM call except the cents-level liveness pings of `doctor`.
   python3 home_run.py [--config home_run.toml] <subcommand> [options]
 
   doctor     checks (HARS healthz + embedder id from memory_status - a hash shim is a FAIL, extractor
-             and model liveness, keys for the profile, pi 1.4.x, node, disk, tiktoken) and prints the
-             `providers.py hars-env` snippet. --deep also runs one tiny memory_compact end to end.
+             and model liveness, keys for the profile, native token counting, disk, tiktoken; pi 1.4.x
+             and node only with --legacy-replay) and prints the `providers.py hars-env` snippet.
+             --deep also runs one tiny memory_compact end to end.
   hars-env   the full HARS server env block (profile LLMs + session-mode/engine settings + embedder
              placeholders) to start the server for these runs.
   dry-run    all tracks, ZERO spend: cost / wall-clock estimate per phase (gen, run, judge) vs the caps.
   smoke      1 OpenHands chain + 1 tiny synthetic long session, a few cents to tens of cents (own campaign).
-  calibrate  Amendment C.4: calibrate the BASELINE CAP on the first chain in seeded order (run_chainreplay
-             --calibrate, no QA asks), iterate on the runner's own cap advice until CLIP-free and the
-             parity ratio is in [0.80, 1.05], write calibration.json. `oh` refuses to run without a passing
-             calibration (or an explicit --baseline-cap) and excludes the calibration chain from the set.
-  oh         OpenHands chain track: batches (B-major, primary B first), retry of invalid cells, merge,
-             export, judge, metrics, funnel.
+  calibrate  Amendment C.6: a cheap parity CHECK of the OH track on the run_longsession path over k sessions
+             (default 1): compaction + two fixed probe asks, CLIP-free + ask-time memory ratio of nc-chunks and
+             nc-graph vs baseline in [0.80, 1.05] -> calibration.json. No cap iteration, nothing tuned, no
+             decision-set question asked, nothing excluded. `--legacy-replay` = the C.4 baseline-cap
+             calibration through the pi replay (run_chainreplay --calibrate).
+  oh         OpenHands track (Amendment C.6): chains.jsonl -> chains_to_longsession.py -> parity check ->
+             run_longsession (baseline, nc-chunks, nc-graph, nc-note-only; B=1536, sweep opt-in) ->
+             export_longsession_judge -> judge_v2 -> metrics_v2 --track longsession --end-only -> funnel.
+             `--legacy-replay` = the pre-C.6 pi replay (batches, retries, merge_runs, C.4 caps).
   beam       BEAM: import selected chats, run_longsession, export, judge, metrics (--end-only, C.2 L-family).
   cc         the owner's Claude Code JSONL: import (redaction ON), QA generation, run, judge, metrics.
   bundle     tar.gz of everything the analyst needs (no raw transcripts / session stores unless
@@ -69,6 +73,7 @@ except ImportError:                     # pragma: no cover
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import cc_discover  # noqa: E402
+import chains_to_longsession as C2L  # noqa: E402  (Amendment C.6: OH chains -> longsession/1)
 import ls_redact  # noqa: E402
 import providers as P  # noqa: E402
 import tokcount  # noqa: E402  (Amendment C.5: native token counting)
@@ -83,7 +88,7 @@ PHASES = ("gen", "run", "judge")
 CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
 PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
 PLACEHOLDER_CAP = 0.0
-HOME_RUN_VERSION = "2026-10-26.c5"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+HOME_RUN_VERSION = "2026-10-27.c6"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
 EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
 HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
 BUDGET_TOTAL_DEFAULT = 30.0
@@ -106,9 +111,12 @@ DEFAULT_CONFIG: dict = {
            # the start of `calibrate`, and accepted by `oh` without a calibration.
            "baseline_cap": "", "baseline_cap_scale": 0.0,
            "calibration_max_iterations": 2, "calibration_seed": 20261026,
-           # Amendment C.5: calibrate on k chains (first k of the seeded order; ALL excluded from the decision set).
-           # Default 1; realized tokens are aggregated over C1..C3 of every calibration chain.
-           "calibration_chains": 1},
+           # Amendment C.5 (legacy replay): calibrate on k chains (first k of the seeded order; ALL excluded from the
+           # decision set). Amendment C.6: the SAME key is the number of sessions of the cheap parity CHECK (default 1);
+           # the check asks only fixed probe questions, so its sessions are NOT excluded from the decision set.
+           "calibration_chains": 1,
+           # Amendment C.6: the OH track runs through run_longsession (no pi). session_concurrency / extra_args go to it.
+           "session_concurrency": 1, "extra_args": []},
     "beam": {"repo": "", "size": "1M", "chats": "sample", "n_chats": 10, "seed": 20261026, "limit": 0,
              "checkpoints": "end", "budgets": [1536], "session_concurrency": 1, "extra_args": []},
     "cc": {"paths": [], "root": "~/.claude/projects", "min_tokens": 0, "limit": 0, "n_single": 40, "n_multihop": 10,
@@ -350,7 +358,7 @@ class Campaign:
         for fn in ("home_run.py", "providers.py", "run_chainreplay.py", "run_longsession.py", "longsession.py",
                    "metrics_v2.py", "judge_v2.py", "merge_runs.py", "funnel_chains.py", "export_judge_input.py",
                    "export_longsession_judge.py", "import_beam.py", "import_claude_code.py",
-                   "gen_longsession_qa.py", "ls_redact.py", "qtypes.py"):
+                   "gen_longsession_qa.py", "ls_redact.py", "qtypes.py", "chains_to_longsession.py", "tokcount.py"):
             src = os.path.join(BASE, fn)
             dst = self.p("scripts", fn)
             if os.path.isfile(src) and not os.path.exists(dst):
@@ -652,7 +660,7 @@ def role_model_table(cfg: dict) -> tuple[list[str], list[dict]]:
 
 
 def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = False,
-                  tracks=TRACKS, offline: bool = False) -> list[dict]:
+                  tracks=TRACKS, offline: bool = False, legacy_replay: bool = False) -> list[dict]:
     g = cfg["general"]
     rows: list[dict] = []
     add = lambda *a, **k: rows.append(check_row(*a, **k))  # noqa: E731
@@ -683,8 +691,9 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
     kenv = g.get("key_env") or None
     kp = P.key_problem(prof, kenv) if not offline else None
     add("keys", "FAIL" if kp else "OK",
-        kp or f"{P.key_env_name(prof, kenv)} is set (value not shown); pi reads it as "
-              f"{prof.pi.get('key_env')}; the HARS server process needs the same key as HARS_MEMORY_LLM_API_KEY")
+        kp or f"{P.key_env_name(prof, kenv)} is set (value not shown)"
+              + (f"; pi reads it as {prof.pi.get('key_env')} (legacy replay only)" if legacy_replay else "")
+              + "; the HARS server process needs the same key as HARS_MEMORY_LLM_API_KEY")
     # HARS
     url = g["mcp"]
     hbase = url.rsplit("/mcp", 1)[0]
@@ -753,23 +762,23 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
                 "network / model id)", scope="oh,beam,cc")
     if deep and not offline:
         rows.extend(deep_ingest_check(cfg, probes))
-    # pi / node
-    need_pi = "oh" in tracks
-    rc, out = probes.cmd(["pi", "--version"])
-    ver = re.search(r"\d+\.\d+\.\d+", out or "")
-    if rc != 0 or not ver:
-        add("pi", "FAIL" if need_pi else "WARN",
-            "pi not found: `npm i -g @earendil-works/pi-coding-agent@1.4.0` (needed by the oh track; "
-            "beam/cc use the built-in client)", scope="oh")
-    else:
-        v = ver.group(0)
-        add("pi", "OK" if v.startswith(PI_VERSION_PREFIX) else "FAIL",
-            f"pi {v}" + ("" if v.startswith(PI_VERSION_PREFIX) else
-                         f" (the harness/events parser is pinned to {PI_VERSION_PREFIX}x)"), scope="oh")
-    rc, out = probes.cmd(["node", "--version"])
-    m = re.search(r"v?(\d+)", out or "")
-    add("node", "OK" if rc == 0 and m and int(m.group(1)) >= 20 else ("FAIL" if need_pi else "WARN"),
-        out if rc == 0 else "node not found (pi needs Node >= 20)", scope="oh")
+    # pi / node: Amendment C.6 - only the LEGACY pi replay (`oh --legacy-replay`) needs them; the default OH track
+    # runs through run_longsession (built-in client) like beam and cc
+    if legacy_replay and "oh" in tracks:
+        rc, out = probes.cmd(["pi", "--version"])
+        ver = re.search(r"\d+\.\d+\.\d+", out or "")
+        if rc != 0 or not ver:
+            add("pi", "FAIL", "pi not found: `npm i -g @earendil-works/pi-coding-agent@1.4.0` (needed by "
+                              "`oh --legacy-replay` only)", scope="oh")
+        else:
+            v = ver.group(0)
+            add("pi", "OK" if v.startswith(PI_VERSION_PREFIX) else "FAIL",
+                f"pi {v}" + ("" if v.startswith(PI_VERSION_PREFIX) else
+                             f" (the harness/events parser is pinned to {PI_VERSION_PREFIX}x)"), scope="oh")
+        rc, out = probes.cmd(["node", "--version"])
+        m = re.search(r"v?(\d+)", out or "")
+        add("node", "OK" if rc == 0 and m and int(m.group(1)) >= 20 else "FAIL",
+            out if rc == 0 else "node not found (pi needs Node >= 20)", scope="oh")
     # disk
     root = g["artifact_root"]
     free = probes.disk_free_gb(root)
@@ -1115,6 +1124,25 @@ def cc_import(camp: Campaign, step: str = "cc.import") -> str:
 
 
 def estimate_oh(camp: Campaign) -> dict:
+    """Amendment C.6: the OH projection is run_longsession's own (converted sessions, real synthetic boundaries,
+    end checkpoint) + the parity check; `--legacy-replay` keeps the pi replay projection (run_chainreplay)."""
+    if getattr(camp, "legacy_replay", False):
+        return estimate_oh_legacy(camp)
+    data = oh_convert(camp)
+    b = [int(x) for x in camp.cfg["oh"]["budgets"]]
+    s = estimate_ls(camp, "oh", data, b, "end", True, extra=oh_ls_extra(camp.cfg))
+    pd = oh_parity_data(camp)
+    p = estimate_ls(camp, "oh", pd, [max(b)], "end", True, extra=oh_ls_extra(camp.cfg), tag=".parity")
+    return {"track": "oh", "gen_usd": 0.0, "run_usd": s["run_usd"] + p["run_usd"], "judge_usd": s["judge_usd"],
+            "judged_items": s["judged_items"], "wall_hours": s["wall_hours"] + p["wall_hours"], "budgets": b,
+            "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": s["ingest_hours"],
+            "parity_check_usd": p["run_usd"], "main_run_usd": s["run_usd"],
+            "unpriced_models": s["unpriced_models"], "cache_saving_usd": s.get("cache_saving_usd", 0.0),
+            "note": "run_longsession projection (summariser + HARS extraction ESTIMATE + asks) incl. the parity "
+                    f"check ({p['sessions']} session); HARS ingest wall-clock uses 11 s/piece (a guess)"}
+
+
+def estimate_oh_legacy(camp: Campaign) -> dict:
     chains = oh_inputs(camp)
     b = camp.cfg["oh"]["budgets"]
     rc, text = camp.run("dry.oh", [camp.script("run_chainreplay.py"), "--dry-run", "--chains", chains,
@@ -1773,7 +1801,7 @@ def oh_cap_plan(camp: Campaign, args, budgets: list[int]) -> dict:
     return plan
 
 
-def cmd_calibrate(camp: Campaign, args) -> int:
+def cmd_calibrate_legacy(camp: Campaign, args) -> int:
     cfg = camp.cfg
     if cfg["general"].get("_offline"):
         raise HomeRunError("the oh calibration needs the pi agent: there is no offline self-test for it")
@@ -1787,7 +1815,9 @@ def cmd_calibrate(camp: Campaign, args) -> int:
 
 
 
-def cmd_oh(camp: Campaign, args) -> int:
+def cmd_oh_legacy(camp: Campaign, args) -> int:
+    """`oh --legacy-replay`: the pre-C.6 pi agent replay (run_chainreplay) with the C.4 cap calibration. Kept for
+    reproducing earlier chain-replay numbers; NOT the decision-set runner since Amendment C.6."""
     cfg = camp.cfg
     o = cfg["oh"]
     if cfg["general"].get("_offline"):
@@ -1801,7 +1831,7 @@ def cmd_oh(camp: Campaign, args) -> int:
           + ", ".join(f"B={b}: {r['cap']} [{r['basis']}]" for b, r in plan["caps"].items() if int(b) in budgets)
           + (f"; excluded from the decision set: {plan['excluded_from_decision_set']}"
              if plan["excluded_from_decision_set"] else ""))
-    est = camp.step("oh.estimate", lambda: {"estimate": estimate_oh(camp)})["estimate"]
+    est = camp.step("oh.estimate", lambda: {"estimate": estimate_oh_legacy(camp)})["estimate"]
     guard_estimate(camp, "oh", est, args.accept_partial)
     bsz = max(1, int(o["batch_chains"]))
     # pass 1: B-major (the primary B = max(budgets) = 1536 completes for ALL chains first)
@@ -1863,12 +1893,300 @@ def cmd_oh(camp: Campaign, args) -> int:
 
 
 # =============================================================================
+# OpenHands track on the streaming long-session runner (Amendment C.6)
+# =============================================================================
+OH_ARMS = "baseline,nc-chunks,nc-graph,nc-note-only"
+# Fixed, question-independent probes of the parity CHECK: no decision-set question is ever asked by the check.
+PARITY_PROBES = (
+    "What are the most important files, identifiers, commands and results of this session so far?",
+    "Which errors, failing tests or exceptions came up in this session, and what was concluded about each?",
+)
+
+
+def oh_ls_extra(cfg: dict) -> list[str]:
+    """run_longsession flags of the OH track (besides --use-real-compactions, set by `real=True`): the converted
+    chains carry their synthetic boundaries as compactions, the tail after C3 is empty as in the chain replay."""
+    o = cfg["oh"]
+    return ["--keep-tail", "0", "--arms", OH_ARMS,
+            "--session-concurrency", str(int(o.get("session_concurrency") or 1))] + list(o.get("extra_args") or [])
+
+
+def oh_convert(camp: Campaign, step: str = "oh.convert") -> str:
+    """chains.jsonl (decision set) -> longsession/1 sessions in <campaign>/oh/ls-data via chains_to_longsession.py.
+    Needs chains.jsonl ONLY (the chain records carry the span events)."""
+    chains = oh_inputs(camp)
+    data = camp.p("oh", "ls-data")
+    want = sorted(c["chain_id"] for c in read_jsonl(chains))
+    conv = read_json(os.path.join(data, C2L.MANIFEST_NAME), None)
+    if conv and sorted(s["sid"] for s in conv.get("sessions", [])) != want:
+        camp.force_steps.add(step)                      # the decision set changed since the last conversion
+
+    def go():
+        if os.path.isdir(data) and os.listdir(data):
+            camp.quarantine(data)
+        camp.run(step, [camp.script("chains_to_longsession.py"), "--chains", chains, "--out", data])
+        m = read_json(os.path.join(data, C2L.MANIFEST_NAME), {}) or {}
+        if m.get("errors") or len(m.get("sessions", [])) != len(want):
+            raise HomeRunError(f"chain conversion incomplete: {m.get('errors')}")
+        n_q = sum(x["questions"] for x in m["sessions"])
+        print(f"  converted {len(m['sessions'])} chain(s) / {n_q} question(s) -> {data}")
+        return {"sessions": len(m["sessions"]), "questions": n_q, "chains_sha256": m.get("chains_sha256"),
+                "out": data}
+    camp.step(step, go)
+    return data
+
+
+def oh_parity_ids(camp: Campaign) -> list[str]:
+    """The first k chains in the seeded order (same seed and order as the C.4 calibration chain)."""
+    o = camp.cfg["oh"]
+    ids = [c["chain_id"] for c in oh_all_chains(camp)]
+    k = max(1, int(o.get("calibration_chains", 1) or 1))
+    _, order = pick_calibration_chain(ids, o.get("calibration_seed", 20261026))
+    return order[:min(k, len(order))]
+
+
+def parity_session(session: dict) -> dict:
+    """The probe twin of a converted chain: same messages and boundaries, ONLY fixed generic questions (no
+    decision-set question, no gold). sid `parity-<chain id>` so nothing can join a decision-set record."""
+    sid = f"parity-{session['sid']}"[:64]
+    s = json.loads(json.dumps(session))
+    s["sid"] = sid
+    s["title"] = f"parity probe of {session['sid']}"
+    s["meta"] = {**(s.get("meta") or {}), "parity_probe_of": session["sid"]}
+    s["questions"] = [{"qid": f"{sid}_p{i + 1}", "qtype": "single", "question": q,
+                       "answer": "n/a (parity probe, never scored)", "answerable": True, "evidence": []}
+                      for i, q in enumerate(PARITY_PROBES)]
+    return s
+
+
+def oh_parity_data(camp: Campaign) -> str:
+    d = camp.p("oh", "parity", "data")
+    by_id = {c["chain_id"]: c for c in oh_all_chains(camp)}
+    for cid in oh_parity_ids(camp):
+        sess, _ = C2L.convert_chain(by_id[cid])
+        C2L.write_session(parity_session(sess), d)
+    return d
+
+
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def parity_from_records(rows: list[dict], comps: list[dict], budgets: list[int]) -> dict:
+    """Pure: per B the realized ask-time memory (the runner's own `memory_tokens`, NATIVE tokens) of
+    baseline vs nc-chunks / nc-graph (note + recall AS INJECTED), the ratio (mean over sessions of the
+    per-session run-mean ratio: the quantity metrics_v2's win_mem_token_ratio gates), CLIP and validity."""
+    out: dict[str, dict] = {}
+    for B in budgets:
+        rb = [r for r in rows if int(r.get("mem_budget") or 0) == int(B)]
+        sids = sorted({str(r.get("chain_id")) for r in rb})
+
+        def per_sid(arm, field="memory_tokens"):
+            return {sid: _mean([float(r[field]) for r in rb if r["arm"] == arm and str(r["chain_id"]) == sid
+                                and r.get(field) is not None]) for sid in sids}
+        base, chunks, graph = per_sid("baseline"), per_sid("nc-chunks"), per_sid("nc-graph")
+        note = per_sid("nc-note-only")
+
+        def ratio(num):
+            rs = [num[s_] / base[s_] for s_ in sids if num.get(s_) and base.get(s_)]
+            return round(sum(rs) / len(rs), 4) if rs else None
+        rc_, rg = ratio(chunks), ratio(graph)
+        clip = {}
+        for r in rb:
+            cs = r.get("clipped_summaries") or {}
+            k = (r["arm"], str(r["chain_id"]))
+            if k not in clip:
+                clip[k] = (int(cs.get("n") or 0), int(cs.get("unrepaired") or 0))
+        clip_fail = sorted(f"{a}@{sid}" for (a, sid), (n, bad) in clip.items() if n and bad / n > 1 / 6)
+        invalid = sorted({f"{r['arm']}@{r['chain_id']}: " + "; ".join(map(str, r.get("chain_invalid_reasons") or []))[:160]
+                          for r in rb if r.get("valid") is not True})
+        bsum = [float(c["realized_tokens"]) for c in comps if c.get("arm") == "baseline" and int(c.get("B") or 0) == int(B)
+                and c.get("realized_tokens") is not None]
+        nsum = [float(c["realized_tokens"]) for c in comps if c.get("arm") == "note" and int(c.get("B") or 0) == int(B)
+                and c.get("realized_tokens") is not None]
+        inwin = lambda v: v is not None and PARITY_LO <= v <= PARITY_HI  # noqa: E731
+        out[str(B)] = {
+            "sessions": sids, "rows": len(rb),
+            "ratio_nc_chunks": rc_, "ratio_nc_graph": rg, "window": [PARITY_LO, PARITY_HI],
+            "in_window": bool(inwin(rc_) and inwin(rg)),
+            "baseline_memory_tokens_mean": _mean(list(base.values())),
+            "nc_chunks_memory_tokens_mean": _mean(list(chunks.values())),
+            "nc_graph_memory_tokens_mean": _mean(list(graph.values())),
+            "nc_note_only_memory_tokens_mean": _mean(list(note.values())),
+            "note_tokens_mean": _mean([float(r["arm_note_tokens"]) for r in rb if r["arm"] == "nc-chunks"
+                                       and r.get("arm_note_tokens") is not None]),
+            "injected_recall_tokens_mean": _mean([float(r["memory_tokens_injected"]) for r in rb
+                                                  if r["arm"] == "nc-chunks" and r.get("memory_tokens_injected") is not None]),
+            "baseline_fill_of_B": (round(_mean(list(base.values())) / B, 4) if _mean(list(base.values())) else None),
+            "pooled_summary_tokens": {"baseline_mean": _mean(bsum), "note_mean": _mean(nsum),
+                                      "baseline_n": len(bsum), "note_n": len(nsum)},
+            "clip_free": not clip_fail, "clip_fail": clip_fail,
+            "all_valid": not invalid and bool(rb), "invalid": invalid,
+            "tokenizer": next((r.get("tokenizer") for r in rb if r.get("tokenizer")), None),
+            "tokenizer_native": next((r.get("tokenizer_native") for r in rb if "tokenizer_native" in r), None),
+        }
+    return out
+
+
+def run_oh_parity(camp: Campaign, *, budgets: list[int]) -> dict:
+    """Amendment C.6 calibration = a cheap parity CHECK on the run_longsession path (no cap is tuned, nothing
+    iterates). k sessions (default 1) are compacted exactly like the real run (baseline summaries, nc notes,
+    HARS ingest) and asked ONLY the fixed probe questions (never a decision-set question), so the check is not
+    excluded from the decision set. PASS = every row valid, CLIP-free and the realized ask-time memory ratio of
+    nc-chunks AND nc-graph vs baseline inside [0.80, 1.05] at every B. Writes <campaign>/calibration.json."""
+    cfg = camp.cfg
+    ids = oh_parity_ids(camp)
+    data = oh_parity_data(camp)
+    run_dir = camp.p("oh", "parity", "run")
+    prof_ = P.load_profile(cfg["general"]["profile"])
+    expect_native = tokcount.provider_of_profile(prof_.name) in tokcount.NATIVE_PROVIDERS and not cfg["general"].get("_offline")
+    print(f"[parity] chain(s) {ids} (first {len(ids)} in seeded order, seed {cfg['oh'].get('calibration_seed', 20261026)}); "
+          f"B in {budgets}; compaction + {len(PARITY_PROBES)} fixed probe asks, run_longsession path, nothing is tuned; "
+          f"acceptance: valid + CLIP-free + ratio in [{PARITY_LO}, {PARITY_HI}]")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_ls_extra(cfg), len(ids), True, "oh-parity",
+                step="oh.parity.run")
+    rows = read_jsonl(os.path.join(run_dir, "records.jsonl"))
+    comps = read_jsonl(os.path.join(run_dir, "compactions.jsonl"))
+    per_b = parity_from_records(rows, comps, budgets)
+    why = []
+    for B, d in per_b.items():
+        if not d["rows"]:
+            why.append(f"B={B}: no records")
+        if not d["all_valid"]:
+            why.append(f"B={B}: invalid cells {d['invalid'][:3]}")
+        if not d["clip_free"]:
+            why.append(f"B={B}: CLIP {d['clip_fail']}")
+        if not d["in_window"]:
+            why.append(f"B={B}: ask-time ratio nc-chunks {d['ratio_nc_chunks']} / nc-graph {d['ratio_nc_graph']} "
+                       f"outside [{PARITY_LO}, {PARITY_HI}] (baseline fills {d['baseline_fill_of_B']} of B)")
+        if expect_native and d["tokenizer_native"] is False:
+            why.append(f"B={B}: counted with {d['tokenizer']!r} (native=False): Amendment C.5 measures NATIVE tokens")
+    pb = per_b.get(str(max(budgets, key=lambda b: (b == 1536, b)))) or {}
+    spent = sum(e["usd"] for e in camp.ledger()["entries"] if e.get("step") == "oh.parity.run")
+    cal = {"version": 3, "amendment": "C.6", "mode": "parity-check", "ts": utc_iso(), "track": "oh",
+           "status": "fail" if why else "pass", "stopped_because": why, "chain_id": ids[0], "chain_ids": ids,
+           "parity_sessions": [f"parity-{i}"[:64] for i in ids], "budgets": budgets, "window": [PARITY_LO, PARITY_HI],
+           "tokenizer": pb.get("tokenizer"), "tokenizer_native": pb.get("tokenizer_native"),
+           "ratio": pb.get("ratio_nc_graph"), "ratio_nc_chunks": pb.get("ratio_nc_chunks"),
+           "ratio_nc_graph": pb.get("ratio_nc_graph"), "per_b": per_b,
+           "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first k',
+                               "seed": cfg["oh"].get("calibration_seed", 20261026)},
+           "probes": list(PARITY_PROBES), "source_run_dir": run_dir, "spent_usd": round(spent, 6),
+           "excluded_from_decision_set": [],
+           "why_not_excluded": "the check asks only the fixed probe questions (sid parity-<chain>, never a decision-set "
+                               "qid) and tunes nothing: no answer, cap or parameter depends on a decision-set item",
+           "note": "no baseline-cap iteration (Amendment C.6): the baseline cap is B (C.5-2); a FAIL is a report"}
+    write_json(camp.p(CAL_FILE), cal)
+    camp.write_manifest()
+    if why:
+        print(f"[parity] FAIL: {'; '.join(why)}")
+    else:
+        print(f"[parity] PASS: ask-time ratio nc-chunks {pb['ratio_nc_chunks']} / nc-graph {pb['ratio_nc_graph']} "
+              f"(window {PARITY_LO}-{PARITY_HI}); baseline {pb['baseline_memory_tokens_mean']:.0f} tok, nc-chunks "
+              f"{pb['nc_chunks_memory_tokens_mean']:.0f} (note {pb['note_tokens_mean']:.0f} + recall "
+              f"{pb['injected_recall_tokens_mean']:.0f}); {tokcount_label(pb)}; spent {fmt_usd(spent)} -> {camp.p(CAL_FILE)}")
+    return cal
+
+
+def tokcount_label(pb: dict) -> str:
+    return f"tokenizer {pb.get('tokenizer')} native={pb.get('tokenizer_native')}"
+
+
+def oh_parity_gate(camp: Campaign, args, budgets: list[int]) -> dict | None:
+    """The `oh` precondition: a passing parity check in this campaign (run now when absent)."""
+    if getattr(args, "skip_parity_check", False):
+        print("[oh] --skip-parity-check: the cheap parity check is skipped (recorded); the run's own "
+              "win_mem_token_ratio gate still decides")
+        return None
+    cal = read_json(camp.p(CAL_FILE), None)
+    if cal and cal.get("amendment") != "C.6":
+        raise HomeRunError(f"oh refuses to use {camp.p(CAL_FILE)}: it is a pre-C.6 (pi replay, cap-iteration) calibration "
+                           "and is VOID for the streaming runner. Start a new campaign (--new) or pass --skip-parity-check.")
+    if not cal:
+        cal = run_oh_parity(camp, budgets=budgets)
+    missing = [B for B in budgets if str(B) not in (cal.get("per_b") or {})]
+    if missing:
+        raise HomeRunError(f"the parity check covers B={sorted(int(b) for b in cal.get('per_b', {}))} but this run uses "
+                           f"B={missing} too: run `home_run.py calibrate --budgets {','.join(map(str, budgets))} "
+                           "--force-step oh.parity.run` first.")
+    if cal.get("status") != "pass" and not getattr(args, "accept_parity_fail", False):
+        raise HomeRunError("oh refuses to run: the parity check FAILED (" + "; ".join(cal.get("stopped_because") or [])[:400]
+                           + f"). See {camp.p(CAL_FILE)}. Nothing is tuned in C.6, so a failing check means the summariser "
+                             "fill and the nc memory do not land in the pre-registered window on this model; investigate "
+                             "(logs/oh.parity.run.log, oh/parity/run/records.jsonl), or pass --accept-parity-fail to run "
+                             "anyway (recorded; the run's win_mem_token_ratio gate will report the same fact).")
+    return cal
+
+
+def cmd_calibrate(camp: Campaign, args) -> int:
+    if getattr(args, "legacy_replay", False):
+        return cmd_calibrate_legacy(camp, args)
+    cfg = camp.cfg
+    if getattr(args, "check_sessions", None):
+        cfg["oh"]["calibration_chains"] = int(args.check_sessions)
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    cal = run_oh_parity(camp, budgets=budgets)
+    return 0 if cal["status"] == "pass" else 1
+
+
+def cmd_oh(camp: Campaign, args) -> int:
+    if getattr(args, "legacy_replay", False):
+        return cmd_oh_legacy(camp, args)
+    cfg = camp.cfg
+    o = cfg["oh"]
+    chains_path = oh_inputs(camp)
+    ids = [c["chain_id"] for c in read_jsonl(chains_path)]
+    data = oh_convert(camp)
+    budgets = [int(b) for b in (args.budgets or o["budgets"])]
+    cal = oh_parity_gate(camp, args, budgets)
+    if cal is not None and cal.get("status") != "pass":
+        print("[oh] --accept-parity-fail: running although the parity check failed (recorded in calibration.json)")
+    est = camp.step("oh.estimate", lambda: {"estimate": estimate_oh(camp)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", "run")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_ls_extra(cfg), len(ids), args.accept_partial, "oh")
+    rec = os.path.join(run_dir, "records.jsonl")
+    if getattr(args, "tolerate_invalid_run", False) and any(r.get("valid") is not True for r in read_jsonl(rec)):
+        print("[oh] some arms are invalid (smoke with --allow-shim): export / judge / metrics are skipped")
+        return 0
+    ji, judged, mp = (os.path.join(run_dir, n) for n in ("judge-input.jsonl", "judged.jsonl", "judge-mapping.json"))
+    camp.step("oh.export", lambda: (camp.run("oh.export", [camp.script("export_longsession_judge.py"), "--records", rec,
+                                                           "--sessions", data, "--out", ji]), {"out": ji})[1])
+    if args.skip_judge:
+        print("[oh] --skip-judge: stopping before the judge")
+        return 0
+    camp.step("oh.judge", lambda: judge_step(camp, "oh", "oh", ji, judged, mp, args.accept_partial))
+    excl = oh_exclusions(camp)
+    xs = (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else [])
+    camp.step("oh.metrics", lambda: metrics_step(
+        camp, "oh.metrics", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-oh.md"),
+        os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only"] + xs))
+    # DESCRIPTIVE companion (Amendment C.6-3): the chain-track reading (S1-S3 on clean_anchor_hit, m = 3) of the same records
+    camp.step("oh.metrics_chains", lambda: metrics_step(
+        camp, "oh.metrics_chains", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-oh-chains-family.md"),
+        os.path.join(run_dir, "metrics-chains-family.json"), ["--track", "chains", "--end-only"] + xs))
+
+    def do_funnel():
+        argv = [camp.script("funnel_chains.py"), "--run", run_dir, "--chains", chains_path,
+                "--out-md", os.path.join(run_dir, "funnel.md"), "--out-json", os.path.join(run_dir, "funnel.json")]
+        if o.get("graph_store"):
+            argv += ["--graph-store", o["graph_store"]]
+        rc, _ = camp.run("oh.funnel", argv, check=False)
+        return {"md": os.path.join(run_dir, "funnel.md"), "rc": rc,
+                "note": "best effort: funnel_chains reads run_chainreplay run dirs; a longsession run dir may only fill part of it"}
+    camp.step("oh.funnel", do_funnel)
+    summarize_track(camp, "oh", run_dir)
+    return 0
+
+
+# =============================================================================
 # BEAM and Claude Code (long-session) tracks
 # =============================================================================
 def ls_run_step(camp: Campaign, track: str, sessions: str, run_dir: str, budgets, checkpoints: str,
                 real: bool, extra: list[str] | None, n_expected_sessions: int, accept_partial: bool,
-                name: str) -> dict:
-    step = f"{track}.run"
+                name: str, step: str | None = None) -> dict:
+    step = step or f"{track}.run"
 
     def go():
         rem = camp.remaining(track, "run")
@@ -2110,8 +2428,9 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
     offline = bool(cfg["general"].get("_offline"))
     print(f"[smoke] campaign {camp.path}\n[smoke] caps: OH run {fmt_usd(sm['run_cap_oh'])}, long-session run "
           f"{fmt_usd(sm['run_cap_ls'])}, judge {fmt_usd(sm['judge_cap'])} each (hard)")
+    legacy = bool(getattr(args, "legacy_replay", False))
     rows = doctor_checks(scfg, probes, live=not args.no_live, deep=not offline, tracks=("oh",) if not args.skip_oh else (),
-                         offline=offline)
+                         offline=offline, legacy_replay=legacy)
     write_json(camp.p("doctor.json"), rows)
     print_doctor(rows)
     fails = [r for r in rows if r["status"] == "FAIL"]
@@ -2126,7 +2445,42 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
         write_json(camp.p("smoke-report.json"), results)
         return 1
 
-    if not args.skip_oh:
+    if not args.skip_oh and not legacy:
+        def oh_new():
+            """Amendment C.6: ONE chain through the streaming runner: parity check -> 4 arms -> judge -> metrics."""
+            src = cfg["oh"].get("artifact_dir")
+            if not src or not os.path.isfile(os.path.join(src, "chains.jsonl")):
+                raise HomeRunError("[oh] artifact_dir not set: pass --skip-oh or copy the OH artifact dir")
+            chains = read_jsonl(os.path.join(src, "chains.jsonl"))
+            # cheapest chain = fewest span characters (the run cost is ~ tokens; deterministic, no dry run needed)
+            size = lambda c: (sum(len(e.get("text") or "") for sp in c["spans"] for e in sp["segments"]), c["chain_id"])  # noqa: E731
+            pick = min(chains, key=size)["chain_id"]
+            first = camp.p("smoke", "oh-src")
+            os.makedirs(first, exist_ok=True)
+            with open(os.path.join(first, "chains.jsonl"), "w") as f:
+                for c in chains:
+                    if c["chain_id"] == pick:
+                        f.write(json.dumps(c, ensure_ascii=False) + "\n")
+            scfg["oh"]["artifact_dir"] = first
+            camp.cfg = scfg
+            ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=bool(args.skip_judge),
+                                    legacy_replay=False, skip_parity_check=bool(getattr(args, "skip_calibrate", False)),
+                                    accept_parity_fail=bool(args.allow_shim), tolerate_invalid_run=bool(args.allow_shim))
+            rcode = cmd_oh(camp, ns)
+            cal = read_json(camp.p(CAL_FILE), {}) or {}
+            m = read_json(os.path.join(camp.p("oh", "run"), "metrics.json"), {}) or {}
+            pb = (cal.get("per_b") or {}).get("1536") or {}
+            return {"chain": pick, "verdict": (m.get("gates") or {}).get("verdict"), "exit": rcode,
+                    "parity": cal.get("status"), "parity_ratio_nc_chunks": pb.get("ratio_nc_chunks"),
+                    "parity_ratio_nc_graph": pb.get("ratio_nc_graph"),
+                    "memory_tokens": {"baseline": pb.get("baseline_memory_tokens_mean"),
+                                      "nc_chunks": pb.get("nc_chunks_memory_tokens_mean"),
+                                      "nc_graph": pb.get("nc_graph_memory_tokens_mean"),
+                                      "nc_note_only": pb.get("nc_note_only_memory_tokens_mean")},
+                    "tokenizer": pb.get("tokenizer"), "tokenizer_native": pb.get("tokenizer_native")}
+        smoke_stage(results, "oh (1 chain via run_longsession: parity check, B=1536, 4 arms -> judge -> metrics)", oh_new)
+
+    if not args.skip_oh and legacy:
         def oh():
             src = cfg["oh"].get("artifact_dir")
             if not src or not os.path.isfile(os.path.join(src, "chains.jsonl")):
@@ -2153,7 +2507,7 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
             os.remove(all_p)
             scfg["oh"]["artifact_dir"] = first
             ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=bool(args.skip_judge),
-                                    baseline_cap=None, baseline_cap_scale=None)
+                                    baseline_cap=None, baseline_cap_scale=None, legacy_replay=True)
             camp.cfg = scfg
             cal_info = {}
             if not getattr(args, "skip_calibrate", False):
@@ -2167,11 +2521,11 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
                                        "run would refuse too; see HOME-RUNBOOK.md 'calibration failed'")
             else:
                 ns.baseline_cap_scale = 1.0          # smoke only: nothing calibrated, B=cap explicit
-            rcode = cmd_oh(camp, ns)
+            rcode = cmd_oh_legacy(camp, ns)
             m = read_json(os.path.join(camp.p("oh", "merged"), "metrics.json"), {}) or {}
             return {"chain": pick, "projected_usd": per.get(pick), "verdict": (m.get("gates") or {}).get("verdict"),
                     "exit": rcode, **cal_info}
-        smoke_stage(results, "oh (1 chain: baseline-cap calibration, B=1536, 4 arms -> judge -> metrics -> funnel)", oh)
+        smoke_stage(results, "oh --legacy-replay (1 chain, pi: baseline-cap calibration, B=1536, 4 arms -> judge -> metrics -> funnel)", oh)
 
     def ls():
         data = camp.p("smoke", "ls-data")
@@ -2427,9 +2781,12 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--no-live", action="store_true", help="skip the cents-level LLM liveness pings")
     d.add_argument("--deep", action="store_true", help="also run one tiny memory_compact end to end on the HARS server")
     d.add_argument("--tracks", default="oh,beam,cc")
+    d.add_argument("--legacy-replay", action="store_true",
+                   help="also require the pi agent + node (only `oh --legacy-replay` needs them, Amendment C.6)")
     sub.add_parser("hars-env", parents=[common], help="print the HARS server env block")
     dr = sub.add_parser("dry-run", parents=[common], help="cost / wall-clock estimate of all tracks (zero spend)")
     dr.add_argument("--tracks", default="oh,beam,cc")
+    dr.add_argument("--legacy-replay", action="store_true", help="price the OH track as the pi replay (pre-C.6)")
     dr.add_argument("--find", default=None, metavar="TEXT", help="price the Claude Code session whose title matches")
     dr.add_argument("--session-id", default=None, metavar="ID")
     dr.add_argument("--pick", type=int, default=None, metavar="N")
@@ -2439,17 +2796,24 @@ def build_parser() -> argparse.ArgumentParser:
     sm.add_argument("--skip-oh", action="store_true")
     sm.add_argument("--skip-ls", action="store_true", help="skip the synthetic long-session part")
     sm.add_argument("--skip-calibrate", action="store_true",
-                    help="no baseline-cap calibration in the OH smoke (cap = B; the smoke then reproduces the uncalibrated CLIP/ratio failure)")
+                    help="no parity check in the OH smoke (C.6; with --legacy-replay: no baseline-cap calibration, cap = B)")
+    sm.add_argument("--legacy-replay", action="store_true", help="OH smoke through the pi replay (pre-C.6)")
     sm.add_argument("--skip-judge", action="store_true", help="no judge call (saves the judge cap)")
     sm.add_argument("--allow-shim", action="store_true", help="accept the hash/shim embedder for this smoke only")
     cal_p = sub.add_parser("calibrate", parents=[common],
-                           help="Amendment C.4: calibrate the OH baseline cap on the calibration chain (writes calibration.json)")
+                           help="Amendment C.6: cheap parity CHECK of the OH track on the run_longsession path (writes "
+                                "calibration.json); --legacy-replay: the C.4 baseline-cap calibration through pi")
     cal_p.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None,
-                       help="B values to calibrate (default [oh] budgets; the primary 1536 first)")
+                       help="B values to check (default [oh] budgets)")
+    cal_p.add_argument("--check-sessions", type=int, default=None, metavar="K",
+                       help="sessions of the parity check (default [oh] calibration_chains = 1)")
+    cal_p.add_argument("--legacy-replay", action="store_true", help="the pre-C.6 pi calibration with cap iteration")
     cal_p.add_argument("--max-iterations", type=int, default=None,
-                       help="max calibration runs per B (default [oh] calibration_max_iterations = 2)")
-    cal_p.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP]", help="START cap (default [oh] baseline_cap, else B)")
-    cal_p.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S", help="START scale: cap(B)=round(B*S)")
+                       help="(--legacy-replay) max calibration runs per B (default [oh] calibration_max_iterations = 2)")
+    cal_p.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP]",
+                       help="(--legacy-replay) START cap (default [oh] baseline_cap, else B)")
+    cal_p.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S",
+                       help="(--legacy-replay) START scale: cap(B)=round(B*S)")
     for name, hlp in (("oh", "OpenHands chain track"), ("beam", "BEAM long-session track"),
                       ("cc", "Claude Code long-session track")):
         t = sub.add_parser(name, parents=[common], help=hlp)
@@ -2458,12 +2822,18 @@ def build_parser() -> argparse.ArgumentParser:
         t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
         t.add_argument("--skip-judge", action="store_true", help="stop after export (no judge spend)")
         if name == "oh":
-            t.add_argument("--retries", type=int, default=None, help="re-run invalid/missing (chain, B) cells N times")
+            t.add_argument("--legacy-replay", action="store_true",
+                           help="the pre-C.6 pi agent replay (run_chainreplay, C.4 cap calibration); NOT the decision runner")
+            t.add_argument("--skip-parity-check", action="store_true",
+                           help="C.6: do not run / consult the cheap parity check (recorded)")
+            t.add_argument("--accept-parity-fail", action="store_true",
+                           help="C.6: run although the parity check failed (recorded; the run's win_mem_token_ratio gate reports it)")
+            t.add_argument("--retries", type=int, default=None, help="(--legacy-replay) re-run invalid/missing (chain, B) cells N times")
             t.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP]",
-                           help="EXPLICIT baseline caps, e.g. 1536:2010,1024:1340 (skips the calibration requirement; "
-                                "wins over a calibration; frozen per campaign)")
+                           help="(--legacy-replay) EXPLICIT baseline caps, e.g. 1536:2010,1024:1340 (skips the calibration "
+                                "requirement; wins over a calibration; frozen per campaign)")
             t.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S",
-                           help="EXPLICIT scale: cap(B)=round(B*S) for the B not in --baseline-cap")
+                           help="(--legacy-replay) EXPLICIT scale: cap(B)=round(B*S) for the B not in --baseline-cap")
         if name == "cc":
             t.add_argument("--find", default=None, metavar="TEXT",
                            help="find the session by a substring of its title / first user message, e.g. \"HARS Experts Research\"")
@@ -2539,9 +2909,11 @@ def main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
             return cmd_smoke(cfg, args, runner=runner, probes=probes)
         camp = open_campaign(cfg, args, args.cmd, runner=runner)
         camp.cfg = cfg
+        camp.legacy_replay = bool(getattr(args, "legacy_replay", False))
         if args.cmd == "doctor":
             tracks = tuple(t for t in args.tracks.split(",") if t)
-            rows = doctor_checks(cfg, probes, live=not args.no_live, deep=args.deep, tracks=tracks, offline=offline)
+            rows = doctor_checks(cfg, probes, live=not args.no_live, deep=args.deep, tracks=tracks, offline=offline,
+                                 legacy_replay=camp.legacy_replay)
             tbl, _ = role_model_table(cfg)
             write_json(camp.p("doctor.json"), {"ts": utc_iso(), "version": HOME_RUN_VERSION, "role_models": tbl,
                                                "checks": rows})

@@ -197,7 +197,9 @@ class Doctor(unittest.TestCase):
         rows = H.doctor_checks(self.cfg, FakeProbes(), deep=True)
         self.assertFalse([r for r in rows if r["status"] == "FAIL"], rows)
         self.assertEqual(self.status(rows, "hars.embedder"), "OK")
-        self.assertEqual(self.status(rows, "pi"), "OK")
+        # Amendment C.6: pi / node are NOT required (and not even listed) unless the legacy replay is asked for
+        self.assertNotIn("pi", {r["check"] for r in rows})
+        self.assertNotIn("node", {r["check"] for r in rows})
         self.assertEqual(self.status(rows, "hars.semantic_probe"), "OK")
         self.assertEqual(self.status(rows, "keys"), "OK")
 
@@ -211,13 +213,19 @@ class Doctor(unittest.TestCase):
         self.assertEqual(self.status(rows, "hars.semantic_probe"), "FAIL")
         self.assertEqual(H.print_doctor(rows) if False else 1, 1)
 
-    def test_pi_node_keys_disk(self):
-        rows = H.doctor_checks(self.cfg, FakeProbes(pi="1.3.9"))
+    def test_pi_node_only_with_the_legacy_replay(self):
+        rows = H.doctor_checks(self.cfg, FakeProbes(pi=None))        # default: no pi, no problem
+        self.assertFalse([r for r in rows if r["status"] == "FAIL"], rows)
+        rows = H.doctor_checks(self.cfg, FakeProbes(pi="1.3.9"), legacy_replay=True)
         self.assertEqual(self.status(rows, "pi"), "FAIL")
-        rows = H.doctor_checks(self.cfg, FakeProbes(pi=None))
+        rows = H.doctor_checks(self.cfg, FakeProbes(pi=None), legacy_replay=True)
         self.assertEqual(self.status(rows, "pi"), "FAIL")
-        rows = H.doctor_checks(self.cfg, FakeProbes(pi=None), tracks=("beam",))
-        self.assertEqual(self.status(rows, "pi"), "WARN")            # only the oh track needs it
+        rows = H.doctor_checks(self.cfg, FakeProbes(pi="1.4.0"), legacy_replay=True)
+        self.assertEqual((self.status(rows, "pi"), self.status(rows, "node")), ("OK", "OK"))
+        rows = H.doctor_checks(self.cfg, FakeProbes(pi=None), tracks=("beam",), legacy_replay=True)
+        self.assertNotIn("pi", {r["check"] for r in rows})           # the legacy replay is an oh-track concern
+
+    def test_keys_and_disk(self):
         cfg = cfg_for(self.d.name, general={"key_env": "HR_NO_SUCH_KEY"})
         self.assertEqual(self.status(H.doctor_checks(cfg, FakeProbes()), "keys"), "FAIL")
         self.assertEqual(self.status(H.doctor_checks(self.cfg, FakeProbes(free=2.0)), "disk"), "FAIL")
@@ -544,7 +552,7 @@ class OpenHandsFlow(unittest.TestCase):
 
     def run_oh(self, runner, extra=(), toml=None):
         # the oh track refuses without a calibration or an explicit cap (Amendment C.4): scale 1.0 = cap == B
-        argv = self.base + (["--config", toml] if toml else []) + ["oh", *(extra or ["--baseline-cap-scale", "1.0"])]
+        argv = self.base + (["--config", toml] if toml else []) + ["oh", "--legacy-replay", *(extra or ["--baseline-cap-scale", "1.0"])]
         return quiet(H.main, argv, runner=runner)
 
     def toml(self, text):
@@ -647,7 +655,7 @@ class OpenHandsFlow(unittest.TestCase):
         self.assertEqual(len([e for e in led if e["phase"] == "run"]), 2)
         # a cap that is already spent refuses a new batch
         rc, so, se = quiet(H.main, ["--root", self.root, "--oh-dir", self.art, "--run-cap", "0.5", "--judge-cap", "9",
-                                    "--config", t, "oh", "--baseline-cap-scale", "1.0", "--force-step", "oh.run.b1536-00", "--accept-partial"], runner=r)
+                                    "--config", t, "oh", "--legacy-replay", "--baseline-cap-scale", "1.0", "--force-step", "oh.run.b1536-00", "--accept-partial"], runner=r)
         self.assertEqual(rc, 2)
         self.assertIn("spent", se)
 
@@ -781,7 +789,7 @@ class SmokeOffline(unittest.TestCase):
                                "TOTAL projected: 12 compactions, 80 asks, ~120.0 min, $0.9000\n")
                 return orig(argv)
             r.chainreplay = chainreplay
-            rc, so, se = quiet(H.main, ["--root", root, "--key-env", "HR_TEST_KEY4", "--oh-dir", art, "smoke", "--skip-ls"],
+            rc, so, se = quiet(H.main, ["--root", root, "--key-env", "HR_TEST_KEY4", "--oh-dir", art, "smoke", "--skip-ls", "--legacy-replay"],
                                runner=r, probes=FakeProbes())
             self.assertEqual(rc, 0, so + se)
             camp = [x for x in os.listdir(root) if x.endswith("-smoke")][0]

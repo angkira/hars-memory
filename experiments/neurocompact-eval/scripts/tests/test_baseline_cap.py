@@ -267,7 +267,7 @@ class CalibrationFlow(unittest.TestCase):
         self.d.cleanup()
 
     def go(self, runner, *cmd, toml=None):
-        argv = self.base + ["--config", toml or self.toml] + list(cmd)
+        argv = self.base + ["--config", toml or self.toml] + [cmd[0], "--legacy-replay"] + list(cmd[1:])
         return thr.quiet(H.main, argv, runner=runner)
 
     def camp(self):
@@ -484,7 +484,7 @@ class CalibrationFlow(unittest.TestCase):
             return orig(argv)
         r.chainreplay = chainreplay
         rc_, so, se = thr.quiet(H.main, ["--root", self.root, "--key-env", "HR_TEST_KEY9", "--oh-dir", self.art,
-                                         "smoke", "--skip-ls"], runner=r, probes=thr.FakeProbes())
+                                         "smoke", "--skip-ls", "--legacy-replay"], runner=r, probes=thr.FakeProbes())
         self.assertEqual(rc_, 0, so + se)
         camp = os.path.join(self.root, [x for x in os.listdir(self.root) if x.endswith("-smoke")][0])
         cal = H.read_json(os.path.join(camp, "calibration.json"))

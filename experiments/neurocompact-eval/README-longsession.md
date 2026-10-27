@@ -9,6 +9,7 @@ Plan: `.plans/2026-10-26_long-session-eval.md`. All scripts live in `scripts/`, 
 ```
 BEAM repo  --import_beam.py-------------------\
 Claude Code *.jsonl --import_claude_code.py ---+--> longsession/1 sessions --gen_longsession_qa.py (if no questions)
+OpenHands chains.jsonl --chains_to_longsession.py -/   (Amendment C.6: the OH track, synthetic boundaries, questions included)
                                                \--> run_longsession.py --dry-run | live | --resume
 ```
 
@@ -19,9 +20,10 @@ Claude Code *.jsonl --import_claude_code.py ---+--> longsession/1 sessions --gen
 | `import_claude_code.py` | Claude Code transcripts -> sessions: user/assistant text, tool_use+tool_result merged into one `tool` message (import_opencode format), `compact_boundary` + compact-summary user line -> `compactions[{at_idx, original_summary}]`, sidechains excluded (flag to include), parentUuid ordering with dead-branch and parallel-tool-result handling, resumed files merged, **secret redaction on by default** with a count report |
 | `ls_redact.py` | the redaction pass (sk-, sk-ant-, sk-or-v1, ghp_/github_pat_, glpat-, AWS keys, PEM private keys, JWT, bearer; `NAME=value` assignments only when NAME has a secret-like word segment (token/secret/password/api_key/auth/bearer/credential...) AND the value looks like a secret: >= 12 chars, mixed classes, entropy; `tokenizer=tiktoken:cl100k_base`, model ids, paths, URLs stay). Per-pattern counts are reported; `home_run bundle` uses the same module |
 | `gen_longsession_qa.py` | QA for sessions without questions. Default `--mode menu`: per compaction window the code pre-extracts window-unique anchors with verbatim >= 8-word evidence, the model only phrases questions (~2 single per window up to 40, ~10 multihop via a code-verified shared entity, a few unanswerable probes verified absent); worst-case budget pre-check before every call. `--mode legacy`: free-text excerpts + post-hoc gates. Full prompt/answer log in `qa-raw.jsonl` |
+| `chains_to_longsession.py` | Amendment C.6: OpenHands `chains.jsonl` -> sessions (sid = chain id; messages = the span events; compactions = the chain's three span-end boundaries, `at_idx = len(messages)` for C3 so the tail is empty; every qa item with its qid, `multihop` -> `xspan_locator`, char-exact evidence, gold anchors, unanswerable probes). Deterministic; reads `chains.jsonl` only. Run with `--use-real-compactions --keep-tail 0 --checkpoints end` |
 | `run_longsession.py` | the runner (below) |
 | `export_longsession_judge.py` | run_longsession records + the session files -> `judge_v2` input: blind, one +-500-char evidence window per hop, BEAM `rubric` reaches the judge, `visible_context` (memory + recall + verbatim tail, question/answer excluded), memory channel fields dropped, `metrics_v2.validate_rows` filter |
-| `home_run.py` | the owner's single entry point (HOME-RUNBOOK.md): doctor / dry-run / smoke / oh / beam / cc / bundle |
+| `home_run.py` | the owner's single entry point (HOME-RUNBOOK.md): doctor / dry-run / smoke / calibrate / oh / beam / cc / bundle (`oh` = convert + this runner since C.6; `--legacy-replay` keeps the pi chain replay) |
 
 ## Format `longsession/1`
 

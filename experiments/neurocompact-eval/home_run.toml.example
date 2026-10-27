@@ -26,22 +26,24 @@ judge = 5.0
 # [caps.beam]
 # run = 12.0
 
-[oh]                                  # OpenHands chain track: all 14 chains (single + xspan_locator + unanswerable)
+[oh]                                  # OpenHands chain track (Amendment C.6): all 14 chains (single + xspan_locator + unanswerable)
 # the unpacked dataset dir; leave empty to auto-detect <artifact_root>/*-oh-multihop-qa, or unpack the tarball with
 #   home_run.py --oh-tar ~/oh-multihop-qa-20261026T144511Z.tar.gz dry-run
 artifact_dir = ""
-batch_chains = 4                      # chains per run_chainreplay invocation (the host has an OOM history)
-retries      = 1                      # re-run invalid / missing (chain, B) cells this many times
-budgets      = [1536]                 # primary cell only. OPT-IN protocol sweep: [1536, 1024, 512] (~3x the cost)
+batch_chains = 4                      # (--legacy-replay only) chains per run_chainreplay invocation
+retries      = 1                      # (--legacy-replay only) re-run invalid / missing (chain, B) cells this many times
+budgets      = [1536]                 # primary cell only. OPT-IN protocol sweep: [1536, 1024, 512]
 graph_store  = ""                     # <HARS sessions dir> for the funnel's anchor_in_graph stage (optional)
-# Amendment C.4: the baseline summary cap is a CALIBRATED parity parameter. Run `home_run.py calibrate` once before `oh`
-# (writes <campaign>/calibration.json, excludes the calibration chain from the decision set). `oh` refuses without it unless
-# you set an explicit cap here or pass --baseline-cap on the command line (recorded as source "cli", not a calibration).
-# Both are also the START value of `calibrate`. Leave empty to calibrate from cap = B.
+# Amendment C.6: the OH track runs through run_longsession (chains_to_longsession.py -> run_longsession.py); no pi, no cap iteration.
+# `home_run.py calibrate` is a cheap parity CHECK of `calibration_chains` sessions (default 1; probe asks only, nothing excluded).
+calibration_chains = 1
+calibration_seed = 20261026           # the check's session = first of the seeded order (same seed as the old calibration chain)
+session_concurrency = 1               # sessions in parallel in run_longsession (the host has an OOM history)
+extra_args  = []                      # appended to run_longsession.py (a protocol change if you alter boundaries / budgets!)
+# LEGACY (--legacy-replay only, Amendment C.4): the baseline summary cap is a CALIBRATED parity parameter of the pi replay.
 baseline_cap       = ""               # "1536:2010,1024:1340" per B, or a table { 1536 = 2010 }
 baseline_cap_scale = 0.0              # cap(B) = round(B * scale) for the B not in baseline_cap (0 = unset), e.g. 1.31
-calibration_max_iterations = 2        # max calibration runs per B (initial + retry at the runner's advice)
-calibration_seed = 20261026           # calibration chain = first of the seeded order (C.4-2); fixed before results
+calibration_max_iterations = 2        # (legacy) max calibration runs per B
 
 [beam]                                # Amendment C.2/C.3 long-session track: BEAM-1M, a seeded sample
 repo        = "~/data/BEAM"           # git clone https://github.com/mohammadtavakoli78/BEAM
