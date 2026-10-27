@@ -710,6 +710,12 @@ section-5 WIN / FAIL rule.
   `baseline` at 1536, which needs the opt-in sweep and is `n/a` without it; the `xspan_locator` stratum is descriptive). The long-session
   track evaluates them as its family L1 to L3 (L4 and L5, genuine multi-hop, have no data on OpenHands: `multi_session_reasoning` does not
   occur) with the long-session test metric (judge score; clean-anchor is reported alongside) and Holm over the fixed family of m = 5 (C.2).
+
+**C.6-3a (2026-10-27, owner decision, before any decision-set result).** On the OpenHands track the secondary family is restricted to
+the hypotheses that have data there: **L1-L3, Holm step-down over the fixed family of m = 3** at one-sided alpha 0.025 (judge score
+metric, NI score leg only, as in C.2). L4/L5 (genuine multi-hop, `multi_session_reasoning`) are not computed on OpenHands: they cannot
+occur there and would only cost power as n/a = p 1 members. The `xspan_locator` stratum stays descriptive. BEAM and Claude Code keep
+L1-L5 (m = 5). Implementation: `metrics_v2.py --ls-family oh` (default `full`); `home_run.py oh` passes it.
   The only consequence for OpenHands is that the correction is over 5, not over the 3 of the chain track; this is the price of one
   metrics path for all three tracks. `home_run oh` also writes the chain-track reading of the same records (`--track chains`: S1 to S3 on
   clean_anchor_hit, m = 3) as `REPORT-oh-chains-family.md`: it is DESCRIPTIVE and never replaces the L-family; when the two differ, the

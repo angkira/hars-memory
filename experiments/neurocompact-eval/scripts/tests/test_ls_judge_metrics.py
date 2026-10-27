@@ -123,6 +123,28 @@ class Pipeline(unittest.TestCase):
         _, weak = judge_v2.window_for(span, ["FIRSTFACT goes here", "nothing like this at all anywhere"])
         self.assertEqual(weak, "evidence_not_found")
 
+    def test_oh_family_is_l1_l3_holm_m3(self):
+        """Amendment C.6-3a: --ls-family oh -> fixed family L1-L3 (m = 3), no L4/L5,
+        xspan_locator kept as a descriptive stratum."""
+        judged, mapping = os.path.join(self.rundir, "judged.jsonl"), os.path.join(self.rundir, "map.json")
+        self.assertEqual(judge_run(self.ji, judged, mapping), 0)
+        md_path, js_path = os.path.join(self.rundir, "oh.md"), os.path.join(self.rundir, "oh.json")
+        old = sys.argv
+        sys.argv = ["metrics_v2.py", "--records", self.rec, "--judge", judged, "--mapping", mapping,
+                    "--judge-input", self.ji, "--out", md_path, "--json", js_path, "--boot", "300",
+                    "--ls-family", "oh"]
+        try:
+            self.assertEqual(quiet(M.main), 0)
+        finally:
+            sys.argv = old
+        sec = json.load(open(js_path))["secondary"]
+        self.assertEqual(sec["family"], list(M.LS_SECONDARY_IDS[:3]))
+        self.assertIn("over the fixed family of 3", sec["correction"])
+        self.assertNotIn("L4_msr_vs_baseline", sec["tests"])
+        self.assertNotIn("L5_msr_graph_vs_chunks", sec["tests"])
+        for d in M.DESCRIPTIVE_IDS:
+            self.assertIn(d, sec["descriptive"])
+
     def test_full_chain_export_judge_metrics(self):
         judged, mapping = os.path.join(self.rundir, "judged.jsonl"), os.path.join(self.rundir, "map.json")
         self.assertEqual(judge_run(self.ji, judged, mapping), 0)

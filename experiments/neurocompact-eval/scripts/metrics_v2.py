@@ -896,7 +896,7 @@ def h_graph_label(d_anchor: dict, d_score: dict) -> str:
 
 def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: int,
                      seed: int, n_sessions: int, primary_b: int = PRIMARY_B,
-                     track: str = "chains") -> dict:
+                     track: str = "chains", ls_family: str = "full") -> dict:
     """The pre-registered secondary family, Holm-corrected at one-sided ALPHA_ONE_SIDED.
     All tests use cluster bootstrap over sessions and the SAME metric (clean_anchor_hit; raw
     anchor_hit only on the loud fallback), except the non-inferiority tests, which are
@@ -905,7 +905,9 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
     track "chains" (Amendment C + C.2): S1-S3 (m = 3); S4d/S5d are DESCRIPTIVE contrasts on the
     xspan_locator stratum (the OpenHands "multihop" items) and never enter the correction.
     track "longsession" (C.2): L1-L5 (m = 5), genuine multi-hop = multi_session_reasoning;
-    knowledge_update / temporal_reasoning / contradiction_resolution strata are descriptive."""
+    knowledge_update / temporal_reasoning / contradiction_resolution strata are descriptive.
+    ls_family "oh" (Amendment C.6-3a): the OpenHands track has no multi_session_reasoning items, so its
+    fixed family is L1-L3 (m = 3); L4/L5 are not computed."""
     G, C, Bz = "nc-graph", "nc-chunks", "baseline"
     tests: dict[str, dict] = {}
     ls = track == "longsession"
@@ -956,7 +958,7 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
                         {"anchor": NI_MARGIN_ANCHOR, "score": NI_MARGIN_SCORE}),
         }
 
-    ids = LS_SECONDARY_IDS if ls else SECONDARY_IDS
+    ids = (LS_SECONDARY_IDS[:3] if ls_family == "oh" else LS_SECONDARY_IDS) if ls else SECONDARY_IDS
     p1 = ids[0]
     sup(p1, "H-graph: nc-graph - nc-chunks, B=1536, anchor, H0 delta<=0",
         (G, primary_b), (C, primary_b))
@@ -965,17 +967,18 @@ def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: in
     ni(ids[2], "token saving: nc-graph@512 non-inferior to baseline@1536",
        (G, 512), (Bz, primary_b))
     descriptive: list[str] = []
-    if ls:
+    if ls and len(ids) == 5:
         sup(ids[3], "genuine multi-hop (multi_session_reasoning): nc-graph - baseline, B=1536, anchor",
             (G, primary_b), (Bz, primary_b), qtypes=msr)
         sup(ids[4], "genuine multi-hop (multi_session_reasoning): nc-graph - nc-chunks, B=1536, anchor",
             (G, primary_b), (C, primary_b), qtypes=msr)
+    if ls:
         for qt in LS_DESCRIPTIVE_STRATA:
             tid = f"D_{qt}_vs_baseline"
             sup(tid, f"descriptive stratum {qt}: nc-graph - baseline, B=1536, anchor",
                 (G, primary_b), (Bz, primary_b), qtypes=(qt,))
             descriptive.append(tid)
-    else:
+    if not ls or ls_family == "oh":
         sup(DESCRIPTIVE_IDS[0], "DESCRIPTIVE xspan_locator stratum (OpenHands 'multihop'): "
             "nc-graph - baseline, B=1536, anchor", (G, primary_b), (Bz, primary_b),
             qtypes=(QT.XSPAN_LOCATOR,))
@@ -1473,6 +1476,9 @@ def _main() -> int:
     ap.add_argument("--track", choices=("auto", "chains", "longsession"), default="auto",
                     help="chains = run_chainreplay records; longsession = run_longsession records "
                          "(auto: longsession when records carry base_qid)")
+    ap.add_argument("--ls-family", choices=("full", "oh"), default="full",
+                    help="long-session secondary family: full = L1-L5 (m = 5, BEAM / Claude Code); "
+                         "oh = L1-L3 (m = 3, Amendment C.6-3a: OpenHands has no multi_session_reasoning)")
     ap.add_argument("--include-sid", default="", metavar="REGEX",
                     help="analysis set: only chain_id/sid matching REGEX (e.g. '^beam-1M-')")
     ap.add_argument("--exclude-sid", default="", metavar="REGEX")
@@ -1573,7 +1579,7 @@ def _main() -> int:
     sec = None
     if not legacy:
         sec = secondary_family(recs, anchor_key, args.cluster, args.boot, args.seed,
-                               n_sessions, primary_b, track)
+                               n_sessions, primary_b, track, args.ls_family)
     diag = {B: graph_diag(recs, B) for B in views} if not legacy else {}
     suspicious = [
         {"qid": r["qid"], "arm": r["arm"], "chain_id": r["chain_id"],

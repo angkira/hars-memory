@@ -2161,7 +2161,7 @@ def cmd_oh(camp: Campaign, args) -> int:
     xs = (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else [])
     camp.step("oh.metrics", lambda: metrics_step(
         camp, "oh.metrics", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-oh.md"),
-        os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only"] + xs))
+        os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only", "--ls-family", "oh"] + xs))
     # DESCRIPTIVE companion (Amendment C.6-3): the chain-track reading (S1-S3 on clean_anchor_hit, m = 3) of the same records
     camp.step("oh.metrics_chains", lambda: metrics_step(
         camp, "oh.metrics_chains", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-oh-chains-family.md"),
