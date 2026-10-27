@@ -140,8 +140,10 @@ class CampaignAndLedger(unittest.TestCase):
             self.assertTrue(os.path.exists(c.p(n)), n)
         self.assertEqual(open(os.path.join(self.d.name, ".homerun-current")).read(), c.path)
         self.assertTrue(os.path.isfile(c.p("scripts", "home_run.py")))
-        # a second invocation reuses it, --new does not
+        # no implicit resume: a second invocation without flags is a NEW campaign; --resume PATH reuses, --new is new
         c2 = H.open_campaign(self.cfg, H.build_parser().parse_args(["dry-run"]), "dry-run", echo=False)
+        self.assertNotEqual(c2.path, c.path)
+        c2 = H.open_campaign(self.cfg, H.build_parser().parse_args(["dry-run", "--resume", c.path]), "dry-run", echo=False)
         self.assertEqual(c2.path, c.path)
         c3 = H.open_campaign(self.cfg, H.build_parser().parse_args(["dry-run", "--new"]), "dry-run", echo=False)
         self.assertNotEqual(c3.path, c.path)
@@ -245,7 +247,12 @@ class Doctor(unittest.TestCase):
         self.assertEqual(rc, 0, so + se)
         self.assertIn("export HARS_MEMORY_EXTRACTOR_BASE_URL=https://api.anthropic.com/v1", so)
         self.assertIn("HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS=1", so)
-        camp = open(os.path.join(self.d.name, ".homerun-current")).read()
+        self.assertEqual(H.list_campaigns(self.d.name), [])                        # no target: no campaign is created
+        self.assertTrue(os.listdir(os.path.join(self.d.name, ".doctor")))
+        camp = H.open_campaign(self.cfg, H.build_parser().parse_args(["dry-run"]), "dry-run", echo=False).path
+        rc, so, se = quiet(H.main, ["--root", self.d.name, "--key-env", "HR_TEST_KEY", "doctor", "--resume", camp],
+                           probes=FakeProbes())
+        self.assertEqual(rc, 0, so + se)
         self.assertTrue(os.path.isfile(os.path.join(camp, "doctor.json")))
         rc, so, se = quiet(H.main, ["--root", self.d.name, "--key-env", "HR_TEST_KEY", "doctor"],
                            probes=FakeProbes(embedder="shim"))
@@ -360,7 +367,7 @@ class BeamEndToEnd(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.camp(), "dry-run.md")))
 
     def test_2_beam_runs_resumes_and_skips(self):
-        argv = self.base + ["beam", "--budgets", "1536", "--skip-judge"]
+        argv = self.base + ["beam", "--budgets", "1536", "--skip-judge", "--resume", self.camp()]   # test_1's campaign
         rc, so, se = quiet(H.main, argv)
         self.assertEqual(rc, 0, so + se)
         c = self.camp()
@@ -553,6 +560,9 @@ class OpenHandsFlow(unittest.TestCase):
     def run_oh(self, runner, extra=(), toml=None):
         # the oh track refuses without a calibration or an explicit cap (Amendment C.4): scale 1.0 = cap == B
         argv = self.base + (["--config", toml] if toml else []) + ["oh", "--legacy-replay", *(extra or ["--baseline-cap-scale", "1.0"])]
+        ptr = os.path.join(self.root, ".homerun-current")
+        if os.path.exists(ptr) and "--resume" not in argv:
+            argv += ["--resume", open(ptr).read()]               # no implicit resume: continue the campaign explicitly
         return quiet(H.main, argv, runner=runner)
 
     def toml(self, text):
@@ -655,7 +665,8 @@ class OpenHandsFlow(unittest.TestCase):
         self.assertEqual(len([e for e in led if e["phase"] == "run"]), 2)
         # a cap that is already spent refuses a new batch
         rc, so, se = quiet(H.main, ["--root", self.root, "--oh-dir", self.art, "--run-cap", "0.5", "--judge-cap", "9",
-                                    "--config", t, "oh", "--legacy-replay", "--baseline-cap-scale", "1.0", "--force-step", "oh.run.b1536-00", "--accept-partial"], runner=r)
+                                    "--config", t, "oh", "--legacy-replay", "--baseline-cap-scale", "1.0", "--force-step", "oh.run.b1536-00", "--accept-partial",
+                                    "--resume", self.camp()], runner=r)
         self.assertEqual(rc, 2)
         self.assertIn("spent", se)
 
@@ -675,7 +686,7 @@ class BundleTests(unittest.TestCase):
         self.d = tempfile.TemporaryDirectory()
         self.root = os.path.join(self.d.name, "root")
         cfg = H.load_config(None, {"general": {"artifact_root": self.root}})
-        self.camp = H.open_campaign(cfg, H.build_parser().parse_args(["bundle"]), "bundle", echo=False)
+        self.camp = H.open_campaign(cfg, H.build_parser().parse_args(["oh"]), "oh", echo=False)
         c = self.camp
         self.secret = "sk-ant-" + "a1B2c3D4" * 4                           # assembled at runtime
         self.env_secret = "tok_" + "Z9y8X7w6" * 3
@@ -710,7 +721,7 @@ class BundleTests(unittest.TestCase):
         self.d.cleanup()
 
     def pack(self, *extra):
-        rc, so, se = quiet(H.main, ["--root", self.root, "bundle", *extra])
+        rc, so, se = quiet(H.main, ["--root", self.root, "bundle", "--resume", self.camp.path, *extra])
         self.assertEqual(rc, 0, so + se)
         path = re.search(r"BUNDLE: (\S+)", so).group(1)
         with tarfile.open(path) as tf:
@@ -828,8 +839,7 @@ class SmokeOffline(unittest.TestCase):
             os.environ["HR_TEST_KEY3"] = "k-" + "SECRETVALUE" * 3
             root = os.path.join(d, "root")
             quiet(H.main, ["--root", root, "--key-env", "HR_TEST_KEY3", "doctor"], probes=FakeProbes())
-            camp = open(os.path.join(root, ".homerun-current")).read()
-            for dp, _, fns in os.walk(camp):
+            for dp, _, fns in os.walk(root):
                 for fn in fns:
                     p = os.path.join(dp, fn)
                     try:

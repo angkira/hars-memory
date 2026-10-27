@@ -123,7 +123,11 @@ class Base(unittest.TestCase):
         self.d.cleanup()
 
     def go(self, runner, *cmd, pre=()):
-        return thr.quiet(H.main, self.base + list(pre) + list(cmd), runner=runner)
+        argv = self.base + list(pre) + list(cmd)
+        ptr = os.path.join(self.root, ".homerun-current")
+        if os.path.exists(ptr) and "--new" not in argv and "--resume" not in argv:
+            argv += ["--resume", open(ptr).read()]           # no implicit resume any more: continue the campaign explicitly
+        return thr.quiet(H.main, argv, runner=runner)
 
     def camp(self):
         return open(os.path.join(self.root, ".homerun-current")).read()
@@ -354,7 +358,7 @@ class ParityCheck(Base):
     def test_a_pre_c6_calibration_is_void(self):
         r = LSFakeRunner()
         self.go(r, "dry-run", "--tracks", "oh") if False else None
-        thr.quiet(H.main, self.base + ["doctor", "--no-live"], probes=thr.FakeProbes())      # opens the campaign
+        thr.quiet(H.main, self.base + ["dry-run", "--tracks", "oh"], runner=r)               # opens the campaign
         H.write_json(os.path.join(self.camp(), "calibration.json"),
                      {"status": "pass", "amendment": "C.5", "caps": {"1536": 2010}, "excluded_from_decision_set": ["x"]})
         rc, so, se = self.go(r, "oh")

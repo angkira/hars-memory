@@ -668,6 +668,7 @@ class Hars:
         self.rcm = L.rc_require("mcp_call", "hars_recall", "hars_status")
         self.url, self.cs, self.rs = mcp_url, compact_sem, recall_sem
         self.ct, self.rt = compact_timeout, recall_timeout
+        self.run_tag = ""                      # set from --run-tag (a server lease tag); "" = do not send
 
     def health(self) -> dict:
         base = self.url.rsplit("/mcp", 1)[0]
@@ -678,9 +679,10 @@ class Hars:
 
     def compact(self, sid: str, summary: str, dropped: list[str], metadata: dict) -> dict:
         with self.cs:
-            return self.rcm.mcp_call(self.url, "memory_compact", {
-                "session_id": sid, "summary": summary, "dropped_context": dropped,
-                "metadata": metadata}, timeout=self.ct)
+            args = {"session_id": sid, "summary": summary, "dropped_context": dropped, "metadata": metadata}
+            if self.run_tag:
+                args["run_tag"] = self.run_tag
+            return self.rcm.mcp_call(self.url, "memory_compact", args, timeout=self.ct)
 
     def recall(self, sid: str, question: str, graph: bool) -> dict:
         with self.rs:
@@ -1398,6 +1400,8 @@ def parse_args(argv=None):
     ap.add_argument("--copy-inputs", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--json", action="store_true", help="dry-run: print the plan as JSON")
+    ap.add_argument("--run-tag", default="", help="HARS lease tag (home_run passes the campaign id when the server "
+                    "exposes memory_lease_acquire); sent as run_tag on memory_compact writes; empty = not sent")
     ap.add_argument("--fake-hars", action="store_true", help="offline HARS stand-in (tests / wiring checks)")
     a = ap.parse_args(argv)
     a.budgets = parse_budgets(a.mem_budgets)
@@ -1517,6 +1521,8 @@ def main(argv=None) -> int:
 def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
     compact_sem, recall_sem = threading.Semaphore(a.compact_concurrency), threading.Semaphore(a.recall_concurrency)
     hars = FakeHars() if a.fake_hars else Hars(a.mcp, compact_sem, recall_sem)
+    if not a.fake_hars:
+        hars.run_tag = a.run_tag or ""
     budget = None
     if a.provider != L.MOCK and a.budget_usd:
         budget = P.Budget(a.budget_usd)

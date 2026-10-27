@@ -39,8 +39,11 @@ campaign.json, MANIFEST.json, ledger.json (spend), steps/<step>.json (done marke
 oh/ beam/ cc/ holding the run dirs (samples/records/summary/run.log/inputs/scripts/MANIFEST.json of
 the underlying runners). Resumable and idempotent: re-running a subcommand skips finished steps
 (`--force-step NAME` redoes one), unfinished runs are resumed (`run_longsession --resume`) or moved
-aside (`*.failed-<UTC>`, never deleted). `--resume DIR|latest` picks the campaign; by default the last
-one is reused (pointer file `<root>/.homerun-current`), `--new` starts a fresh one.
+aside (`*.failed-<UTC>`, never deleted). NO implicit resume: a command that needs a campaign creates a NEW one
+(its path is printed); `--resume` = the newest by CREATION time (campaign.json created_utc, printed loudly),
+`--resume ID|PATH` = that one; `bundle` and `status` are read-only and require a target. One client per HARS:
+every step that writes to HARS takes `~/.cache/nc-eval/locks/<sha1(mcp url)>.lock` (`--force-shared-hars` to override).
+Paid steps refuse on a campaign made under another EVAL-VERSION or with a void calibration/caps.
 
 Caps (USD, hard): `[caps]` gen / run / judge in home_run.toml (placeholders 0 = unset; per track
 override in `[caps.oh]`, `[caps.beam]`, `[caps.cc]`) or --gen-cap/--run-cap/--judge-cap. A paid step
@@ -51,6 +54,8 @@ estimate of HARS extraction, judge = the blind judge. See HOME-RUNBOOK.md.
 from __future__ import annotations
 
 import argparse
+import atexit
+import calendar
 import glob
 import hashlib
 import json
@@ -333,6 +338,12 @@ class Campaign:
         self.runner = runner or subprocess_runner
         self.echo = echo
         self.force_steps: set[str] = set()
+        self.kind = ""
+        # guards (version/void check before paid steps, HARS lock + lease) run only with the real subprocess runner;
+        # tests inject a fake runner and switch them on explicitly
+        self.guards_enabled = runner is None or runner is subprocess_runner
+        self.lease_fn = None                    # tests: fake (tool, args) -> dict
+        self.lease: dict | None = None
         self.python = cfg["general"].get("python") or sys.executable
         for d in ("steps", "logs", "scripts", "inputs"):
             os.makedirs(os.path.join(self.path, d), exist_ok=True)
@@ -342,12 +353,14 @@ class Campaign:
         return os.path.join(self.path, *parts)
 
     # ---- manifest
-    def init_files(self, argv: list[str]) -> None:
+    def init_files(self, argv: list[str], kind: str = "") -> None:
         cj = self.p("campaign.json")
         data = read_json(cj, None)
         if data is None:
             data = {"created_utc": utc_iso(), "name": self.cfg["general"]["name"], "git_head": git_head(),
-                    "python": sys.version.split()[0], "invocations": []}
+                    "python": sys.version.split()[0], "invocations": [], "kind": kind or self.kind,
+                    "eval_version": HOME_RUN_VERSION}
+        data.setdefault("invocations", [])
         data["profile"] = self.cfg["general"]["profile"]
         data["mcp"] = self.cfg["general"]["mcp"]
         data["invocations"].append({"ts": utc_iso(), "argv": argv})
@@ -446,6 +459,13 @@ class Campaign:
     # ---- subprocess
     def run(self, step: str, argv: list[str], *, env: dict | None = None, isolated: bool = False,
             check: bool = True, cwd: str | None = None) -> tuple[int, str]:
+        script = os.path.basename(argv[0]) if argv else ""
+        dry = "--dry-run" in argv
+        offline = bool(self.cfg["general"].get("_offline")) or "--fake-hars" in argv
+        if script in PAID_SCRIPTS and not dry:
+            guard_spend(self, f"step {step}")                       # EVAL-VERSION / void calibration or caps
+        if self.guards_enabled and script in HARS_WRITER_SCRIPTS and not dry and not offline:
+            argv = self.hars_guard(argv)                            # one client per HARS (+ lease/run_tag)
         full = [self.python] + (["-I"] if isolated else []) + argv
         e = dict(os.environ)
         e.update(env or {})
@@ -456,6 +476,20 @@ class Campaign:
             raise HomeRunError(f"step '{step}' failed (exit {rc}); log: {self.p('logs', step + '.log')}. "
                                "Fix the cause and re-run the same subcommand: finished steps are skipped.")
         return rc, text
+
+    def hars_guard(self, argv: list[str]) -> list[str]:
+        """Lock this HARS endpoint for this process (refuses when another home_run holds it), try the server lease once
+        and hand run_longsession the lease tag as --run-tag."""
+        url = self.cfg["general"]["mcp"]
+        tag = os.path.basename(self.path)
+        GUARD_CTX["campaign"] = tag
+        acquire_hars_lock(url, tag)
+        if self.lease is None:
+            self.lease = try_server_lease(url, tag, call=self.lease_fn, force=GUARD_CTX["force_shared"])
+            print(f"[hars-lease] {self.lease['note']}")
+        if self.lease.get("active") and os.path.basename(argv[0]) == "run_longsession.py" and "--run-tag" not in argv:
+            argv = argv + ["--run-tag", self.lease["tag"]]
+        return argv
 
     def script(self, name: str) -> str:
         return os.path.join(BASE, name)
@@ -470,24 +504,119 @@ class Campaign:
         return None
 
 
+# ---------------------------------------------------------------------------
+# campaign selection (owner bug 2): NEVER an implicit resume
+# ---------------------------------------------------------------------------
+READ_ONLY_CMDS = ("bundle", "status")          # need an explicit target (--resume [ID|PATH])
+NOT_RESUMABLE_KINDS = ("smoke", "dry-run")      # `--resume` (newest) skips these throw-away campaigns
+_STAMP_RE = re.compile(r"^(\d{8}T\d{6}Z)-homerun-")
+
+
+def _parse_ts(s) -> float | None:
+    if not isinstance(s, str) or not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y%m%dT%H%M%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            return calendar.timegm(time.strptime(s, fmt)) if "%f" not in fmt else \
+                calendar.timegm(time.strptime(s.split(".")[0] + "Z", "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            continue
+    return None
+
+
+def campaign_created(path: str) -> float:
+    """Creation time of a campaign: campaign.json `created_utc`, else the UTC stamp in the dir name. NEVER mtime
+    (hand-touching an old campaign must not make it the newest)."""
+    ts = _parse_ts((read_json(os.path.join(path, "campaign.json"), None) or {}).get("created_utc"))
+    if ts is None:
+        m = _STAMP_RE.match(os.path.basename(path.rstrip("/")))
+        ts = _parse_ts(m.group(1)) if m else None
+    return ts if ts is not None else 0.0
+
+
+def list_campaigns(root: str) -> list[dict]:
+    """Campaign dirs under root (those holding campaign.json), newest CREATION first."""
+    out = []
+    if os.path.isdir(root):
+        for n in os.listdir(root):
+            pth = os.path.join(root, n)
+            cj = os.path.join(pth, "campaign.json")
+            if os.path.isdir(pth) and os.path.isfile(cj):
+                d = read_json(cj, {}) or {}
+                out.append({"path": pth, "name": n, "created": campaign_created(pth), "kind": d.get("kind") or "",
+                            "created_utc": d.get("created_utc") or ""})
+    out.sort(key=lambda c: (c["created"], c["name"]), reverse=True)
+    return out
+
+
+def fmt_campaigns(cs: list[dict], limit: int = 5) -> str:
+    return "\n".join(f"    {c['name']}  (created {c['created_utc'] or '?'}{', ' + c['kind'] if c['kind'] else ''})"
+                     for c in cs[:limit]) or "    (none)"
+
+
+def resolve_campaign(root: str, spec: str) -> str:
+    """`--resume` spec -> campaign dir. ''/'newest'/'latest' = newest by creation time (campaign.json created_utc,
+    throw-away smoke / dry-run campaigns skipped); otherwise a path, a name under root, or a unique name fragment."""
+    spec = (spec or "").strip()
+    cs = list_campaigns(root)
+    if spec in ("", "newest", "latest"):
+        cand = [c for c in cs if c["kind"] not in NOT_RESUMABLE_KINDS]
+        if not cand:
+            raise HomeRunError(f"--resume: no campaign to resume under {root}. Start one by running the command without "
+                               "--resume (it creates a new campaign and prints its path).")
+        return cand[0]["path"]
+    for cand in (spec, os.path.join(root, spec)):
+        if os.path.isdir(cand):
+            return os.path.abspath(cand)
+    hits = [c for c in cs if spec in c["name"]]
+    if len(hits) == 1:
+        return hits[0]["path"]
+    raise HomeRunError(f"--resume {spec!r}: " + ("matches several campaigns:\n" + fmt_campaigns(hits, 10) if hits
+                                                else f"no campaign dir {spec!r} (as a path or under {root}).\n  newest:\n"
+                                                + fmt_campaigns(cs)))
+
+
+def eval_version_file() -> str | None:
+    p = os.path.join(os.path.dirname(BASE), "EVAL-VERSION")
+    try:
+        with open(p) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 def open_campaign(cfg: dict, args, kind: str, runner=None, echo: bool = True) -> Campaign:
+    """Pick the campaign. Rules (owner bug 2, no implicit resume):
+      * `--resume` / `--resume newest`  = the newest campaign by CREATION time (loud message);
+      * `--resume ID|PATH`              = that campaign (also [general] campaign_dir);
+      * nothing                         = a NEW campaign (its path is printed) - except the read-only commands
+                                          (bundle, status), which refuse without an explicit target;
+      * `--new`                         = a new campaign even with --resume."""
     root = cfg["general"]["artifact_root"]
     os.makedirs(root, exist_ok=True)
     ptr = os.path.join(root, ".homerun-current")
-    path = getattr(args, "resume", None) or cfg["general"].get("campaign_dir") or ""
-    if path == "latest":
-        path = open(ptr).read().strip() if os.path.exists(ptr) else ""
-        if not path:
-            raise HomeRunError("--resume latest: no previous campaign (pointer file missing)")
-    if not path and kind != "smoke" and not getattr(args, "new", False) and os.path.exists(ptr):
-        cand = open(ptr).read().strip()
-        if cand and os.path.isdir(cand):
-            path = cand
-            print(f"[campaign] reusing the current campaign {cand} (--new starts a fresh one)")
-    if path:
+    spec = getattr(args, "resume", None)
+    if spec is None:
+        spec = cfg["general"].get("campaign_dir") or None
+    new = bool(getattr(args, "new", False))
+    path = ""
+    if spec is not None and not new:
+        path = resolve_campaign(root, spec)
         if not os.path.isdir(path):
             raise HomeRunError(f"campaign dir not found: {path}")
+        if spec in ("", "newest", "latest"):
+            cj = read_json(os.path.join(path, "campaign.json"), {}) or {}
+            print("\n" + "!" * 78 + f"\n[campaign] RESUMING the NEWEST campaign by creation time: {path}\n"
+                  f"            created {cj.get('created_utc', '?')} (not by modification time). Pass --resume <ID|PATH> to be explicit, "
+                  "--new to start fresh.\n" + "!" * 78)
+        else:
+            print(f"[campaign] resuming {path}")
+    elif kind in READ_ONLY_CMDS:
+        raise HomeRunError(f"`{kind}` is read-only and never guesses a campaign: name one. "
+                           f"--resume (newest by creation time) or --resume ID|PATH.\n  newest campaigns under {root}:\n"
+                           + fmt_campaigns(list_campaigns(root)))
     else:
+        prev = [c for c in list_campaigns(root) if c["kind"] not in NOT_RESUMABLE_KINDS]
         suffix = "-smoke" if kind == "smoke" else ""
         base = os.path.join(root, f"{utc_stamp()}-homerun-{cfg['general']['name']}{suffix}")
         path, n = base, 1
@@ -495,14 +624,209 @@ def open_campaign(cfg: dict, args, kind: str, runner=None, echo: bool = True) ->
             n += 1
             path = f"{base}-{n}"
         os.makedirs(path)
-        print(f"[campaign] new campaign {path}")
+        print(f"[campaign] NEW campaign {path}  (nothing is resumed implicitly)")
+        if prev and kind != "smoke":
+            print(f"[campaign] to continue an earlier one instead, re-run with --resume (newest: {prev[0]['name']}) "
+                  "or --resume ID|PATH")
     camp = Campaign(path, cfg, runner=runner, echo=echo)
+    camp.kind = kind
     camp.force_steps = set(getattr(args, "force_step", None) or [])
     if kind != "smoke":
-        with open(ptr, "w") as f:
+        with open(ptr, "w") as f:                   # informational only: never read back by open_campaign
             f.write(camp.path)
-    camp.init_files(sys.argv[1:] if sys.argv[1:] else [])
+    camp.init_files(sys.argv[1:] if sys.argv[1:] else [], kind=kind)
     return camp
+
+
+# ---------------------------------------------------------------------------
+# paid-step guard (owner bug 5): a campaign made under another EVAL-VERSION, or with a void calibration/caps, never spends
+# ---------------------------------------------------------------------------
+PAID_SCRIPTS = ("run_longsession.py", "run_chainreplay.py", "judge_v2.py", "gen_longsession_qa.py")
+HARS_WRITER_SCRIPTS = ("run_longsession.py", "run_chainreplay.py")
+
+
+def campaign_eval_version(camp_path: str) -> str | None:
+    """EVAL-VERSION the campaign was made under: campaign.json `eval_version`; campaigns created before that field
+    existed fall back to the HOME_RUN_VERSION of their own scripts/home_run.py copy."""
+    d = read_json(os.path.join(camp_path, "campaign.json"), {}) or {}
+    if d.get("eval_version"):
+        return str(d["eval_version"])
+    try:
+        with open(os.path.join(camp_path, "scripts", "home_run.py")) as f:
+            m = re.search(r'^HOME_RUN_VERSION\s*=\s*"([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def spend_blockers(camp: "Campaign") -> list[str]:
+    """Why this campaign must not spend (empty = fine). Pure reads."""
+    why: list[str] = []
+    code = HOME_RUN_VERSION
+    marker = eval_version_file()
+    if marker and marker != code:
+        why.append(f"this checkout is inconsistent: EVAL-VERSION {marker!r} != home_run.py {code!r} (stale/mixed copy)")
+    made = campaign_eval_version(camp.path)
+    if made != code:
+        why.append(f"the campaign was made under EVAL-VERSION {made or '(unknown)'!r}, the code is {code!r}: its "
+                   "calibration, caps and records belong to another protocol version")
+    cal = read_json(camp.p(CAL_FILE), None)
+    if cal:
+        want = "C.5" if getattr(camp, "legacy_replay", False) else "C.6"
+        if cal.get("void") is True or cal.get("status") == "void":
+            why.append(f"{CAL_FILE} is marked VOID ({cal.get('void_reason') or 'no reason recorded'})")
+        elif cal.get("amendment") != want:
+            why.append(f"{CAL_FILE} is from Amendment {cal.get('amendment') or '(none)'}, this "
+                       f"{'legacy ' if want == 'C.5' else ''}run needs {want} (a pre-{want} calibration counted other tokens "
+                       "or capped differently and is VOID)")
+        elif cal.get("eval_version") and cal["eval_version"] != code:
+            why.append(f"{CAL_FILE} was written under EVAL-VERSION {cal['eval_version']!r}, the code is {code!r}")
+    caps = read_json(camp.p("oh", "caps.json"), None)
+    if caps:
+        if caps.get("void") is True:
+            why.append("oh/caps.json is marked VOID")
+        elif caps.get("origin") == "calibration" and cal and cal.get("amendment") != "C.5" and getattr(camp, "legacy_replay", False):
+            why.append("oh/caps.json was frozen from a void (pre-C.5) calibration")
+    return why
+
+
+def guard_spend(camp: "Campaign", what: str) -> None:
+    why = spend_blockers(camp)
+    if why:
+        raise HomeRunError(f"refusing to spend on {what}: campaign {os.path.basename(camp.path)} is not valid for this code.\n  - "
+                           + "\n  - ".join(why) + "\n  Start a new campaign (run the command WITHOUT --resume, or add --new) "
+                                                 "after updating the checkout. Nothing was spent.")
+
+
+# ---------------------------------------------------------------------------
+# one client per HARS (owner bug 4): advisory lock file + optional server lease
+# ---------------------------------------------------------------------------
+def lock_dir() -> str:
+    return os.environ.get("NC_EVAL_LOCK_DIR") or os.path.expanduser("~/.cache/nc-eval/locks")
+
+
+def norm_mcp_url(url: str) -> str:
+    u = (url or "").strip().rstrip("/").lower()
+    return re.sub(r"//(localhost|\[::1\]|0\.0\.0\.0)(?=[:/])", "//127.0.0.1", u)
+
+
+def lock_path(url: str) -> str:
+    return os.path.join(lock_dir(), hashlib.sha1(norm_mcp_url(url).encode()).hexdigest() + ".lock")
+
+
+def pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+GUARD_CTX = {"force_shared": False, "campaign": ""}         # set by main(): --force-shared-hars, the campaign id
+_HELD_LOCKS: dict[str, dict] = {}
+
+
+def acquire_hars_lock(url: str, campaign: str = "", force: bool | None = None, argv: list[str] | None = None) -> str:
+    """Take the advisory lock of this HARS endpoint on this host. Re-entrant in-process; a dead holder's file is
+    stale and replaced; a live holder refuses (HomeRunError with its details) unless --force-shared-hars."""
+    force = GUARD_CTX["force_shared"] if force is None else force
+    campaign = campaign or GUARD_CTX["campaign"]
+    path = lock_path(url)
+    if path in _HELD_LOCKS:
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    info = {"pid": os.getpid(), "campaign": campaign, "started_at": utc_iso(), "mcp": url,
+            "argv": list(argv if argv is not None else sys.argv[1:])[:12]}
+    for _ in range(5):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            holder = read_json(path, None) or {}
+            if holder.get("pid") == os.getpid():
+                break
+            if not pid_alive(holder.get("pid")):
+                print(f"[hars-lock] stale lock of dead pid {holder.get('pid')} (campaign {holder.get('campaign')}) removed")
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            if force:
+                print(f"[hars-lock] --force-shared-hars: ignoring the lock held by pid {holder.get('pid')} "
+                      f"(campaign {holder.get('campaign')}, since {holder.get('started_at')}); two clients on one HARS "
+                      "can corrupt both runs (1 engine thread, queue 32, OOM history)", file=sys.stderr)
+                _HELD_LOCKS[path] = {**info, "forced": True}
+                return path
+            raise HomeRunError(
+                f"another home_run is already using this HARS ({url}): pid {holder.get('pid')}, campaign "
+                f"{holder.get('campaign') or '?'}, since {holder.get('started_at') or '?'}, command {holder.get('argv')}.\n"
+                f"  Two clients on one HARS corrupt both runs. Wait for it, or stop it, or (at your own risk) pass "
+                f"--force-shared-hars.  lock file: {path}")
+        else:
+            with os.fdopen(fd, "w") as f:
+                json.dump(info, f)
+            break
+    _HELD_LOCKS[path] = info
+    return path
+
+
+def release_hars_locks() -> None:
+    for path, info in list(_HELD_LOCKS.items()):
+        try:
+            if not info.get("forced") and (read_json(path, None) or {}).get("pid") == os.getpid():
+                os.remove(path)
+        except OSError:
+            pass
+        _HELD_LOCKS.pop(path, None)
+
+
+atexit.register(release_hars_locks)
+
+_LEASE_ABSENT = ("unknown tool", "no such tool", "not found", "unsupported", "not implemented", "method not found",
+                 "invalid tool", "tool not")
+
+
+def try_server_lease(url: str, tag: str, call=None, force: bool = False) -> dict:
+    """If the server exposes memory_lease_acquire, take a lease tagged with the campaign id. Tolerates its absence
+    (any transport/unknown-tool error = no lease, run goes on without run_tag). A live lease held by someone else
+    refuses unless --force-shared-hars. Returns {"active": bool, "tag": tag|None, "note": str}."""
+    if call is None:
+        def call(tool, args):
+            import run_chainreplay as rc  # noqa: PLC0415
+            return rc.mcp_call(url, tool, args, timeout=30)
+    try:
+        r = call("memory_lease_acquire", {"tag": tag, "owner": f"home_run:{os.getpid()}", "campaign": tag})
+    except Exception as e:  # noqa: BLE001  (absent tool, server down, old server: all tolerated)
+        return {"active": False, "tag": None, "note": f"no server lease ({type(e).__name__}: {str(e)[:80]})"}
+    if not isinstance(r, dict):
+        return {"active": False, "tag": None, "note": "no server lease (unexpected reply)"}
+    err = str(r.get("error") or "").lower()
+    if r.get("ok") is False or r.get("acquired") is False:
+        if err and any(s in err for s in _LEASE_ABSENT):
+            return {"active": False, "tag": None, "note": f"no server lease ({err[:80]})"}
+        if force:
+            return {"active": False, "tag": None, "note": f"server lease held by {r.get('holder') or '?'}; forced past it"}
+        raise HomeRunError(f"the HARS server lease is held by another client ({r.get('holder') or r.get('owner') or err[:120]}); "
+                           "wait for it or pass --force-shared-hars")
+    return {"active": True, "tag": r.get("run_tag") or tag, "note": f"server lease taken (run_tag {r.get('run_tag') or tag})"}
+
+
+def release_server_lease(url: str, tag: str, call=None) -> None:
+    try:
+        if call is None:
+            import run_chainreplay as rc  # noqa: PLC0415
+            rc.mcp_call(url, "memory_lease_release", {"tag": tag}, timeout=30)
+        else:
+            call("memory_lease_release", {"tag": tag})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # =============================================================================
@@ -821,30 +1145,114 @@ def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = 
 
 # (document, query, expected substring): the query shares NOT ONE word with its document (stopwords
 # included), so a lexical / hash bag-of-words embedder scores 0 and the recall comes back empty
+# Each probe document is a realistic, self-contained note of ~300-400 tokens (well above the server's 200-token
+# chunk minimum, so the chunker keeps it as its OWN chunk; three short sentences used to be merged into one
+# sub-minimum chunk that min_score 0.2 then dropped, so the probe reported 1/3 on a healthy embedder).
+# (document, query sharing no content word with the marker sentence, marker the recalled context must contain)
 SEMANTIC_PROBES = (
-    ("Automobile ignition failed overnight; depleted battery.",
-     "Why wouldn't the vehicle crank, accumulator exhausted?", "depleted battery"),
-    ("Bananas contain potassium and thrive on tropical plantations.",
-     "Which fruit supplies electrolytes, cultivated in warm equatorial farms?", "tropical plantations"),
-    ("Quarterly revenue increased twelve percent across Europe.",
-     "How much did sales grow in the European region each trimester?", "twelve percent"),
+    ("Postmortem: payments-ledger outage of 14 March. At 02:10 UTC the primary PostgreSQL volume reached 100 percent "
+     "utilisation and the service stopped accepting new transactions. The on-call engineer was paged at 02:14 by the "
+     "disk-usage alert, confirmed that the data directory had grown by 380 GB in nine days and traced the growth to "
+     "the write-ahead log archive job, which had been failing silently since 5 March because the credentials of the "
+     "object-storage bucket had been rotated without updating the job. Segments piled up locally instead of being "
+     "shipped away, so the volume filled. Mitigation: at 02:41 the team extended the volume by 500 GB, fixed the "
+     "credentials and let the archiver drain the backlog; the ledger accepted writes again at 02:52 and no committed "
+     "transaction was lost. Contributing factors: the archiver exit code was never monitored, the disk alert fired at "
+     "95 percent instead of 80, and the runbook did not mention the bucket credentials. Follow-ups: alert on archive "
+     "lag in minutes, lower the disk threshold to 80 percent, add the credential rotation to the secrets checklist, "
+     "and rehearse a full-disk recovery during the next game day. Owner of the follow-ups is the storage team, due "
+     "before the end of the quarter, with a status review at the next reliability meeting. Customer impact was limited "
+     "to 38 minutes of failed card payments; support sent a status note to the 212 affected merchants and finance "
+     "reconciled the retried transactions the same morning, without any manual refunds.",
+     "Why did the main database stop taking payments overnight, and which broken housekeeping task caused it?",
+     "write-ahead log archive job"),
+    ("Orchard notes, Elstar apple block, harvest week. The lower terrace of the orchard sits in a frost pocket: cold "
+     "air drains down the slope on clear still nights and collects between the windbreak hedge and the stone wall, so "
+     "the blossom there was scorched twice this spring while the upper rows were untouched. Fruit set on the lower "
+     "terrace was about a third of the upper terrace. The picking crew started at 07:00 on the upper rows, where the "
+     "sugar reading was 13.8 Brix and the starch iodine test showed an even pattern, and moved down only after lunch. "
+     "Bruising was kept low by using shallow crates and lining them with foam; pickers were told to roll the fruit "
+     "off the spur instead of pulling it. Pollination was helped by two hives of bees placed beside the crab apple "
+     "pollinator trees, which flower at the same time as Elstar. For next year the owner wants to prune the lower "
+     "rows more openly so that air moves through the canopy, plant a late-flowering cultivar in the frost pocket, and "
+     "test a wind machine, because covering the whole terrace with frost fleece costs too much labour. Storage: "
+     "the crop goes into the cold room at 1 degree Celsius with a controlled atmosphere for the winter market. The "
+     "packing shed grades the fruit by size and colour, sends the smallest apples to the juice press and keeps a "
+     "sample box from every row so that next season's pruning can be compared with the measured yield per tree.",
+     "Where on the farm do the flowers get killed by cold nights, and how did that change the crop?",
+     "frost pocket"),
+    ("Quarterly business review, EMEA region, third quarter. Revenue increased twelve percent compared with the same "
+     "quarter last year, reaching 41.6 million euros, driven mostly by Germany and the Nordics where two large "
+     "multi-year contracts started billing in July. The United Kingdom was flat after a pricing change delayed "
+     "renewals by about six weeks. Gross margin improved by 1.4 points to 68.2 percent because the hosting costs per "
+     "customer fell after the migration to the new data center. Net revenue retention was 112 percent, logo churn "
+     "was 2.1 percent, and the average deal size grew from 54 thousand to 61 thousand euros. The pipeline for the "
+     "next quarter stands at 3.1 times the target, with the strongest coverage in financial services and public "
+     "sector accounts. Risks: two public sector tenders have slipped into the following year, a currency swing of "
+     "five percent would remove roughly 0.8 million euros from reported revenue, and hiring for the support team is "
+     "three people behind plan. Decisions requested from leadership: approve four additional account executives for "
+     "the DACH market, confirm the discount policy for renewals above 100 thousand euros, and sign off the revised "
+     "forecast for the board meeting at the end of the month. The customer success team also reported "
+     "that onboarding time fell from 41 to 29 days after the template library was introduced, and that the partner "
+     "channel now sources roughly a fifth of all new logos in the region.",
+     "By how much did sales grow in the European territory during the latest three-month period?",
+     "twelve percent"),
 )
 SEMANTIC_MIN_HITS = 2
 
 
+def _scores_of(rec) -> list[float]:
+    """Best-effort retrieval scores from a memory_recall payload (any nesting; keys containing 'score')."""
+    out: list[float] = []
+
+    def walk(x, depth=0):
+        if depth > 6:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if "score" in str(k) and isinstance(v, (int, float)) and not isinstance(v, bool) \
+                        and not str(k).startswith("min_"):
+                    out.append(round(float(v), 3))
+                else:
+                    walk(v, depth + 1)
+        elif isinstance(x, list):
+            for v in x[:50]:
+                walk(v, depth + 1)
+    walk(rec)
+    return sorted(set(out), reverse=True)[:3]
+
+
 def deep_ingest_check(cfg: dict, probes: Probes) -> list[dict]:
-    """One tiny memory_compact -> entities > 0 (the :8305 trap: ok=true compactions with an empty
-    graph) AND a semantic recall probe: a paraphrase that shares NO word with the target sentence must
-    still retrieve it. memory_status does NOT identify the embedder reliably (it reports
-    HARS_MEMORY_EMBED_MODEL even when HARS_MEMORY_EMBED_PROVIDER=http serves another model, e.g. a
-    hash shim), so this behavioural probe is the real shim detector."""
+    """A throwaway session (`doctor-probe-<utc>`) gets THREE separate memory_compact documents of realistic length;
+    then (1) entities > 0 (the :8305 trap: ok=true compactions with an empty graph) and (2) a semantic recall
+    probe: per document, a paraphrase sharing no content word with the marker sentence must still retrieve it.
+    memory_status does NOT identify the embedder reliably (it reports HARS_MEMORY_EMBED_MODEL even when
+    HARS_MEMORY_EMBED_PROVIDER=http serves another model, e.g. a hash shim), so this behavioural probe is the real
+    shim detector. Isolation: the probe only ever writes to its own session id. In HARS_MEMORY_SESSION_MODE=split
+    (the generated env) that is a separate store under sessions/; in `subgraph` mode a compaction is indexed into
+    the MAIN graph, which the compact result reports (`mode`) and this check turns into a FAIL row."""
     url = cfg["general"]["mcp"]
-    sid = f"doctor-{utc_stamp()}"
+    acquire_hars_lock(url)                      # the probe writes to HARS: one client per endpoint
+    sid = f"doctor-probe-{utc_stamp()}"
     rows: list[dict] = []
     try:
-        probes.mcp(url, "memory_compact", {"session_id": sid, "summary": "GOAL\nverify ingest\nACTIVE STATE\n- ok",
-                                           "dropped_context": [d for d, _, _ in SEMANTIC_PROBES],
-                                           "metadata": {"source": "doctor"}}, 900)
+        modes = set()
+        for i, (doc, _, _) in enumerate(SEMANTIC_PROBES, 1):
+            r = probes.mcp(url, "memory_compact", {"session_id": sid, "summary": doc, "seq": i,
+                                                   "metadata": {"source": "doctor-probe", "probe_doc": i}}, 900)
+            if isinstance(r, dict) and r.get("ok") is False:
+                raise RuntimeError(f"memory_compact doc {i} ok=false: {str(r)[:160]}")
+            if isinstance(r, dict) and r.get("mode"):
+                modes.add(str(r["mode"]))
+        if "subgraph" in modes:
+            rows.append(check_row("hars.probe_isolation", "FAIL",
+                                  f"the server is in session mode 'subgraph': the doctor probe session {sid} was indexed "
+                                  "into the MAIN graph (doc ids session:" + sid + ":c1..c3). Remove them and run the "
+                                  "eval against a throwaway data dir with HARS_MEMORY_SESSION_MODE=split"))
+        else:
+            rows.append(check_row("hars.probe_isolation", "OK" if "split" in modes else "WARN",
+                                  f"probe session {sid} only (session mode {','.join(sorted(modes)) or 'not reported'}: "
+                                  "split = its own store under sessions/, the main index is untouched)"))
         st = probes.mcp(url, "memory_session_status", {"session_id": sid}, 60)
         ent = int((st or {}).get("entities") or 0)
         vec = (st or {}).get("vectors_indexed")
@@ -854,18 +1262,18 @@ def deep_ingest_check(cfg: dict, probes: Probes) -> list[dict]:
             rows.append(check_row("hars.deep_ingest", "FAIL", f"compact ok but entities={ent} vectors_indexed={vec}: the "
                                   "server's extractor/embedder path is dead (empty graph) - check HARS_MEMORY_EXTRACTOR_*"))
         hits, detail = 0, []
-        for _, q, want in SEMANTIC_PROBES:
+        for i, (_, q, want) in enumerate(SEMANTIC_PROBES, 1):
             rec = probes.mcp(url, "memory_recall", {"session_id": sid, "question": q, "top_k": 4}, 120)
             ok = want in str((rec or {}).get("context") or "")
             hits += ok
-            detail.append(f"{'hit' if ok else 'MISS'}:{want!r}")
+            detail.append(f"doc{i} {'hit' if ok else 'MISS'} {want!r} scores={_scores_of(rec)}")
         if hits >= SEMANTIC_MIN_HITS:
             rows.append(check_row("hars.semantic_probe", "OK", f"{hits}/{len(SEMANTIC_PROBES)} zero-overlap paraphrase queries "
-                                  "retrieved their sentence: the embedder is semantic"))
+                                  f"retrieved their document: the embedder is semantic ({'; '.join(detail)})"))
         else:
             rows.append(check_row("hars.semantic_probe", "FAIL",
-                                  f"only {hits}/{len(SEMANTIC_PROBES)} zero-overlap paraphrase queries retrieved their sentence "
-                                  f"({', '.join(detail)}): the embedder is lexical/hash-like (a shim?) or broken. NOT "
+                                  f"only {hits}/{len(SEMANTIC_PROBES)} zero-overlap paraphrase queries retrieved their "
+                                  f"document ({'; '.join(detail)}): the embedder is lexical/hash-like (a shim?) or broken. NOT "
                                   "decision-grade; start HARS with the real embedder (HARS_MEMORY_EMBED_*)"))
     except Exception as e:  # noqa: BLE001
         rows.append(check_row("hars.deep_ingest", "FAIL", f"{type(e).__name__}: {str(e)[:160]}"))
@@ -1704,7 +2112,7 @@ def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exc
     source_dir = pb.get("run_dir")
     pb_tok = (pb.get("iterations") or [{}])[-1]
     cal_out = {
-        "version": 2, "amendment": "C.5", "ts": utc_iso(), "track": "oh", "status": status, "chain_id": cal_ids[0],
+        "version": 2, "amendment": "C.5", "eval_version": HOME_RUN_VERSION, "ts": utc_iso(), "track": "oh", "status": status, "chain_id": cal_ids[0],
         "chain_ids": cal_ids, "calibration_chains": len(cal_ids),
         "tokenizer": (pb_tok or {}).get("tokenizer"), "tokenizer_native": (pb_tok or {}).get("tokenizer_native"),
         "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first k',
@@ -1760,7 +2168,8 @@ def oh_cap_plan(camp: Campaign, args, budgets: list[int]) -> dict:
         why = ("the calibration FAILED (see calibration.json; HOME-RUNBOOK.md 'calibration failed')"
                if cal else "there is no calibration yet")
         raise HomeRunError(f"oh refuses to run: {why}. The baseline cap is a calibrated parity parameter "
-                           "(Amendment C.4): run `home_run.py calibrate` first, or pass --baseline-cap "
+                           "(Amendment C.4): run `home_run.py calibrate` first (and then `oh --resume <that campaign>`; "
+                           "without --resume a NEW campaign is created), or pass --baseline-cap "
                            "1536:<cap> (or --baseline-cap-scale S / [oh] baseline_cap) explicitly.")
     rows = {}
     for B in budgets:
@@ -2064,7 +2473,7 @@ def run_oh_parity(camp: Campaign, *, budgets: list[int]) -> dict:
             why.append(f"B={B}: counted with {d['tokenizer']!r} (native=False): Amendment C.5 measures NATIVE tokens")
     pb = per_b.get(str(max(budgets, key=lambda b: (b == 1536, b)))) or {}
     spent = sum(e["usd"] for e in camp.ledger()["entries"] if e.get("step") == "oh.parity.run")
-    cal = {"version": 3, "amendment": "C.6", "mode": "parity-check", "ts": utc_iso(), "track": "oh",
+    cal = {"version": 3, "amendment": "C.6", "eval_version": HOME_RUN_VERSION, "mode": "parity-check", "ts": utc_iso(), "track": "oh",
            "status": "fail" if why else "pass", "stopped_because": why, "chain_id": ids[0], "chain_ids": ids,
            "parity_sessions": [f"parity-{i}"[:64] for i in ids], "budgets": budgets, "window": [PARITY_LO, PARITY_HI],
            "tokenizer": pb.get("tokenizer"), "tokenizer_native": pb.get("tokenizer_native"),
@@ -2104,6 +2513,11 @@ def oh_parity_gate(camp: Campaign, args, budgets: list[int]) -> dict | None:
         raise HomeRunError(f"oh refuses to use {camp.p(CAL_FILE)}: it is a pre-C.6 (pi replay, cap-iteration) calibration "
                            "and is VOID for the streaming runner. Start a new campaign (--new) or pass --skip-parity-check.")
     if not cal:
+        others = [c for c in list_campaigns(camp.cfg["general"]["artifact_root"]) if c["path"] != camp.path
+                  and (read_json(os.path.join(c["path"], CAL_FILE), {}) or {}).get("status") == "pass"]
+        print(f"[oh] {os.path.basename(camp.path)} has no {CAL_FILE}: running the cheap parity check now."
+              + (f" (An earlier campaign already holds a passing one: {others[0]['name']}; to reuse it, stop and re-run "
+                 f"`oh --resume {others[0]['name']}`.)" if others else ""))
         cal = run_oh_parity(camp, budgets=budgets)
     missing = [B for B in budgets if str(B) not in (cal.get("per_b") or {})]
     if missing:
@@ -2122,6 +2536,7 @@ def oh_parity_gate(camp: Campaign, args, budgets: list[int]) -> dict | None:
 def cmd_calibrate(camp: Campaign, args) -> int:
     if getattr(args, "legacy_replay", False):
         return cmd_calibrate_legacy(camp, args)
+    guard_spend(camp, "calibrate")
     cfg = camp.cfg
     if getattr(args, "check_sessions", None):
         cfg["oh"]["calibration_chains"] = int(args.check_sessions)
@@ -2133,6 +2548,7 @@ def cmd_calibrate(camp: Campaign, args) -> int:
 def cmd_oh(camp: Campaign, args) -> int:
     if getattr(args, "legacy_replay", False):
         return cmd_oh_legacy(camp, args)
+    guard_spend(camp, "oh")
     cfg = camp.cfg
     o = cfg["oh"]
     chains_path = oh_inputs(camp)
@@ -2217,6 +2633,7 @@ def ls_run_step(camp: Campaign, track: str, sessions: str, run_dir: str, budgets
 
 
 def cmd_beam(camp: Campaign, args) -> int:
+    guard_spend(camp, "beam")
     cfg = camp.cfg
     b = cfg["beam"]
     data = beam_import(camp)
@@ -2295,6 +2712,7 @@ def cc_discover_cmd(cfg: dict, args, *, input_fn=input, isatty=None, out=print) 
 
 def cmd_cc(camp: Campaign, args) -> int:
     import longsession as L  # noqa: PLC0415
+    guard_spend(camp, "cc")
     cfg = camp.cfg
     c = cfg["cc"]
     sel = cfg.get("_cc_selected")
@@ -2423,6 +2841,7 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
                                      "smoke": {"run": sm["run_cap_ls"], "judge": sm["judge_cap"]}},
                             "oh": {"budgets": [1536], "batch_chains": 1, "retries": 0}})
     camp = open_campaign(scfg, args, "smoke", runner=runner)
+    camp.legacy_replay = bool(getattr(args, "legacy_replay", False))
     probes = probes or Probes()
     results: list[dict] = []
     offline = bool(cfg["general"].get("_offline"))
@@ -2756,8 +3175,13 @@ def common_parser() -> argparse.ArgumentParser:
     c.add_argument("--gen-cap", type=float, default=S, help="hard USD cap for QA generation")
     c.add_argument("--run-cap", type=float, default=S, help="hard USD cap for runs (replay/compaction/answers + HARS estimate)")
     c.add_argument("--judge-cap", type=float, default=S, help="hard USD cap for judging")
-    c.add_argument("--resume", default=S, metavar="DIR|latest", help="campaign dir to continue")
-    c.add_argument("--new", action="store_true", default=S, help="start a fresh campaign instead of reusing the current one")
+    c.add_argument("--resume", nargs="?", const="newest", default=S, metavar="ID|PATH",
+                   help="continue a campaign: bare --resume = the NEWEST by creation time (campaign.json created_utc, not "
+                        "mtime; printed loudly), --resume ID|PATH = that one. Without it, a command that needs a campaign "
+                        "creates a NEW one; bundle / status refuse without a target")
+    c.add_argument("--new", action="store_true", default=S, help="start a fresh campaign (the default; overrides --resume)")
+    c.add_argument("--force-shared-hars", action="store_true", default=S,
+                   help="run although another home_run holds the lock of this HARS endpoint (unsafe: two clients on one HARS)")
     c.add_argument("--force-step", action="append", default=S, metavar="STEP", help="redo this finished step (repeatable)")
     c.add_argument("--oh-dir", default=S, help="the copied OpenHands artifact dir (holds chains.jsonl)")
     c.add_argument("--beam-repo", default=S, help="BEAM checkout (contains chats/)")
@@ -2842,6 +3266,8 @@ def build_parser() -> argparse.ArgumentParser:
             t.add_argument("--pick", type=int, default=None, metavar="N", help="choose candidate N of --find/--session-id (non-interactive)")
             t.add_argument("--projects-root", default=None, help="where transcripts live (default [cc] root = ~/.claude/projects)")
             t.add_argument("--top", type=int, default=15, help="--list: how many sessions")
+    sub.add_parser("status", parents=[common], help="read-only: campaigns under the artifact root, or (with --resume) one "
+                                                    "campaign's steps / spend / calibration / validity")
     b = sub.add_parser("bundle", parents=[common], help="tar.gz of what the analyst needs (redaction-scanned)")
     b.add_argument("--include-raw", action="store_true", help="also pack raw transcripts, session stores, judge input")
     b.add_argument("--no-redact", action="store_true", help="skip the redaction pass (scan report still written)")
@@ -2880,7 +3306,58 @@ def overrides_from_args(args) -> dict:
     return o
 
 
+def cmd_doctor(cfg: dict, args, probes: Probes, offline: bool, camp: Campaign | None) -> int:
+    tracks = tuple(t for t in args.tracks.split(",") if t)
+    rows = doctor_checks(cfg, probes, live=not args.no_live, deep=args.deep, tracks=tracks, offline=offline,
+                         legacy_replay=bool(getattr(args, "legacy_replay", False)))
+    tbl, _ = role_model_table(cfg)
+    rep_ = {"ts": utc_iso(), "version": HOME_RUN_VERSION, "role_models": tbl, "checks": rows}
+    if camp is not None:
+        write_json(camp.p("doctor.json"), rep_)
+    else:
+        dpath = os.path.join(cfg["general"]["artifact_root"], ".doctor", f"{utc_stamp()}-doctor.json")
+        write_json(dpath, rep_)
+        print(f"[doctor] no campaign targeted: report -> {dpath} (--resume ID|PATH to store it in a campaign)")
+    print(f"home_run {HOME_RUN_VERSION} @ {BASE}\n")
+    print("\n".join(tbl) + "\n")
+    rc = print_doctor(rows)
+    print("\n# HARS server LLM env for this profile (providers.py hars-env):")
+    print("\n".join(hars_env_block(cfg)))
+    if camp is not None:
+        camp.write_manifest()
+    return rc
+
+
+def cmd_status(cfg: dict, args) -> int:
+    root = cfg["general"]["artifact_root"]
+    spec = getattr(args, "resume", None)
+    if spec is None and not cfg["general"].get("campaign_dir"):
+        cs = list_campaigns(root)
+        print(f"campaigns under {root} (newest by creation first; nothing is modified):\n" + fmt_campaigns(cs, 20))
+        print("\nTarget one: home_run.py status --resume ID|PATH   (bare --resume = the newest)")
+        return 0
+    camp = Campaign(resolve_campaign(root, spec if spec is not None else cfg["general"]["campaign_dir"]), cfg, runner=None, echo=False)
+    led = camp.ledger()["totals"]
+    cal = read_json(camp.p(CAL_FILE), None)
+    steps = sorted(f[:-5] for f in os.listdir(camp.p("steps")) if f.endswith(".json"))
+    print(f"campaign {camp.path}\n  created {(read_json(camp.p('campaign.json'), {}) or {}).get('created_utc')}  "
+          f"EVAL-VERSION {campaign_eval_version(camp.path)} (code {HOME_RUN_VERSION})")
+    print(f"  steps done ({len(steps)}): {', '.join(steps) or '-'}")
+    print(f"  spend: {led or '-'}  (total {fmt_usd(sum(led.values()))})")
+    print(f"  calibration: {('%s (Amendment %s)' % (cal.get('status'), cal.get('amendment'))) if cal else 'none yet'}")
+    why = spend_blockers(camp)
+    print("  valid for spending: " + ("yes" if not why else "NO\n    - " + "\n    - ".join(why)))
+    return 0
+
+
 def main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
+    try:
+        return _main(argv, runner=runner, probes=probes)
+    finally:
+        release_hars_locks()
+
+
+def _main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = getattr(args, "config", None) or ("home_run.toml" if os.path.isfile("home_run.toml") else None)
     try:
@@ -2905,25 +3382,21 @@ def main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
         if args.cmd == "hars-env":
             print("\n".join(hars_env_block(cfg)))
             return 0
+        GUARD_CTX["force_shared"] = bool(getattr(args, "force_shared_hars", False))
+        GUARD_CTX["campaign"] = ""
+        if args.cmd == "status":
+            return cmd_status(cfg, args)
         if args.cmd == "smoke":
             return cmd_smoke(cfg, args, runner=runner, probes=probes)
+        if args.cmd == "doctor" and getattr(args, "resume", None) is None and not cfg["general"].get("campaign_dir"):
+            # no target: a doctor run is not a campaign; its report goes to <root>/.doctor/
+            return cmd_doctor(cfg, args, probes, offline, None)
         camp = open_campaign(cfg, args, args.cmd, runner=runner)
+        GUARD_CTX["campaign"] = os.path.basename(camp.path)
         camp.cfg = cfg
         camp.legacy_replay = bool(getattr(args, "legacy_replay", False))
         if args.cmd == "doctor":
-            tracks = tuple(t for t in args.tracks.split(",") if t)
-            rows = doctor_checks(cfg, probes, live=not args.no_live, deep=args.deep, tracks=tracks, offline=offline,
-                                 legacy_replay=camp.legacy_replay)
-            tbl, _ = role_model_table(cfg)
-            write_json(camp.p("doctor.json"), {"ts": utc_iso(), "version": HOME_RUN_VERSION, "role_models": tbl,
-                                               "checks": rows})
-            print(f"home_run {HOME_RUN_VERSION} @ {BASE}\n")
-            print("\n".join(tbl) + "\n")
-            rc = print_doctor(rows)
-            print("\n# HARS server LLM env for this profile (providers.py hars-env):")
-            print("\n".join(hars_env_block(cfg)))
-            camp.write_manifest()
-            return rc
+            return cmd_doctor(cfg, args, probes, offline, camp)
         if args.cmd == "dry-run":
             tracks = [t for t in args.tracks.split(",") if t]
             dry_run_report(camp, tracks)

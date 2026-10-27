@@ -133,7 +133,7 @@ behavioural paraphrase probe** (a tiny `memory_compact` + `memory_recall`; a has
 `memory_status` alone cannot be trusted: it reports `HARS_MEMORY_EMBED_MODEL` even when `HARS_MEMORY_EMBED_PROVIDER=http`
 serves a different model, see the findings in `HANDOFF.md`); the cents-level liveness ping of every profile model;
 the server's extractor/keyword model vs the profile; keys; **`tokcount.native` (Amendment C.5: one free `count_tokens` call on the answering model must succeed; FAIL = a run would be refused)**; free disk (pi 1.4.x and node only with `doctor --legacy-replay`); tiktoken; your inputs.
-Do not run two clients against the HARS engine at once (1 thread / queue 32 by design; the host has an OOM history).
+Do not run two clients against the HARS engine at once (1 thread / queue 32 by design; the host has an OOM history). home_run now enforces this (lock file per HARS endpoint, section 6.2).
 
 ## 4. Inputs
 
@@ -187,10 +187,46 @@ HR cc --find "TITLE"             # (or --session-id ID / --list): pick the sessi
 HR bundle                        # step 9
 ```
 Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export, judge later), `--retries N` (legacy replay only),
-`--skip-parity-check` / `--accept-parity-fail` (oh, recorded), `--check-sessions K` (calibrate), `--resume DIR|latest`, `--new`, `--force-step NAME`, `--accept-partial`. The judge is always the profile's judge
+`--skip-parity-check` / `--accept-parity-fail` (oh, recorded), `--check-sessions K` (calibrate), `--resume [ID|PATH]`, `--new`, `--force-step NAME`, `--accept-partial`, `--force-shared-hars`. The judge is always the profile's judge
 (`claude-sonnet-5-5`, same family as the Haiku agent, so `--allow-same-family-judge` is passed and the limitation is
 printed in every report, C.1-2). The vendor switch (OpenRouter / Gemini) is `--profile NAME` and a NEW decision set
 (C.1-4): never mix profiles or embedders inside one campaign.
+
+### 6.1 Which campaign does a command use? (NO implicit resume)
+
+Since 2026-10-27 home_run never attaches to "the last campaign" on its own (a `calibrate` used to silently join an old,
+hand-touched one). The rule:
+
+| you type | what happens |
+|---|---|
+| `HR calibrate` / `oh` / `beam` / `cc` / `dry-run` (no flag) | a **NEW** campaign is created and its path printed (`[campaign] NEW campaign ...`) |
+| `HR oh --resume` | the **newest campaign by creation time** (`campaign.json` `created_utc`, never mtime; smoke / dry-run campaigns are skipped), announced in a `!!!` banner |
+| `HR oh --resume 20261027T150000Z-homerun-home` (or a path, or a unique fragment of the name) | exactly that campaign |
+| `HR oh --resume --new` / `--new` | a new campaign (`--new` wins) |
+| `HR bundle`, `HR status` (read-only) | refuse without `--resume` and list the newest campaigns; `status` alone just lists them |
+| `HR doctor` | needs no campaign (report goes to `<root>/.doctor/`); `doctor --resume ID` stores `doctor.json` in that campaign |
+
+Put `--resume` AFTER the subcommand (`HR oh --resume`); before it, `--resume oh` would read `oh` as the campaign id.
+
+So the normal chain is: `HR calibrate` (prints the new campaign path) -> `HR oh --resume` (or `--resume <that id>`) -> `HR cc ... --resume`
+-> `HR bundle --resume`. `oh` in a NEW campaign has no `calibration.json` and runs its own cheap parity check first (it tells you if an earlier
+campaign already holds a passing one). `HR status --resume ID` prints created time, EVAL-VERSION, steps, spend, calibration state and whether the
+campaign may still spend.
+
+### 6.2 Safety guards on paid steps
+
+* **Void or foreign campaigns never spend.** Every paid step (run, judge, QA generation, calibrate, oh, beam, cc) first checks: the campaign's
+  `eval_version` (recorded in `campaign.json` at creation; older campaigns fall back to their own `scripts/home_run.py` copy) equals the code's
+  `EVAL-VERSION`; `EVAL-VERSION` file and `home_run.py` agree; `calibration.json` is of Amendment C.6 (C.5 for `--legacy-replay`), not marked
+  `void`, and written under this EVAL-VERSION; `oh/caps.json` is not void. Otherwise: `refusing to spend ... Start a new campaign`, nothing spent.
+* **One client per HARS.** Every step that writes to HARS (smoke, calibrate, oh, beam, cc, `doctor --deep`) takes an advisory lock
+  `~/.cache/nc-eval/locks/<sha1(mcp url)>.lock` (pid, campaign, start time; a dead pid = stale, replaced). A second `home_run` refuses and prints the holder.
+  `--force-shared-hars` overrides (at your own risk). If the server exposes `memory_lease_acquire` / `memory_lease_release`, home_run also takes a lease
+  tagged with the campaign id and sends it as `run_tag` on `memory_compact` writes (`run_longsession --run-tag`); an older server without the tools is tolerated.
+* **`doctor --deep` probe**: one throwaway session `doctor-probe-<UTC>` receives THREE separate realistic notes (~330 tokens each, above the
+  server's 200-token chunk minimum) via `memory_compact`; one zero-overlap paraphrase query per note; the row `hars.semantic_probe` lists per-note hit/MISS and
+  scores (>= 2 of 3 passes). Row `hars.probe_isolation` is OK only in `HARS_MEMORY_SESSION_MODE=split` (the generated env): in `subgraph` mode a compaction is indexed into the MAIN graph
+  and the row FAILS (remove `session:doctor-probe-*` docs and use a throwaway data dir).
 
 Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~2.3 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.

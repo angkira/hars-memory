@@ -268,6 +268,9 @@ class CalibrationFlow(unittest.TestCase):
 
     def go(self, runner, *cmd, toml=None):
         argv = self.base + ["--config", toml or self.toml] + [cmd[0], "--legacy-replay"] + list(cmd[1:])
+        ptr = os.path.join(self.root, ".homerun-current")
+        if os.path.exists(ptr) and "--new" not in argv and "--resume" not in argv:
+            argv += ["--resume", open(ptr).read()]           # no implicit resume any more: continue the campaign explicitly
         return thr.quiet(H.main, argv, runner=runner)
 
     def camp(self):

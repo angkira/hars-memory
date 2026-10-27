@@ -191,22 +191,60 @@ def _expand(paths) -> list[str]:
     return sorted(out)
 
 
-def load_sessions(paths) -> list[dict]:
-    """Sessions from .json (object | list) / .jsonl (one per line) files or directories."""
+def _sid_from(stem: str, idx: int, taken: set) -> str:
+    base = re.sub(r"[^A-Za-z0-9._-]", "-", stem).strip("-.") or "session"
+    sid = f"{base[:56]}-{idx}"
+    n = idx
+    while sid in taken:
+        n += 1
+        sid = f"{base[:56]}-{n}"
+    return sid[:64]
+
+
+def _is_session_like(d) -> bool:
+    return isinstance(d, dict) and isinstance(d.get("messages"), list)
+
+
+def load_sessions(paths, *, warn=None) -> list[dict]:
+    """Sessions from .json (object | list) / .jsonl (one per line) files or directories.
+
+    Robustness (owner bug 1: cc QA crashed with KeyError 'sid'):
+      * inside a DIRECTORY, files/lines that are not sessions (no "messages" list: qa-manifest-*.json,
+        qa-raw.jsonl, conversion manifests) are skipped, with one warning per file;
+      * a session without a valid "sid" gets a deterministic one `<file stem>-<index in file>` (recorded in
+        s["_sid_assigned"], with a warning), so every downstream `s["sid"]` is safe.
+    `warn(msg)` defaults to a stderr print."""
+    warn = warn or (lambda m: print(f"[load_sessions] {m}", file=sys.stderr))
     sessions: list[dict] = []
+    given = {os.path.abspath(p) for p in ([paths] if isinstance(paths, str) else list(paths)) if not os.path.isdir(p)}
     for fp in _expand(paths):
+        explicit = os.path.abspath(fp) in given
+        items: list = []
         with open(fp, encoding="utf-8") as f:
             if fp.endswith(".jsonl"):
-                for ln, line in enumerate(f, 1):
+                for line in f:
                     if line.strip():
-                        s = json.loads(line)
-                        s.setdefault("_path", fp)
-                        sessions.append(s)
+                        items.append(json.loads(line))
             else:
                 d = json.load(f)
-                for s in (d if isinstance(d, list) else [d]):
-                    s.setdefault("_path", fp)
-                    sessions.append(s)
+                items = d if isinstance(d, list) else [d]
+        stem = os.path.splitext(os.path.basename(fp))[0]
+        kept = [s for s in items if explicit or _is_session_like(s)]
+        if len(kept) < len(items):
+            warn(f"{fp}: skipped {len(items) - len(kept)} non-session record(s) (no 'messages' list)")
+        taken = {s["sid"] for s in kept if isinstance(s, dict) and isinstance(s.get("sid"), str)}
+        for i, s in enumerate(kept):
+            if not isinstance(s, dict):
+                continue
+            s.setdefault("_path", fp)
+            sid = s.get("sid")
+            if not isinstance(sid, str) or not SID_RE.match(sid):
+                new = _sid_from(stem, i, taken)
+                taken.add(new)
+                warn(f"{fp}[{i}]: session has no valid sid ({sid!r}); assigned {new!r}")
+                s["_sid_assigned"] = new
+                s["sid"] = new
+            sessions.append(s)
     return sessions
 
 

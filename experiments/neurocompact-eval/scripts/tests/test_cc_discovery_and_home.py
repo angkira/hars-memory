@@ -205,7 +205,8 @@ class HomeRunCc(Fixture):
         self.assertEqual(len(imported), 1)
         self.assertIn("redaction", so)
         # the same campaign refuses a different session
-        rc, so, se = quiet(H.main, ["--root", root, "cc", "--find", "cooking", "--projects-root", self.root])
+        rc, so, se = quiet(H.main, ["--root", root, "cc", "--find", "cooking", "--projects-root", self.root,
+                                       "--resume", camp])
         self.assertEqual(rc, 2)
         self.assertIn("--new", se)
 
