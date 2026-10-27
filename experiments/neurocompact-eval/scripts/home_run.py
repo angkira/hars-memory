@@ -778,6 +778,9 @@ def acquire_hars_lock(url: str, campaign: str = "", force: bool | None = None, a
 
 
 def release_hars_locks() -> None:
+    while _ACTIVE_LEASES:
+        url, tag, call = _ACTIVE_LEASES.pop()
+        release_server_lease(url, tag, call)
     for path, info in list(_HELD_LOCKS.items()):
         try:
             if not info.get("forced") and (read_json(path, None) or {}).get("pid") == os.getpid():
@@ -789,6 +792,8 @@ def release_hars_locks() -> None:
 
 atexit.register(release_hars_locks)
 
+LEASE_TTL_S = 259200                                   # 3 days (server clamps to 1..604800); released on exit
+_ACTIVE_LEASES: list = []
 _LEASE_ABSENT = ("unknown tool", "no such tool", "not found", "unsupported", "not implemented", "method not found",
                  "invalid tool", "tool not")
 
@@ -802,20 +807,22 @@ def try_server_lease(url: str, tag: str, call=None, force: bool = False) -> dict
             import run_chainreplay as rc  # noqa: PLC0415
             return rc.mcp_call(url, tool, args, timeout=30)
     try:
-        r = call("memory_lease_acquire", {"tag": tag, "owner": f"home_run:{os.getpid()}", "campaign": tag})
+        r = call("memory_lease_acquire", {"tag": tag, "ttl_s": LEASE_TTL_S})
     except Exception as e:  # noqa: BLE001  (absent tool, server down, old server: all tolerated)
         return {"active": False, "tag": None, "note": f"no server lease ({type(e).__name__}: {str(e)[:80]})"}
     if not isinstance(r, dict):
         return {"active": False, "tag": None, "note": "no server lease (unexpected reply)"}
     err = str(r.get("error") or "").lower()
-    if r.get("ok") is False or r.get("acquired") is False:
+    if r.get("error_kind") == "lease_held" or r.get("ok") is False or r.get("acquired") is False:
         if err and any(s in err for s in _LEASE_ABSENT):
             return {"active": False, "tag": None, "note": f"no server lease ({err[:80]})"}
+        holder = r.get("held_by") or r.get("holder") or err[:120]
         if force:
-            return {"active": False, "tag": None, "note": f"server lease held by {r.get('holder') or '?'}; forced past it"}
-        raise HomeRunError(f"the HARS server lease is held by another client ({r.get('holder') or r.get('owner') or err[:120]}); "
+            return {"active": False, "tag": None, "note": f"server lease held by {holder}; forced past it"}
+        raise HomeRunError(f"the HARS server lease is held by another client (tag {holder}, expires {r.get('expires_at') or '?'}); "
                            "wait for it or pass --force-shared-hars")
-    return {"active": True, "tag": r.get("run_tag") or tag, "note": f"server lease taken (run_tag {r.get('run_tag') or tag})"}
+    _ACTIVE_LEASES.append((url, tag, call))
+    return {"active": True, "tag": tag, "note": f"server lease taken (run_tag {tag}, ttl {LEASE_TTL_S}s)"}
 
 
 def release_server_lease(url: str, tag: str, call=None) -> None:

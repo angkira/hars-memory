@@ -371,10 +371,12 @@ class HarsLock(unittest.TestCase):
 
         def ok(tool, args):
             got.append((tool, args))
-            return {"ok": True, "run_tag": "tag-1"}
+            return {"ok": True, "held_by": "camp"}
         r = H.try_server_lease(self.url, "camp", call=ok)
-        self.assertEqual((r["active"], r["tag"]), (True, "tag-1"))
-        self.assertEqual(got[0][0], "memory_lease_acquire")
+        self.assertEqual((r["active"], r["tag"]), (True, "camp"))
+        self.assertEqual(got[0], ("memory_lease_acquire", {"tag": "camp", "ttl_s": H.LEASE_TTL_S}))
+        H.release_hars_locks()                                                   # the lease is released on exit
+        self.assertEqual(got[-1], ("memory_lease_release", {"tag": "camp"}))
 
         def absent(tool, args):
             return {"ok": False, "error": "Unknown tool: memory_lease_acquire"}
@@ -385,7 +387,7 @@ class HarsLock(unittest.TestCase):
         self.assertFalse(H.try_server_lease(self.url, "camp", call=boom)["active"])
 
         def held(tool, args):
-            return {"ok": False, "error": "lease held", "holder": "other-run"}
+            return {"ok": False, "error_kind": "lease_held", "held_by": "other-run", "expires_at": "x"}
         with self.assertRaises(H.HomeRunError):
             H.try_server_lease(self.url, "camp", call=held)
         self.assertFalse(H.try_server_lease(self.url, "camp", call=held, force=True)["active"])
@@ -395,10 +397,10 @@ class HarsLock(unittest.TestCase):
         camp = H.open_campaign(thr.cfg_for(self.d.name + "/root"), H.build_parser().parse_args(["oh"]), "oh",
                                runner=lambda full, *a: (calls.append(full) or (0, "")), echo=False)
         camp.guards_enabled = True
-        camp.lease_fn = lambda tool, args: {"ok": True, "run_tag": "tagX"}
+        camp.lease_fn = lambda tool, args: {"ok": True, "held_by": args.get("tag")}
         with contextlib.redirect_stdout(io.StringIO()):
             camp.run("run", [camp.script("run_longsession.py"), "--sessions", "x"], check=False)
-        self.assertEqual(calls[-1][-2:], ["--run-tag", "tagX"])
+        self.assertEqual(calls[-1][-2:], ["--run-tag", os.path.basename(camp.path)])
 
     def test_force_flag_parses(self):
         a = H.build_parser().parse_args(["oh", "--force-shared-hars"])
