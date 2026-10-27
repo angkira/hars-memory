@@ -30,6 +30,8 @@ required after indexing.
 | `memory_upsert_document` | Insert or update one document | No (extractor) | No |
 | `memory_delete_document` | Delete one document and its unshared entities | No (extractor) | Yes |
 | `memory_list_projects` | List knowledge base projects visible to the token | Yes | No |
+| `memory_lease_acquire` | Take the optional cooperative run lease (`tag`, `ttl_s`) | Yes | No |
+| `memory_lease_release` | Release the run lease held by `tag` | Yes | No |
 
 ---
 
@@ -570,3 +572,51 @@ error scenarios:
   graceful stub fallback raises `RuntimeError` with a clear message
 - **Legacy env prefix detected**: the server refuses to start if legacy env
   vars (e.g. `GRAPHRAG_*`) are set — see `HARS_MEMORY_LEGACY_ENV_PREFIXES`
+
+---
+
+## Run lease (optional, cooperative)
+
+Two eval clients pointed at one HARS instance silently share (and poison) one
+index. The run lease is an opt-in guard; with no lease held nothing changes.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `memory_lease_acquire` | `tag` (required), `ttl_s` (default 3600, clamped to 1..604800) | `ok:true, held_by, expires_at, expires_in_s, renewed` - or `ok:false, error_kind:"lease_held", held_by, expires_at` when a *different* unexpired tag holds it. The same tag renews. |
+| `memory_lease_release` | `tag` | `ok:true, released:true`; `ok:false, held_by, expires_at` if another tag holds it; `released:false` if nothing is held. |
+
+- The write tools (`memory_compact`, `memory_remember`, `memory_merge_session`,
+  `memory_upsert_document`) accept an optional `run_tag`. If a lease is active
+  and `run_tag` differs from the holder, the write **still happens** but the
+  response gets a `warning` field and the server logs a `lease mismatch` line.
+  Calls without `run_tag` are never warned about; no tool is ever hard-blocked.
+- The lease lives in memory in the engine process (one per engine shard) and
+  expires by TTL, so a crashed client cannot hold it forever.
+- `/healthz` shows `active_leases` (`[{tag, acquired_at, expires_at, expires_in_s}]`)
+  plus `lease_conflicts` / `lease_warnings` counters (per engine under
+  `engine_router.engines`, aggregated at the top level).
+
+## Job watchdog and orphan handling
+
+Blocking tool work (`memory_compact`, `memory_merge_session`, retrieval stages)
+runs on the engine pool's threads. A job that hangs used to hold its thread
+forever, so a one-thread pool stopped draining until a restart.
+
+- **Hard deadline**: `HARS_MEMORY_ENGINE_JOB_TIMEOUT_SECONDS` (default `900`,
+  `0` = off), measured from the moment a pool thread starts the job. On expiry
+  the caller gets `ok:false, error_kind:"job_timeout"`, the queue slot is
+  released, the executor is replaced with fresh threads (queued jobs are moved
+  over, not lost) and the stuck thread is leaked as a daemon (counted, reclaimed
+  if it ever returns). Session ingests also carry a cooperative deadline at 90%
+  of this value that cancels the async extraction cleanly first.
+- **Disconnected / timed-out caller**: a job that has not started is cancelled
+  and never runs; a running job cannot be interrupted, so it is left to finish
+  and its slot is released when the thread ends or at the deadline, whichever
+  comes first. No orphan holds a slot past the deadline.
+- `/healthz` fields: `jobs_timed_out`, `worker_restarts`, `current_job_age_s`
+  (oldest running job), and under `engine`: `job_timeout_s`, `leaked_threads`,
+  `orphans_cancelled`, `orphans_running`.
+- LLM/embedder calls also have a total wall-clock cap per attempt:
+  `HARS_MEMORY_LLM_HARD_TIMEOUT_SECONDS` (default 2x `HARS_MEMORY_LLM_TIMEOUT_SECONDS`)
+  and `HARS_MEMORY_EMBED_HTTP_HARD_TIMEOUT` (default 2x `HARS_MEMORY_EMBED_HTTP_TIMEOUT`);
+  `0` disables.

@@ -90,6 +90,7 @@ class _SimIngest:
         graph_storage: str | None = None,
         batch_size: int | None = None,
         embed_batch_size: int | None = None,
+        timeout_s: float | None = None,
     ) -> IngestResult:
         self.calls.append({
             "docs": list(docs),

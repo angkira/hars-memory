@@ -13,9 +13,9 @@ trivial ``/healthz`` probe took 265 ms).
 This module gives the retrieval path a **bounded** place to put that blocking
 work:
 
-* :class:`EnginePool` — a ``ThreadPoolExecutor`` with a configurable thread
+* :class:`EnginePool` — a daemon-thread executor with a configurable thread
   count *and* a bounded queue (a semaphore in front of the executor, because
-  ``ThreadPoolExecutor``'s own queue is unbounded). Saturation raises
+  an executor's own queue is unbounded). Saturation raises
   :class:`EngineOverloaded` instead of silently growing latency without limit.
 * :class:`LoopLagMonitor` — an asyncio task that samples its own scheduling
   delay; this is the direct measurement of "is the event loop free", exposed
@@ -46,6 +46,9 @@ env                                          default            meaning
 ``HARS_MEMORY_MCP_LOOP_LAG_INTERVAL_MS``     ``50``             loop-lag
                                                                 sampling
                                                                 period
+``HARS_MEMORY_ENGINE_JOB_TIMEOUT_SECONDS``   ``900``            hard per-job
+                                                                deadline (watchdog);
+                                                                ``0`` = off
 ===========================================  =================  ==============
 
 Concurrency model and its limits
@@ -61,13 +64,14 @@ curves and the honest limit.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import logging
 import os
+import queue
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 logger = logging.getLogger("memory.runtime")
@@ -77,6 +81,10 @@ ENV_ENGINE_QUEUE = "HARS_MEMORY_MCP_ENGINE_QUEUE"
 ENV_ENGINE_QUEUE_TIMEOUT_MS = "HARS_MEMORY_MCP_ENGINE_QUEUE_TIMEOUT_MS"
 ENV_ENGINE_STATS = "HARS_MEMORY_MCP_ENGINE_STATS"
 ENV_LOOP_LAG_INTERVAL_MS = "HARS_MEMORY_MCP_LOOP_LAG_INTERVAL_MS"
+#: Hard per-job deadline (seconds, measured from the moment a pool thread starts
+#: the job). ``0`` disables the watchdog. See :class:`EnginePool`.
+ENV_ENGINE_JOB_TIMEOUT_S = "HARS_MEMORY_ENGINE_JOB_TIMEOUT_SECONDS"
+DEFAULT_JOB_TIMEOUT_S = 900.0
 
 #: Rolling window used for the latency summaries in :meth:`EnginePool.stats`.
 _WINDOW = 256
@@ -125,6 +133,19 @@ def engine_queue_timeout_s() -> float:
     return max(0.1, _env_int(ENV_ENGINE_QUEUE_TIMEOUT_MS, 10_000) / 1000.0)
 
 
+def engine_job_timeout_s() -> float:
+    """Per-job hard deadline in seconds (``0`` = watchdog off)."""
+    raw = os.environ.get(ENV_ENGINE_JOB_TIMEOUT_S, "").strip()
+    if not raw:
+        return DEFAULT_JOB_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r; using %.0f", ENV_ENGINE_JOB_TIMEOUT_S, raw, DEFAULT_JOB_TIMEOUT_S)
+        return DEFAULT_JOB_TIMEOUT_S
+    return max(0.0, value)
+
+
 def _percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None
@@ -146,6 +167,129 @@ class EngineOverloaded(RuntimeError):
         )
 
 
+class JobTimeout(RuntimeError):
+    """A pool job exceeded its hard deadline and was abandoned by the watchdog."""
+
+    error_kind = "job_timeout"
+
+    def __init__(self, timeout_s: float, name: str = "") -> None:
+        self.timeout_s = timeout_s
+        self.job_name = name
+        super().__init__(
+            f"engine job {name or '<anonymous>'} exceeded its {timeout_s:.0f}s deadline "
+            f"and was abandoned (worker restarted)"
+        )
+
+
+class _DaemonExecutor:
+    """Minimal fixed-size thread executor whose threads are *daemons*.
+
+    ``concurrent.futures.ThreadPoolExecutor`` threads are joined at interpreter
+    exit, so one thread wedged in a hung call would also make the process
+    unkillable by a normal shutdown. This executor can be :meth:`abandon`-ed:
+    idle threads exit, a thread that is stuck in user code is left behind as a
+    daemon (leaked, counted, but it cannot block exit) and work that had not
+    started yet is handed back so it can be re-submitted to a fresh executor.
+    """
+
+    def __init__(self, max_workers: int, prefix: str) -> None:
+        self.max_workers = max_workers
+        self._prefix = prefix
+        self._q: queue.SimpleQueue[Any] = queue.SimpleQueue()
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._idle = 0
+        self.abandoned = False
+        self.shut = False
+
+    def submit(self, fn: Callable[[], Any]) -> "concurrent.futures.Future[Any]":
+        fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        self.submit_item((fut, fn))
+        return fut
+
+    def submit_item(self, item: tuple["concurrent.futures.Future[Any]", Callable[[], Any]]) -> None:
+        with self._lock:
+            if self.abandoned or self.shut:
+                raise RuntimeError("executor is closed")
+            self._q.put(item)
+            if self._idle == 0 and len(self._threads) < self.max_workers:
+                thread = threading.Thread(
+                    target=self._worker,
+                    name=f"{self._prefix}_{len(self._threads)}",
+                    daemon=True,
+                )
+                self._threads.append(thread)
+                thread.start()
+
+    def _worker(self) -> None:
+        while True:
+            with self._lock:
+                self._idle += 1
+            item = self._q.get()
+            with self._lock:
+                self._idle -= 1
+            if item is None or self.abandoned:
+                if item is not None:  # hand a not-yet-started item back
+                    self._q.put(item)
+                return
+            fut, fn = item
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn())
+            except BaseException as exc:  # noqa: BLE001 -- delivered via the future
+                fut.set_exception(exc)
+
+    def alive_threads(self) -> int:
+        return sum(1 for thread in self._threads if thread.is_alive())
+
+    def abandon(self) -> list[tuple["concurrent.futures.Future[Any]", Callable[[], Any]]]:
+        """Stop using this executor; return work that never started."""
+        with self._lock:
+            self.abandoned = True
+            pending: list[Any] = []
+            while True:
+                try:
+                    item = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    pending.append(item)
+            for _ in self._threads:
+                self._q.put(None)
+        return pending
+
+    def shutdown(self, wait: bool = True, timeout: float | None = None) -> None:
+        with self._lock:
+            self.shut = True
+            for _ in self._threads:
+                self._q.put(None)
+        if wait:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            for thread in list(self._threads):
+                thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+
+
+class _Job:
+    __slots__ = ("name", "executor", "cfut", "future", "started_at", "started_evt",
+                 "done_evt", "finished", "waiter_gone", "loop", "sem", "wait_ms", "timed_out")
+
+    def __init__(self, name: str, loop: asyncio.AbstractEventLoop) -> None:
+        self.name = name
+        self.loop = loop
+        self.executor: _DaemonExecutor | None = None
+        self.cfut: concurrent.futures.Future[Any] | None = None
+        self.future: asyncio.Future[Any] = loop.create_future()
+        self.started_at: float | None = None
+        self.started_evt = asyncio.Event()
+        self.done_evt = asyncio.Event()
+        self.finished = False  # slot released + counters settled (idempotent)
+        self.waiter_gone = False
+        self.timed_out = False
+        self.wait_ms = 0.0
+        self.sem: asyncio.Semaphore | None = None
+
+
 class EnginePool:
     """Bounded thread pool for the synchronous parts of a recall.
 
@@ -160,15 +304,26 @@ class EnginePool:
         workers: int | None = None,
         queue_limit: int | None = None,
         queue_timeout_s: float | None = None,
+        job_timeout_s: float | None = None,
     ) -> None:
         self.workers = engine_threads() if workers is None else max(0, workers)
+        self.job_timeout_s = (
+            engine_job_timeout_s() if job_timeout_s is None else max(0.0, job_timeout_s)
+        )
         self.queue_limit = (
             engine_queue_limit(self.workers) if queue_limit is None else max(0, queue_limit)
         )
         self.queue_timeout_s = (
             engine_queue_timeout_s() if queue_timeout_s is None else queue_timeout_s
         )
-        self._executor: ThreadPoolExecutor | None = None
+        self._executor: _DaemonExecutor | None = None
+        self._abandoned: list[_DaemonExecutor] = []
+        self._jobs: set[_Job] = set()
+        self._watchers: set[asyncio.Task[None]] = set()
+        self.jobs_timed_out = 0
+        self.worker_restarts = 0
+        self.orphans_cancelled = 0
+        self.orphans_running = 0
         self._executor_lock = threading.Lock()
         # One semaphore per running loop: the same process may host several
         # loops (uvicorn worker, TestClient portal, a benchmark harness) and
@@ -187,20 +342,21 @@ class EnginePool:
 
     # -- pool -------------------------------------------------------------
 
-    def _get_executor(self) -> ThreadPoolExecutor:
-        if self._executor is None:
+    def _get_executor(self) -> _DaemonExecutor:
+        executor = self._executor
+        if executor is None or executor.abandoned:
             with self._executor_lock:
-                if self._executor is None:
-                    self._executor = ThreadPoolExecutor(
-                        max_workers=max(1, self.workers),
-                        thread_name_prefix="hars-mcp-engine",
-                    )
+                executor = self._executor
+                if executor is None or executor.abandoned:
+                    executor = _DaemonExecutor(max(1, self.workers), "hars-mcp-engine")
+                    self._executor = executor
                     logger.info(
-                        "MCP engine pool started: %d threads, queue limit %d",
+                        "MCP engine pool started: %d threads, queue limit %d, job timeout %.0fs",
                         self.workers,
                         self.queue_limit,
+                        self.job_timeout_s,
                     )
-        return self._executor
+        return executor
 
     def _slots_for_loop(self) -> asyncio.Semaphore:
         loop = asyncio.get_running_loop()
@@ -212,7 +368,26 @@ class EnginePool:
         return entry[1]
 
     async def run(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-        """Run ``fn(*args, **kwargs)`` in the pool (or inline when disabled)."""
+        """Run ``fn(*args, **kwargs)`` in the pool (or inline when disabled).
+
+        Failure containment (the wedge fix):
+
+        * **Hard deadline.** A job that is still running ``job_timeout_s``
+          after a pool thread picked it up is declared dead by a watchdog: its
+          caller gets :class:`JobTimeout` (``error_kind == "job_timeout"``), its
+          queue slot / inflight count is released, and the executor is
+          *abandoned and replaced* so queued work drains on fresh threads. A
+          Python thread cannot be killed, so the stuck one is leaked (daemon,
+          counted in ``leaked_threads``) rather than left holding the pool.
+        * **Disconnected caller.** If the awaiting task is cancelled (client
+          timeout / disconnect) a job that has not started yet is cancelled
+          outright and never runs; a job already running cannot be interrupted,
+          so it is left to finish -- its slot is released when the thread
+          really ends, or by the watchdog at the deadline, whichever is first.
+          Either way an orphan cannot hold a slot past the deadline.
+
+        ``workers == 0`` (inline) has no watchdog: the call runs on the loop.
+        """
         if self.workers == 0:
             return fn(*args, **kwargs)
 
@@ -227,30 +402,143 @@ class EnginePool:
             ) from None
         wait_ms = (time.perf_counter() - queued_at) * 1000.0
 
+        loop = asyncio.get_running_loop()
+        job = _Job(getattr(fn, "__qualname__", None) or repr(fn), loop)
+        job.sem = self._slots_for_loop()
+        job.wait_ms = wait_ms
         with self._lock:
             self.submitted += 1
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
+            self._jobs.add(job)
 
-        started = time.perf_counter()
+        def _thread_body() -> Any:
+            job.started_at = time.monotonic()
+            try:
+                loop.call_soon_threadsafe(job.started_evt.set)
+            except RuntimeError:  # loop closed while queued
+                pass
+            return fn(*args, **kwargs)
+
         try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                self._get_executor(), functools.partial(fn, *args, **kwargs)
-            )
-            return result
+            executor = self._get_executor()
+            job.executor = executor
+            job.cfut = executor.submit(_thread_body)
         except BaseException:
-            with self._lock:
-                self.failed += 1
+            self._finish(job, failed=True)
             raise
-        finally:
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            with self._lock:
-                self.completed += 1
-                self.inflight -= 1
-                self._queue_wait_ms.append(wait_ms)
-                self._run_ms.append(elapsed_ms)
-            self._slots_for_loop().release()
+        job.cfut.add_done_callback(lambda fut: self._cfut_done(job, fut))
+        if self.job_timeout_s > 0:
+            watcher = loop.create_task(self._watch(job, self.job_timeout_s), name="mcp-job-watchdog")
+            self._watchers.add(watcher)
+            watcher.add_done_callback(self._watchers.discard)
+        try:
+            return await job.future
+        except asyncio.CancelledError:
+            job.waiter_gone = True
+            if job.cfut.cancel():  # never started: it will never run
+                with self._lock:
+                    self.orphans_cancelled += 1
+            else:
+                with self._lock:
+                    self.orphans_running += 1
+                logger.warning(
+                    "caller of engine job %s went away while it runs; slot is held "
+                    "until it ends or the %.0fs deadline",
+                    job.name,
+                    self.job_timeout_s,
+                )
+            raise
+
+    # -- job lifecycle (all on the owning loop) ----------------------------
+
+    def _cfut_done(self, job: _Job, fut: "concurrent.futures.Future[Any]") -> None:
+        try:
+            job.loop.call_soon_threadsafe(self._on_cfut_done, job, fut)
+        except RuntimeError:  # loop closed: nothing left to release into
+            pass
+
+    def _on_cfut_done(self, job: _Job, fut: "concurrent.futures.Future[Any]") -> None:
+        job.started_evt.set()
+        job.done_evt.set()
+        if job.finished:  # watchdog already abandoned it; late result is dropped
+            if job.timed_out:
+                logger.info("abandoned engine job %s finally ended (thread reclaimed)", job.name)
+            return
+        failed = fut.cancelled() or fut.exception() is not None
+        self._finish(job, failed=failed)
+        if job.future.done():
+            return
+        if fut.cancelled():
+            job.future.cancel()
+        elif fut.exception() is not None:
+            job.future.set_exception(fut.exception())  # type: ignore[arg-type]
+        else:
+            job.future.set_result(fut.result())
+
+    def _finish(self, job: _Job, *, failed: bool) -> None:
+        """Settle counters and release the queue slot exactly once."""
+        if job.finished:
+            return
+        job.finished = True
+        started = job.started_at
+        elapsed_ms = (time.monotonic() - started) * 1000.0 if started is not None else 0.0
+        with self._lock:
+            if failed:
+                self.failed += 1
+            self.completed += 1
+            self.inflight -= 1
+            self._jobs.discard(job)
+            self._queue_wait_ms.append(job.wait_ms)
+            self._run_ms.append(elapsed_ms)
+        job.sem.release()
+
+    async def _watch(self, job: _Job, timeout_s: float) -> None:
+        await job.started_evt.wait()
+        try:
+            await asyncio.wait_for(job.done_evt.wait(), timeout_s)
+        except (asyncio.TimeoutError, TimeoutError):
+            self._on_timeout(job, timeout_s)
+
+    def _on_timeout(self, job: _Job, timeout_s: float) -> None:
+        if job.finished:
+            return
+        job.timed_out = True
+        with self._lock:
+            self.jobs_timed_out += 1
+        logger.error(
+            "engine job %s exceeded %.0fs (waiter_gone=%s): releasing its slot and "
+            "restarting the worker pool",
+            job.name, timeout_s, job.waiter_gone,
+        )
+        self._finish(job, failed=True)
+        if not job.future.done():
+            job.future.set_exception(JobTimeout(timeout_s, job.name))
+        if job.cfut is not None:
+            job.cfut.cancel()
+        self._restart_executor(job.executor)
+
+    def _restart_executor(self, old: _DaemonExecutor | None) -> None:
+        if old is None or old.abandoned:
+            return
+        pending = old.abandon()
+        with self._executor_lock:
+            if self._executor is old:
+                self._executor = None
+            self._abandoned = [ex for ex in self._abandoned if ex.alive_threads()]
+            self._abandoned.append(old)
+        with self._lock:
+            self.worker_restarts += 1
+        fresh = self._get_executor()
+        for item in pending:  # work that never started moves to the new threads
+            fresh.submit_item(item)
+        logger.warning(
+            "engine pool restarted (restart #%d); %d leaked thread(s), %d queued job(s) moved",
+            self.worker_restarts, self.leaked_threads(), len(pending),
+        )
+
+    def leaked_threads(self) -> int:
+        return sum(ex.alive_threads() for ex in self._abandoned)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -267,6 +555,13 @@ class EnginePool:
                 "overloads": self.overloads,
                 "inflight": self.inflight,
                 "max_inflight": self.max_inflight,
+                "job_timeout_s": self.job_timeout_s,
+                "jobs_timed_out": self.jobs_timed_out,
+                "worker_restarts": self.worker_restarts,
+                "leaked_threads": self.leaked_threads(),
+                "orphans_cancelled": self.orphans_cancelled,
+                "orphans_running": self.orphans_running,
+                "current_job_age_s": self._current_job_age_s(),
                 "queue_wait_ms": {
                     "p50": _percentile(waits, 0.50),
                     "p95": _percentile(waits, 0.95),
@@ -279,11 +574,17 @@ class EnginePool:
                 },
             }
 
+    def _current_job_age_s(self) -> float | None:
+        """Age of the oldest job a pool thread is running right now."""
+        now = time.monotonic()
+        ages = [now - job.started_at for job in self._jobs if job.started_at is not None]
+        return round(max(ages), 1) if ages else None
+
     async def aclose(self) -> None:
         executor = self._executor
         self._executor = None
         if executor is not None:
-            await asyncio.to_thread(executor.shutdown, True)
+            await asyncio.to_thread(executor.shutdown, True, 5.0)
             logger.info("MCP engine pool stopped")
 
     def shutdown(self) -> None:
@@ -397,7 +698,10 @@ def runtime_health() -> dict[str, Any]:
     """Engine + loop-lag block for ``/healthz`` (empty when stats are off)."""
     if not stats_enabled():
         return {}
+    from hars_memory.run_lease import get_lease_registry
+
     block: dict[str, Any] = {"engine": get_engine().stats()}
+    block.update(get_lease_registry().health())
     if _LOOP_MONITOR is not None:
         block["loop"] = _LOOP_MONITOR.stats()
     return block
@@ -423,6 +727,8 @@ async def run_blocking(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> 
 
 
 __all__ = [
+    "DEFAULT_JOB_TIMEOUT_S",
+    "ENV_ENGINE_JOB_TIMEOUT_S",
     "ENV_ENGINE_QUEUE",
     "ENV_ENGINE_QUEUE_TIMEOUT_MS",
     "ENV_ENGINE_STATS",
@@ -430,9 +736,11 @@ __all__ = [
     "ENV_LOOP_LAG_INTERVAL_MS",
     "EngineOverloaded",
     "EnginePool",
+    "JobTimeout",
     "LoopLagMonitor",
     "configure_engine",
     "default_threads",
+    "engine_job_timeout_s",
     "engine_queue_limit",
     "engine_threads",
     "get_engine",

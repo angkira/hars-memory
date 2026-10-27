@@ -85,6 +85,8 @@ TOOL_SCOPES: Final[dict[str, str]] = {
     "memory_list_projects": SCOPE_READ,
     "memory_remember": SCOPE_WRITE,
     "memory_compact": SCOPE_WRITE,
+    "memory_lease_acquire": SCOPE_WRITE,
+    "memory_lease_release": SCOPE_WRITE,
     "memory_merge_session": SCOPE_WRITE,
     "memory_upsert_document": SCOPE_WRITE,
     "memory_delete_document": SCOPE_ADMIN,

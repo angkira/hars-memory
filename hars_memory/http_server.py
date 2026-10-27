@@ -367,6 +367,25 @@ def _health_payload(provider: OAuthProvider) -> dict[str, Any]:
         warm = bool(healthy) and all(item.get("index_warm") for item in healthy)
         seconds = [item.get("warmup_seconds") for item in healthy if item.get("warmup_seconds")]
         warmup_seconds = max(seconds) if seconds else None
+    local = runtime_health()
+    # Flat watchdog/lease summary: from the engines in split mode (that is where
+    # jobs run and leases live), from this process otherwise.
+    sources = (
+        [item for item in (engines or {}).get("engines", {}).values() if "error" not in item]
+        if router is not None
+        else [local]
+    )
+    ages = [
+        (item.get("engine") or {}).get("current_job_age_s")
+        for item in sources
+        if (item.get("engine") or {}).get("current_job_age_s") is not None
+    ]
+    watchdog = {
+        "jobs_timed_out": sum((item.get("engine") or {}).get("jobs_timed_out", 0) for item in sources),
+        "worker_restarts": sum((item.get("engine") or {}).get("worker_restarts", 0) for item in sources),
+        "current_job_age_s": max(ages) if ages else None,
+        "active_leases": [lease for item in sources for lease in item.get("active_leases", [])],
+    }
     return {
         "status": "ok",
         "mode": mode_from_env(),
@@ -377,7 +396,8 @@ def _health_payload(provider: OAuthProvider) -> dict[str, Any]:
         "oauth": provider.enabled,
         "oauth_store": getattr(provider.store, "kind", None),
         "engine_router": engines,
-        **runtime_health(),
+        **local,
+        **watchdog,
     }
 
 

@@ -73,6 +73,16 @@ from hars_memory.ingest.document import (
     build_source_header,
 )
 
+def _ingest_deadline_s() -> float | None:
+    """Cooperative ingest deadline: 90% of the pool's hard job deadline, so the
+    async work is cancelled cleanly *before* the watchdog has to abandon the
+    worker thread. ``None`` when the watchdog is disabled."""
+    from hars_memory.mcp_runtime import engine_job_timeout_s
+
+    hard = engine_job_timeout_s()
+    return hard * 0.9 if hard > 0 else None
+
+
 logger = logging.getLogger(__name__)
 
 MODE_ENV = "HARS_MEMORY_SESSION_MODE"
@@ -440,6 +450,7 @@ class SessionMemoryStore:
                 index_dir=target_dir,
                 batch_size=self.index_bs,
                 embed_batch_size=self.index_bs,
+                timeout_s=_ingest_deadline_s(),
                 **self._storage_kwargs(),
             )
             if result.errors:
@@ -643,6 +654,7 @@ class SessionMemoryStore:
             embed_batch_size=self.index_bs,
             vector_storage=None,
             graph_storage=None,
+            timeout_s=_ingest_deadline_s(),
         )
         if result.errors:
             raise RuntimeError("; ".join(result.errors))

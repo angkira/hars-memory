@@ -415,6 +415,11 @@ def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
     _explicit_http_model = os.environ.get("HARS_MEMORY_EMBED_HTTP_MODEL", "").strip()
     http_model = _explicit_http_model or model_name
     timeout = float(os.environ.get("HARS_MEMORY_EMBED_HTTP_TIMEOUT", "60"))
+    # Total wall-clock cap per embedding request (httpx's own timeout is per
+    # socket operation). Default 2x; 0 disables.
+    hard_timeout = float(
+        os.environ.get("HARS_MEMORY_EMBED_HTTP_HARD_TIMEOUT", str(2 * timeout))
+    )
     batch_size = max(1, int(batch_size))
     max_inputs_per_request = max(
         1, int(os.environ.get("HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST", "128"))
@@ -606,7 +611,21 @@ def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
         for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
             await _pace()
             try:
-                resp = await client.post(url, json=payload, headers=headers)  # type: ignore[attr-defined]
+                if hard_timeout > 0:
+                    try:
+                        resp = await asyncio.wait_for(
+                            client.post(url, json=payload, headers=headers),  # type: ignore[attr-defined]
+                            timeout=hard_timeout,
+                        )
+                    except (asyncio.TimeoutError, TimeoutError):
+                        # httpx's timeout is per socket op; a stalled/trickling
+                        # endpoint needs this total cap. Treated like any
+                        # transport timeout (retried, then surfaced).
+                        raise httpx.ReadTimeout(
+                            f"embedding request exceeded hard {hard_timeout:.0f}s deadline"
+                        ) from None
+                else:
+                    resp = await client.post(url, json=payload, headers=headers)  # type: ignore[attr-defined]
             except httpx.TransportError as exc:  # timeouts included
                 last_error = exc
                 logger.warning(

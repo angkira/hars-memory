@@ -93,6 +93,7 @@ from hars_memory.mcp_oauth import (
     required_scope_for_tool,
 )
 from hars_memory.mcp_runtime import EngineOverloaded, run_blocking
+from hars_memory.run_lease import get_lease_registry
 from hars_memory.projects import (
     ProjectMetadata,
     get_default_project_registry,
@@ -951,8 +952,24 @@ def schema(properties: dict[str, Any], required: list[str] | None = None) -> dic
     return result
 
 
+#: Write tools that honour the optional cooperative ``run_tag`` (see run_lease.py).
+LEASE_WRITE_TOOLS = frozenset(
+    {"memory_compact", "memory_remember", "memory_merge_session", "memory_upsert_document"}
+)
+
+
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> Tool:
     props = dict(properties)
+    if name in LEASE_WRITE_TOOLS:
+        props.setdefault(
+            "run_tag",
+            {
+                "type": "string",
+                "description": "Optional run label. If a run lease (memory_lease_acquire) is held by a "
+                               "different tag the write still happens but the response carries a "
+                               "`warning`. Never blocks.",
+            },
+        )
     props.setdefault(
         "project",
         {
@@ -4734,6 +4751,26 @@ async def list_tools() -> list[Tool]:
             },
         ),
         tool(
+            "memory_lease_acquire",
+            (
+                "Take the optional cooperative run lease so two eval/benchmark clients do not silently "
+                "share one index. Returns ok=false with held_by/expires_at if a DIFFERENT unexpired tag "
+                "holds it; the same tag renews. Does not block any tool: writes that pass a differing "
+                "`run_tag` just get a `warning`. In-memory, expires after ttl_s."
+            ),
+            {
+                "tag": {"type": "string", "description": "Run label, e.g. 'nc-eval-2026-10-27-a'."},
+                "ttl_s": {"type": "number", "default": 3600, "description": "Lease lifetime in seconds (1..604800)."},
+            },
+            ["tag"],
+        ),
+        tool(
+            "memory_lease_release",
+            "Release the run lease held by `tag` (only the holder can release; no-op if none is held).",
+            {"tag": {"type": "string", "description": "The tag the lease was acquired with."}},
+            ["tag"],
+        ),
+        tool(
             "memory_remember",
             (
                 "Save a knowledge note into the long-term memory staging area. Notes accumulate as "
@@ -5001,7 +5038,31 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
 
 async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
-    """Execute one MCP tool in this process (the engine's real body)."""
+    """Execute one MCP tool in this process (the engine's real body).
+
+    Thin wrapper over :func:`_execute_tool_inner` that adds the cooperative
+    run-lease ``warning`` (run_lease.py) to write-tool responses.
+    """
+    result = await _execute_tool_inner(name, arguments)
+    if name in LEASE_WRITE_TOOLS and isinstance(arguments, dict) and arguments.get("run_tag"):
+        warning = get_lease_registry().check_write(arguments.get("run_tag"), name)
+        if warning and result:
+            try:
+                body = json.loads(result[0].text)
+            except (ValueError, AttributeError):
+                body = None
+            if isinstance(body, dict):
+                body["warning"] = warning
+                return json_text(body)
+    return result
+
+
+def _error_kind(exc: BaseException) -> dict[str, str]:
+    kind = getattr(exc, "error_kind", None)
+    return {"error_kind": str(kind)} if kind else {}
+
+
+async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
     args: dict[str, Any] = arguments if isinstance(arguments, dict) else {}
     project_id = str(args.get("project") or "default").strip()
     raw_token = str(args.get("access_token") or os.environ.get("HARS_MEMORY_ACCESS_TOKEN", "")).strip()
@@ -5063,6 +5124,8 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
             "memory_sync_status": "read",
             "memory_session_status": "read",
             "memory_remember": "write",
+            "memory_lease_acquire": "write",
+            "memory_lease_release": "write",
             "memory_compact": "write",
             "memory_merge_session": "write",
             "memory_upsert_document": "write",
@@ -5082,6 +5145,11 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 "error_type": "ForbiddenError" if token_context else "UnauthorizedError",
                 "code": 403 if token_context else 401,
             })
+
+        if name == "memory_lease_acquire":
+            return json_text(get_lease_registry().acquire(args.get("tag"), args.get("ttl_s")))
+        if name == "memory_lease_release":
+            return json_text(get_lease_registry().release(args.get("tag")))
 
         # ------------------------------------------------------------------ #
         # memory_status — always GPU-free                                    #
@@ -5783,6 +5851,7 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                     "ok": False,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
+                    **_error_kind(exc),
                 })
             log_write_event(
                 tool="memory_compact",
@@ -5815,6 +5884,7 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                     "ok": False,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
+                    **_error_kind(exc),
                 })
             log_write_event(
                 tool="memory_merge_session",
@@ -6617,7 +6687,8 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 "hars-memory-qdrant container: `docker ps --filter name=hars-memory-qdrant` "
                 "/ restart with `docker compose -f docker-compose.dev.yml up -d hars-memory-qdrant`."
             )
-        return json_text({"ok": False, "error_type": error_type, "error": error_message})
+        return json_text({"ok": False, "error_type": error_type, "error": error_message,
+                          **_error_kind(exc)})
 
 
 # ---------------------------------------------------------------------------

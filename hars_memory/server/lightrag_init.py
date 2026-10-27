@@ -9,6 +9,7 @@ Index path: extractor LLM (GPU) — gate with gpu_guard.assert_gpu_free() first.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Mapping
@@ -252,6 +253,13 @@ def make_llm_func(
     # the library's public API.  If chunks are still timing out under very heavy
     # load, lower HARS_MEMORY_MAX_PARALLEL_INSERT (default 2) to reduce contention.
     timeout_seconds = float(os.environ.get("HARS_MEMORY_LLM_TIMEOUT_SECONDS", "300"))
+    # The httpx timeout above is per socket operation (connect / each read), so
+    # an endpoint that accepts the request and then trickles or stalls
+    # keep-alives can hold one call forever. HARD is a total wall-clock cap per
+    # attempt (default 2x the per-op timeout); 0 disables it.
+    hard_timeout_seconds = float(
+        os.environ.get("HARS_MEMORY_LLM_HARD_TIMEOUT_SECONDS", str(2 * timeout_seconds))
+    )
 
     # Bounded retry/backoff for transient endpoint failures (see
     # _is_retryable_llm_error and the make_llm_func docstring above for why
@@ -389,7 +397,19 @@ def make_llm_func(
         request_kwargs["extra_body"] = extra_body or None
 
         async def _complete_once() -> str:
-            response = await client.chat.completions.create(**request_kwargs)
+            try:
+                if hard_timeout_seconds > 0:
+                    response = await asyncio.wait_for(
+                        client.chat.completions.create(**request_kwargs),
+                        timeout=hard_timeout_seconds,
+                    )
+                else:
+                    response = await client.chat.completions.create(**request_kwargs)
+            except (asyncio.TimeoutError, TimeoutError):
+                raise RuntimeError(
+                    f"LLM call to '{model}' at {endpoint} exceeded the hard "
+                    f"{hard_timeout_seconds:.0f}s deadline (HARS_MEMORY_LLM_HARD_TIMEOUT_SECONDS)"
+                ) from None
             message = response.choices[0].message
             usage = getattr(response, "usage", None)
             LLM_USAGE["calls"] += 1

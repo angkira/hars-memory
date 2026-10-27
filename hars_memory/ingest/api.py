@@ -142,6 +142,7 @@ def ingest_documents(
     graph_storage: str | None = None,
     batch_size: int | None = None,
     embed_batch_size: int | None = None,
+    timeout_s: float | None = None,
 ) -> IngestResult:
     """Ingest pre-built `Document` objects into the index at `index_dir`.
 
@@ -183,16 +184,29 @@ def ingest_documents(
         (32), so pre-existing callers are unchanged. Session compaction
         indexing passes its own batch-size knob here.
     """
-    return asyncio.run(
-        _ingest_documents_async(
-            docs,
-            index_dir,
-            vector_storage=vector_storage,
-            graph_storage=graph_storage,
-            batch_size=batch_size,
-            embed_batch_size=embed_batch_size,
-        )
+    coro = _ingest_documents_async(
+        docs,
+        index_dir,
+        vector_storage=vector_storage,
+        graph_storage=graph_storage,
+        batch_size=batch_size,
+        embed_batch_size=embed_batch_size,
     )
+    if timeout_s is not None and timeout_s > 0:
+        # Cooperative hard deadline: cancels every awaiting LightRAG/LLM/embed
+        # task of THIS call so the (pool) thread returns instead of hanging in
+        # asyncio.run() forever. Raises JobTimeout (error_kind "job_timeout").
+        coro = _with_deadline(coro, timeout_s)
+    return asyncio.run(coro)
+
+
+async def _with_deadline(coro: "object", timeout_s: float) -> IngestResult:
+    from hars_memory.mcp_runtime import JobTimeout
+
+    try:
+        return await asyncio.wait_for(coro, timeout_s)  # type: ignore[arg-type]
+    except (asyncio.TimeoutError, TimeoutError):
+        raise JobTimeout(timeout_s, "ingest_documents") from None
 
 
 async def _ingest_documents_async(
