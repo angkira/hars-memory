@@ -82,6 +82,7 @@ evidence (EMPTY). All gates passed at rate 1.000 on all 70 items; hard-gate fail
   appended after the question and carries no arm-specific abstention instruction.
 - Cost ceilings: pre-freeze gate $0.60; full run $2.50 hard (RUNBOOK-gate.md).
 
+> **Amendment C.10 (2026-10-28), section 4a.10:** the C.9 `sum+mem` result measured "access to the dropped transcript" (transcript-only questions) with an uncapped `max_chars`; C.10 adds the true retrieval cap, the controls `sum+bm25` / `sum+grep` / `oracle` on the same questions, measured ingest cost, tokens and USD per correct answer, and a pre-registered decision rule. PRIMARY for "HARS-specific value": `sum+mem` vs `sum+bm25`.
 > **Amendment C.8 (2026-10-28), section 4a.8:** the only memory configuration is the PROJECT layout (the session's dropped context lives in its own project on the owner's server and is read with the global memory's own call); every split-session result (C.6 nc arms, any C.7 run on split) measured the server's session side channel and is diagnostic only.
 > **Amendment C.7 (2026-10-28), section 4a.7:** the primary treatment is now `nc-enriched` (memory recalled at compaction time, none at ask time); `nc-chunks` / `nc-graph` are exploratory.
 
@@ -994,6 +995,100 @@ done (C.8 project layout), the workspaces, the same judge model as the C.6 campa
 name `memory_recall` in an answer is masked like the other arm strings). Limits, stated: one realisation of a stochastic agent per (question, arm) (haiku at provider default
 sampling); the retrieval is not deterministic across calls; the agent chooses its own keywords, so the result measures memory + the agent's use of it; without the final patch
 the workspace lacks the session's edits (C.9-2); wall-clock per step is not controlled; the memory is the C.8 ingest as realised once.
+
+### 4a.10 PROTOCOL AMENDMENT C.10 (2026-10-28, written BEFORE any C.10 record exists; control arms, a true retrieval cap, measured cost, a decision rule)
+
+Provenance: the independent methodology review of the finished C.9 agentic run (run `ag20261028T172454`, 14 sessions, 140 questions, `sum` vs
+`sum+mem`) and the owner's approval of the fix set below. Nothing here changes a C.9 record, the C.8 projects, the C.6 summaries or the judge model;
+the C.9 rows are reused (labelled) and every C.10 number is a new record.
+
+**C.10-1. Findings that motivate it (all from the C.9 bundle, none from a C.10 record).**
+1. *The questions are transcript-only, so "access" is not "retrieval quality".* The QA guard excludes the final patch and requires session-local
+   specifics, so on 80 of the 106 memory-relevant questions the anchor appears in NO workspace result of either arm. There `sum` is 15 correct and
+   `sum+mem` 56: 41 of the 44 extra correct answers come from questions the workspace cannot answer by construction. The accuracy gain
+   (memory-relevant, session-mean `sum+mem - sum` = +0.41, 14/14 sessions positive) is real, but it measures "the dropped conversation is reachable
+   vs not", not "HARS is a better retriever than trivial retrieval over the same text". No competitor arm existed.
+2. *`max_chars` was not a cap.* `_merge_context_with_fusion` budgeted only the content of the Document Chunks section; the entity / relation
+   sections, the session-graph splice, the JSON envelope, the reference list and the headers were not counted, and two paths returned the context
+   unbounded. 126 of 126 recalls exceeded the configured 6000 characters (median 27k, max 104k); one recall returned a median 37% of the session's
+   whole dropped transcript (mean 55%, p90 115%, max 141%). Close to "paste the transcript", and it inflated cache-write tokens to 14.7k per
+   question (0.8k for `sum`).
+3. *The token question is unanswered.* `sum` mostly does not search (median 1 step; 40 of 54 abstentions at step 1 with no tool) and searching would
+   not help (the answers are not in the workspace), so +19.2k tokens per question (+223%) is the price of answering at all, not the cost of
+   searching less efficiently. The one slice that bears on the hypothesis (both arms correct, `sum` used a workspace tool) shows memory saving about
+   two steps and costing about 2x total and 9x fresh tokens. The ingest (extractor) cost was an unmeasured estimate (USD 0.137, "plausibly up to 10x
+   low", C.6-5). Tokens per correct answer went 26.0k -> 37.9k and USD per correct 0.0016 -> 0.0035.
+4. *Bookkeeping holes:* the traces were written but dropped by the bundler; no per-session `workspace_kind` (C.9-2 promised the two no-patch
+   sessions separately); the leak scan printed nothing on a pass; a judge reply that could not be parsed was scored `wrong`; the ledger booked an
+   ABORTED judge run as USD 0.0 although it had spent USD 1.0968 (the abort path printed a different message than the one the ledger parses).
+   C.9-6 also named two primary endpoints (accuracy, tokens) with no rule for the case where they disagree, and C.9-1 triggered `note+mem` on a
+   "gain" it never defined.
+
+**C.10-2. Design (what is added; the C.9 arms keep their prompts byte for byte).**
+- *Server, hard cap.* `memory_recall(max_chars=N)` bounds the TOTAL rendered `context` to N characters on every path (lightrag, merged, merged-not-applied,
+  fusion-only, session-graph splice): relation lines are cut first, then entity lines, then the lowest-ranked chunks (with their reference lines),
+  then the tail of the best chunk, and only then a hard cut; the response carries `context_cap` (chars before / after, what was cut). Without
+  `max_chars` the behaviour is unchanged. `home_run doctor` probes it (row `hars.hard_cap`) and `run_agentic` refuses to start the HARS arms against a
+  server that does not report `context_cap` (`--allow-old-server` overrides, recorded).
+- *Arms* (same questions, same summary, same workspace and tools, same system prompt where the tool is the same):
+  `sum` (C.9 rows, reused), `sum+mem` (re-run with the true cap), `sum+mem@uncapped` (the C.9 `sum+mem` rows, relabelled, reused),
+  `sum+bm25` (the SAME `memory_recall(query, ll_keywords, hl_keywords)` tool name, schema and prompt as `sum+mem`, backed by BM25 over exactly the
+  dropped text that was ingested into the session's HARS project: the same `split_pieces` split, `--piece-chars` 8000; the retrieval unit is a
+  passage of about 1500 characters cut from those pieces (`--bm25-passage-chars`), because an 8000-character unit cannot fill a 6000-character cap
+  with more than one hit; query = query + keywords), `sum+grep` (a `transcript_grep(pattern)` tool: regex over the same dropped text, matching
+  lines with one line of context), `oracle` (the complete dropped transcript in the system prompt as text, plus the summary and the workspace tools,
+  no retrieval tool; its size is recorded per session). `note+mem` stays optional (C.10-5) and is NOT run.
+- *One cap.* Every retrieval arm uses `--retrieval-max-chars` (default 6000), sent to the server as `max_chars` AND enforced client-side as a guard;
+  each row records the realised characters (`retrieval_chars_max`, `retrieval_chars_total`), whether the server honoured the cap
+  (`retrieval_cap_server_violations`) and how often the guard cut (`retrieval_client_cuts`). A tool output above the cap after the guard stops the run.
+- *Reuse.* `--reuse-agentic-run DIR` copies the finished C.9 rows of `sum` and `sum+mem` (same question, same summary sha256 required), marked
+  `reused_from`; their judge verdicts are merged (rid mapped to the new label), only the new rows are judged. The ingest (C.8 projects) is reused,
+  nothing is re-ingested for these arms.
+
+**C.10-3. Contrasts (all paired by question, cluster bootstrap over sessions, 10 000 resamples, seed 1337; estimates with CIs).**
+- PRIMARY for "HARS-specific value": `sum+mem` vs `sum+bm25` (same tool, same cap, same text), memory-relevant subset.
+- Next to it: `sum+mem` vs `sum+grep`; `sum+bm25` vs `sum+grep`; each retrieval arm vs `oracle` (how much of the available benefit the cap leaves); `sum+mem`
+  vs `sum+mem@uncapped` (the effect of the cap itself); every arm vs `sum`.
+- Metrics per contrast: accuracy (correct rate, answerable), total / fresh / cache-read tokens, steps, tool calls, USD; tokens and USD PER CORRECT
+  answer; the same on the questions BOTH arms answered correctly (accuracy-matched cost); the marginal tokens per extra correct answer.
+- *Ingest cost.* `home_run oh-ingest-measure` re-ingests K sessions (default 3) into fresh throwaway projects and records the extractor's calls, prompt /
+  completion tokens (the provider's `usage`; an estimate is flagged) and USD per session (server field `extract_usage`); the mean per session x the
+  number of sessions is amortised over the questions on the HARS arms (`sum+mem`, `sum+mem@uncapped`, `note+mem`) as `tokens_all_in` and `usd_product`.
+  The judge's USD is reported separately (`usd_all_in`): it is an eval cost, not a product cost. When the ingest is not measured the per-correct
+  figures of the HARS arms say so and EXCLUDE it.
+- *Fresh vs cached.* Every arm table splits tokens into cache reads (re-sent every step, priced about 1/10), cache writes, uncached input, output.
+- *Sessions without the patch.* The sessions whose workspace has no final patch (`workspace_kind` = `base_commit`) are reported separately (arm tables
+  and contrasts, memory-relevant subset), and `workspace_kind` is recorded in every row and in the bundle.
+
+**C.10-4. The decision rule when accuracy and cost disagree, fixed before any C.10 record.** DECISION RULE (accuracy vs cost disagree), pair A vs B, memory-relevant subset, answerable questions answered by both arms, 95% cluster-bootstrap CIs over sessions (10 000 resamples, seed 1337). ACCURACY class from d = acc(A) - acc(B): UP if CI_lo(d) > 0; DOWN if CI_hi(d) < 0; TIE if the CI lies inside +-0.05; else UNRESOLVED. COST class from r = (tokens per correct answer of A) / (that of B), tokens = agent total incl. cache reads + output + the measured ingest tokens amortised per question (HARS arms): DOWN if CI_hi(r) < 1; UP if CI_lo(r) > 1; TIE if the CI lies inside [0.909, 1.10]; else UNRESOLVED. The USD axis (agent + amortised ingest, judge excluded) is classified the same way; if its class differs from the token axis the verdict is UNRESOLVED ('axes disagree'). VERDICT: ACC UNRESOLVED -> UNRESOLVED. ACC TIE: COST TIE -> TIE, COST DOWN -> A_BETTER, COST UP -> B_BETTER, else UNRESOLVED. ACC UP: COST DOWN or TIE -> A_BETTER. ACC DOWN: COST UP or TIE -> B_BETTER. Otherwise (the more accurate arm is costlier, or its cost is unresolved) the MARGINAL rule decides: let M = (extra tokens of the more accurate arm) / (extra correct answers it gives) and c = tokens per correct answer of the less accurate arm; the more accurate arm wins the trade-off (A_BETTER_TRADEOFF / B_BETTER_TRADEOFF) iff the upper CI bound of M <= 1.5 x c (an extra correct answer may cost up to 1.5 times an average correct answer of the less accurate arm), loses it (TRADEOFF_UNFAVOURABLE_<arm>) iff the lower CI bound of M > 1.5 x c, else UNRESOLVED. Everything else is UNRESOLVED ('not distinguishable at this n'), never 'no effect'. HARS-SPECIFIC VALUE is claimed only if sum+mem vs sum+bm25 is A_BETTER or A_BETTER_TRADEOFF; sum+mem vs sum+grep is reported next to it.
+
+**C.10-5. GAIN, defined numerically, and the `note+mem` trigger.** GAIN (the note+mem trigger): sum+mem shows a gain over sum iff, on the memory-relevant subset, accuracy d(sum+mem - sum) >= +0.10 with CI_lo > 0 AND the decision rule's verdict of sum+mem vs sum is A_BETTER or A_BETTER_TRADEOFF. note+mem may then run only if, in addition, neither sum+bm25 nor sum+grep beats sum+mem (verdict B_BETTER*/TRADEOFF_UNFAVOURABLE_sum+mem): a HARS variant is not worth testing when trivial retrieval already beats HARS. `metrics_agentic.py` computes both and prints them; a person does not decide
+by eye. `note+mem` is NOT run now.
+
+**C.10-6. Judge robustness and the ledger.** An unparseable judge reply is re-asked ONCE with a strict-format reminder; if it still fails the row is
+`judge_unparsed` (and `judge_reasked` records the attempt), is EXCLUDED from accuracy, never scored `wrong`, and the count per arm is reported (the question
+leaves every pair that contains that arm). `judge_v2` keeps the verdicts of an aborted run (`<out>.partial`, resumable with `--resume-partial`) and its spend
+(`<out>.spend.json`, rewritten every 10 judgments and at the end, plus the same `judge spend: $X over N calls` line on abort); `home_run` books the
+larger of the two in the ledger even when the run aborted, so a cap can no longer be silently exceeded. Each verdict carries `judge_cost_usd`.
+
+**C.10-7. Bundle.** The default bundle of the OH track now packs, gzip-compressed and redacted, the agentic traces (`traces*.jsonl`), the recall / probe
+sidecars and `ingest.jsonl` (with `extract_usage`), under `--max-raw-mb` (default 200; the bundle lists what the guard skipped); redaction stays on, the
+per-session workspace kinds are written to `oh/workspace-kinds.json`, and the scan prints an explicit `LEAK SCAN: PASS` line with counts (the workspace leak scan of
+`run_agentic` likewise prints `[leak-scan] PASS ...` per session).
+
+**C.10-8. Cost and guard.** `oh-agentic --controls --dry-run` prints the estimate per arm by the C.9-7 steps x tokens model (stated assumptions, 8 steps) AND the same
+model with the step counts OBSERVED in the C.9 run; the oracle's transcript is priced as a cached prefix (written once per session, read at every step). EVAL-VERSION
+`2026-10-28.c10`; `oh-agentic`, `oh-ingest-measure` and the other reuse commands accept a campaign stamped `2026-10-27.c6` ... `2026-10-28.c9`, nothing older; the caps,
+the paid-step guard, the per-HARS lock and the server lease apply unchanged.
+
+**C.10-9. Out of scope, stated.** (a) The redesign that answers the TOKEN question properly - questions that exist in the workspace or the final state but are
+costly to locate (reported as a second stratum), a forced-search floor for the baseline, a step-cap sweep, sessions whose dropped context is far larger than the
+window (the 2.5M-token Claude Code session, BEAM 100k-1M) - is future work: with transcript-only questions on ~70k-character sessions the cost comparison between
+arms is a comparison of ways to REACH the transcript, and it cannot show that memory saves search effort. (b) `note+mem` is not run. (c) A `max_chars` sweep
+(2k / 6k / 15k), a weaker or stronger agent model and a cross-family judge are not part of this amendment. (d) HARS is not tuned (keywords, `max_chars`, prompts)
+on these 106 questions. Limits: one realisation of a stochastic agent per (question, arm); the agent writes its own queries; the BM25 / grep corpus is the
+text the extractor was given, so a lexical anchor is easy for them (rare verbatim tokens, <= 3 messages); the same-family judge limitation of C.1-2 stands
+(`anchor_hit` is the judge-free cross-check); n = 14 sessions, so an `UNRESOLVED` verdict is the likely outcome for small differences.
 
 ## 5. Measurement stack
 
