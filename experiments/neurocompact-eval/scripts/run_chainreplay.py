@@ -691,20 +691,25 @@ GRAPH_RECALL_ARGS = {"session_graph": True, "session_graph_mode": GRAPH_MODE}
 # question text. `keyword_source` ("caller" | "llm" | "question_fallback") is logged per ask.
 
 
-def recall_args(session_id: str, question: str, graph: bool = False) -> dict:
+def recall_args(session_id: str, question: str, graph: bool = False, project: str | None = None) -> dict:
     """The frozen memory_recall call shape per arm. nc-chunks: byte-identical to the
-    pre-amendment call; nc-graph: the same plus session_graph/session_graph_mode."""
+    pre-amendment call; nc-graph: the same plus session_graph/session_graph_mode.
+    ``project`` (Amendment C.8, recall probe column A only): the same keyword-less shape against a project's
+    main index, without session_id."""
     a = {"session_id": session_id, "question": question, "top_k": 8}
     if graph:
         a.update(GRAPH_RECALL_ARGS)
+    if project:
+        a.pop("session_id")
+        a["project"] = str(project)
     return a
 
 
 def hars_recall(mcp_url: str, session_id: str, question: str, timeout: int = 600,
-                graph: bool = False) -> dict:
+                graph: bool = False, project: str | None = None) -> dict:
     """memory_recall; returns the raw tool payload (or {'context': '', 'error': ...})."""
     try:
-        d = mcp_call(mcp_url, "memory_recall", recall_args(session_id, question, graph),
+        d = mcp_call(mcp_url, "memory_recall", recall_args(session_id, question, graph, project=project),
                      timeout=timeout)
         if not isinstance(d, dict):
             return {"context": "", "error": f"unexpected payload {type(d).__name__}"}
@@ -716,7 +721,8 @@ def hars_recall(mcp_url: str, session_id: str, question: str, timeout: int = 600
 CORRECT_RECALL_MODE = "hybrid"
 
 
-def recall_args_correct(session_id: str, query: str, ll_keywords, hl_keywords, max_chars: int | None = None) -> dict:
+def recall_args_correct(session_id: str, query: str, ll_keywords, hl_keywords, max_chars: int | None = None,
+                        project: str | None = None) -> dict:
     """Amendment C.7 "correct usage" call shape (the ONE memory configuration): the caller model supplies the
     query plus ll_keywords (exact identifiers) and hl_keywords (topics), mode hybrid, the SERVER'S default top_k
     (top_k is deliberately NOT sent), no session_graph, and the output is budgeted by the server's own
@@ -725,16 +731,22 @@ def recall_args_correct(session_id: str, query: str, ll_keywords, hl_keywords, m
     makes the server fall back to naive mode and skip its graph branch."""
     a = {"session_id": session_id, "question": query, "mode": CORRECT_RECALL_MODE,
          "ll_keywords": [str(x) for x in (ll_keywords or [])], "hl_keywords": [str(x) for x in (hl_keywords or [])]}
+    if project:
+        # Amendment C.8 (project-subgraph layout): the memory IS the project's main index, so the call goes to the
+        # PROJECT and carries NO session_id (a session_id would add the server's side channel to the result).
+        a.pop("session_id")
+        a["project"] = str(project)
     if max_chars is not None:
         a["max_chars"] = int(max_chars)
     return a
 
 
 def hars_recall_correct(mcp_url: str, session_id: str, query: str, ll_keywords, hl_keywords,
-                        max_chars: int | None = None, timeout: int = 600) -> dict:
+                        max_chars: int | None = None, timeout: int = 600, project: str | None = None) -> dict:
     try:
         d = mcp_call(mcp_url, "memory_recall",
-                     recall_args_correct(session_id, query, ll_keywords, hl_keywords, max_chars), timeout=timeout)
+                     recall_args_correct(session_id, query, ll_keywords, hl_keywords, max_chars, project=project),
+                     timeout=timeout)
         if not isinstance(d, dict):
             return {"context": "", "error": f"unexpected payload {type(d).__name__}"}
         return d

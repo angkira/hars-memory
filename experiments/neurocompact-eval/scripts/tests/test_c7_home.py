@@ -122,7 +122,10 @@ class Base(unittest.TestCase):
             H.write_json(os.path.join(self.camp, "calibration.json"), cal)
 
     def go(self, runner, *cmd, resume=True, pre=()):
-        argv = self.base + list(pre) + list(cmd) + (["--resume", self.camp] if resume else [])
+        cmd = list(cmd)
+        if cmd and cmd[0] in ("oh-probe", "oh-enrich") and "--layout" not in cmd:
+            cmd += ["--layout", "split-session"]       # C.8: these tests pin the (diagnostic) split-session path
+        argv = self.base + list(pre) + cmd + (["--resume", self.camp] if resume else [])
         return thr.quiet(H.main, argv, runner=runner)
 
     def steps(self):
@@ -141,7 +144,7 @@ class Guards(Base):
         rc, so, se = self.go(r, "oh")
         self.assertEqual(rc, 2)
         self.assertIn("EVAL-VERSION", se)
-        self.assertIn("only oh-probe/oh-enrich may reuse", se)
+        self.assertIn("may reuse a 2026-10-27.c6", se)
         rc, so, se = self.go(r, "oh-probe")
         self.assertEqual(rc, 0, so + se)
 
@@ -181,17 +184,17 @@ class Probe(Base):
         self.assertEqual(r.arg(a, "--reuse-arms"), "baseline,nc-note-only")
         self.assertEqual(r.arg(a, "--probe-caps"), "500,1000")
         self.assertEqual(r.arg(a, "--arms"), "baseline,nc-enriched,nc-note-only")
-        self.assertEqual(r.arg(a, "--out"), os.path.join(self.camp, "oh", "probe-run"))
-        self.assertIn("oh.probe", self.steps())
-        m = H.read_json(os.path.join(self.camp, "steps", "oh.probe.json"))
+        self.assertEqual(r.arg(a, "--out"), os.path.join(self.camp, "oh", "probe-run-split"))
+        self.assertIn("oh.probe.split", self.steps())
+        m = H.read_json(os.path.join(self.camp, "steps", "oh.probe.split.json"))
         self.assertEqual(m["n_questions"], 7)
         self.assertEqual(m["headline"]["B_raw"], 0.8)
-        led = [e for e in H.read_json(os.path.join(self.camp, "ledger.json"))["entries"] if e["step"] == "oh.probe.run"]
+        led = [e for e in H.read_json(os.path.join(self.camp, "ledger.json"))["entries"] if e["step"] == "oh.probe.split.run"]
         self.assertEqual(len(led), 1)
         self.assertIn("probe report", so)
         cj = H.read_json(os.path.join(self.camp, "campaign.json"))
         self.assertEqual(cj["eval_version"], "2026-10-27.c6")                # the campaign's own stamp is not rewritten
-        self.assertEqual(cj["c7_reuse"]["oh-probe"]["eval_version"], H.HOME_RUN_VERSION)
+        self.assertEqual(cj["c7_reuse"]["oh-probe-split"]["eval_version"], H.HOME_RUN_VERSION)
         self.assertTrue(os.path.isfile(os.path.join(self.camp, "scripts", "c7", "run_longsession.py")))
 
     def test_probe_dry_run_spends_nothing_and_writes_no_step(self):
@@ -199,7 +202,7 @@ class Probe(Base):
         rc, so, se = self.go(r, "oh-probe", "--dry-run")
         self.assertEqual(rc, 0, so + se)
         self.assertIn("estimate (zero spend)", so)
-        self.assertNotIn("oh.probe", self.steps())
+        self.assertNotIn("oh.probe.split", self.steps())
         self.assertFalse([1 for s, a in r.calls if s == "run_longsession.py" and "--dry-run" not in a])
 
 
@@ -217,7 +220,7 @@ class Enrich(Base):
         self.assertTrue(old_judged)
         rc, so, se = self.go(r, "oh-enrich")
         self.assertEqual(rc, 0, so + se)
-        run = os.path.join(self.camp, "oh", "enrich-run")
+        run = os.path.join(self.camp, "oh", "enrich-run-split")
         dry = [a for s, a in r.calls if s == "run_longsession.py" and "--dry-run" in a]
         real = [a for s, a in r.calls if s == "run_longsession.py" and "--dry-run" not in a]
         self.assertEqual((len(dry), len(real)), (1, 1))
@@ -229,7 +232,7 @@ class Enrich(Base):
         self.assertEqual(r.arg(real[0], "--out"), run)
         # the estimate is the reuse projection: only the new arm's asks are judge items, no ingest
         est = H.read_json(os.path.join(self.camp, "oh-enrich-estimate.json")) if os.path.exists(
-            os.path.join(self.camp, "oh-enrich-estimate.json")) else H.read_json(os.path.join(self.camp, "steps", "oh.enrich.estimate.json"))["estimate"]
+            os.path.join(self.camp, "oh-enrich-split-estimate.json")) else H.read_json(os.path.join(self.camp, "steps", "oh.enrich.split.estimate.json"))["estimate"]
         n_q = sum(len(c["qa"]) for c in self.chains)
         self.assertEqual(est["judged_items"], n_q)
         self.assertEqual(est["ingest_hours"], 0.0)
@@ -245,10 +248,10 @@ class Enrich(Base):
         self.assertEqual(scripts, ["export_longsession_judge.py", "export_longsession_judge.py", "judge_v2.py", "metrics_v2.py"])
         exp_new = [a for s, a in r.calls if s == "export_longsession_judge.py" and "--skip-judged" in a][0]
         self.assertEqual(r.arg(exp_new, "--skip-judged"), os.path.join(self.camp, "oh", "run", "judged.jsonl"))
-        for st in ("oh.enrich.run", "oh.enrich.export", "oh.enrich.export_new", "oh.enrich.judge", "oh.enrich.merge", "oh.enrich.metrics"):
+        for st in ("oh.enrich.split.run", "oh.enrich.split.export", "oh.enrich.split.export_new", "oh.enrich.split.judge", "oh.enrich.split.merge", "oh.enrich.split.metrics"):
             self.assertIn(st, self.steps())
         led = {e["step"] for e in H.read_json(os.path.join(self.camp, "ledger.json"))["entries"]}
-        self.assertTrue({"oh.enrich.run", "oh.enrich.judge"} <= led)
+        self.assertTrue({"oh.enrich.split.run", "oh.enrich.split.judge"} <= led)
         self.assertTrue(os.path.isfile(os.path.join(run, "home_run-summary.json")))
         mt = [a for s, a in r.calls if s == "metrics_v2.py"][0]
         self.assertEqual(r.arg(mt, "--judge"), os.path.join(run, "judged.jsonl"))
@@ -264,7 +267,7 @@ class Enrich(Base):
         self.assertEqual(rc, 0, so + se)
         self.assertIn("NO ingest / extraction", so)
         self.assertFalse(any(s in ("export_longsession_judge.py", "judge_v2.py") for s, _ in r.calls))
-        self.assertNotIn("oh.enrich.estimate", self.steps())
+        self.assertNotIn("oh.enrich.split.estimate", self.steps())
 
     def test_a_parity_miss_stops_before_any_judge_spend(self):
         self.assertEqual(self.go(EnrichRunner(), "oh-probe")[0], 0)
@@ -305,9 +308,9 @@ class Enrich(Base):
 class FreshOhDefaults(unittest.TestCase):
     def test_default_oh_arms_are_the_c7_set_and_the_version_is_bumped(self):
         self.assertEqual(H.OH_ARMS, "baseline,nc-enriched,nc-note-only")
-        self.assertEqual(H.HOME_RUN_VERSION, "2026-10-28.c7")
+        self.assertEqual(H.HOME_RUN_VERSION, "2026-10-28.c8")
         self.assertEqual(open(os.path.join(os.path.dirname(H.BASE), "EVAL-VERSION")).read().strip(), H.HOME_RUN_VERSION)
-        self.assertEqual(H.REUSE_COMPATIBLE_FROM, ("2026-10-27.c6",))
+        self.assertEqual(H.REUSE_COMPATIBLE_FROM, ("2026-10-27.c6", "2026-10-28.c7"))
 
 
 if __name__ == "__main__":

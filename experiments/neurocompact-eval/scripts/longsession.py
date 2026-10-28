@@ -93,6 +93,26 @@ def norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 
+PROJECT_ID_MAX = 63
+RESERVED_PROJECT_IDS = ("default",)
+
+
+def make_project_id(run_id: str, sid: str, B: int | None = None, per_budget: bool = False) -> str:
+    """Amendment C.8: the isolated HARS project of one eval session (project-subgraph layout): ``nc-<run id>-<sid>``
+    (+ ``-b<B>`` with --hars-per-budget), sanitised to [A-Za-z0-9_-] and limited to PROJECT_ID_MAX characters (an
+    over-long id keeps its head and gets an 8-hex hash of the full id, so two long ids never collide). It is a
+    directory name on the eval server and the suffix of its Qdrant collection (``<base>_<project id>``). It can never
+    be ``default``: the prefix is fixed."""
+    raw = f"nc-{run_id}-{sid}" + (f"-b{int(B)}" if per_budget and B is not None else "")
+    pid = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-")
+    if len(pid) > PROJECT_ID_MAX:
+        h = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:8]
+        pid = pid[:PROJECT_ID_MAX - 9].rstrip("-") + "-" + h
+    if pid in RESERVED_PROJECT_IDS:        # unreachable with the fixed prefix; kept as an invariant
+        raise ValueError(f"refusing reserved project id {pid!r}")
+    return pid
+
+
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
 

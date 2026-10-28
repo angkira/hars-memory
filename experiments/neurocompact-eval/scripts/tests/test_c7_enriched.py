@@ -21,7 +21,8 @@ HAVE_RC = L.rc() is not None and all(hasattr(L.rc(), n) for n in (
 needs_rc = unittest.skipUnless(HAVE_RC, "run_chainreplay.py not importable (mid-edit?)")
 
 BASE = ["--window", "14000", "--keep-tail", "3000", "--mem-budgets", "1536", "--provider", "mock", "--agent-model", "mock",
-        "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4"]
+        "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4",
+        "--hars-layout", "split-session"]          # C.8: these tests pin the (diagnostic) split-session behaviour
 NEW_ARMS = ["--arms", "baseline,nc-enriched,nc-note-only"]
 
 

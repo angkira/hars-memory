@@ -35,8 +35,9 @@
    uv run python home_run.py cc --find "HARS Experts Research"          # prints candidates, you pick; then import -> QA -> run -> judge
    uv run python home_run.py bundle                 # send the ONE .tar.gz back
    ```
-   **You already have a finished `oh` campaign (question-time arms)?** Do NOT re-run it. Read section 6.0b: `oh-probe --resume <campaign>`
-   (cents), then `oh-enrich --resume <campaign>` (the Amendment C.7 treatment, nc-enriched, against its stored HARS sessions).
+   **You already have a finished `oh` campaign (question-time arms)?** Do NOT re-run it. Read section 6.0c (Amendment C.8): `oh-provision`,
+   restart your server once, `doctor`, `oh-ingest`, `oh-probe`, `oh-enrich` (nc-enriched against the session's own project). The split-session
+   HARS data of that campaign measured a server side channel, not the memory (6.0b is kept for the record).
 
 ---
 
@@ -189,6 +190,8 @@ HR cc --find "TITLE"             # (or --session-id ID / --list): pick the sessi
 HR oh-probe  --resume CAMP       # Amendment C.7 (section 6.0b): recall probe on a FINISHED oh campaign - cents, no answer model, no judge
 HR oh-enrich --resume CAMP       # Amendment C.7: ONLY nc-enriched against that campaign (reuses its HARS sessions, notes, judged baseline /
                                  #   nc-note-only), judges the new rows only, merges, metrics. Run oh-probe first; --dry-run on both
+HR oh-provision / oh-ingest --resume CAMP   # Amendment C.8 (section 6.0c): the session's own project on your existing server, then ingest
+                                 #   (oh-probe / oh-enrich default to this project layout; `--layout split-session` = DIAGNOSTIC ONLY)
 HR bundle                        # step 9
 ```
 Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export, judge later), `--retries N` (legacy replay only),
@@ -236,7 +239,41 @@ campaign may still spend.
 Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~2.3 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
 
+### 6.0c Amendment C.8 - the memory is the session's own PROJECT (read before `oh-ingest` / `oh-enrich`)
+
+The split-session runs (C.6 arms, C.7 as first shipped) measured the server's session side channel, not the memory (protocol 4a.8). The
+decision configuration writes each eval session's dropped context into ITS OWN project on your EXISTING server (`memory_upsert_document`,
+`project=nc-<id>-<sid>`) and reads it back with `memory_recall(project=..., ll/hl keywords, hybrid, max_chars)`, no `session_id` - like the
+global memory. No second server, no mode switch, no new tool. The old split path stays as `--layout split-session`, DIAGNOSTIC ONLY.
+
+```bash
+cd experiments/neurocompact-eval/scripts
+CAMP=<the finished oh campaign>
+uv run python home_run.py oh-provision --resume $CAMP [--projects-dir DIR]   # 1) writes <projects dir>/nc-<id>-<sid>/project.json for all 14 sessions
+#    2) RESTART your existing HARS server ONCE (projects are read at start only) with HARS_MEMORY_PROJECTS_DIR=<that dir>
+#       (the default dir ~/.local/share/hars-longterm-memory/projects needs no env; otherwise also set [hars] projects_dir in home_run.toml)
+uv run python home_run.py doctor    --resume $CAMP        # 3) rows projects.registered (14/14), projects.default_untouched, projects.state (all empty)
+uv run python home_run.py oh-ingest --resume $CAMP --dry-run   #  estimate: ingest wall-clock + server-side extraction cost
+uv run python home_run.py oh-ingest --resume $CAMP        # 4) writes the dropped spans (old notes, same pieces / boundaries); no model call of ours
+uv run python home_run.py oh-probe  --resume $CAMP        # 5) cents: anchor recall on the ingested projects (A old shape, B/C correct shape, D BM25)
+uv run python home_run.py oh-enrich --resume $CAMP --dry-run
+uv run python home_run.py oh-enrich --resume $CAMP        # 6) PAID: nc-enriched only (judge = new rows only), merge, metrics
+uv run python home_run.py bundle    --resume $CAMP        # 7) send the .tar.gz back
+```
+- `oh-provision` only creates directories under the projects dir and records `c8_projects` in `campaign.json`. It starts and stops nothing, never
+  touches `default` or your global KB, and is idempotent (same run id on a re-run).
+- `oh-ingest` is resumable (the idempotent upsert + the run's ingest cache). A fresh ingest refuses a project that is not empty; after a crash wipe
+  that project's dir under the projects dir and restart the server, or simply re-run the same command (a resumed run is exempt).
+- `oh-probe` / `oh-enrich` in this layout need `oh-ingest` done; `oh-enrich` without it would ingest inside the run (the dry-run then shows the
+  ingest). Outputs: `oh/ingest-run/`, `oh/probe-run/`, `oh/enrich-run/`; the split path writes `oh/probe-run-split/`, `oh/enrich-run-split/`.
+- The estimate of `oh-ingest` / `oh-enrich --dry-run` includes the ingest wall-clock (pieces x `extract_s_per_piece`, a guess printed with its
+  value) and the server-side extraction (extract chunks x the extractor model's price, charged to the run cap as a flagged estimate).
+- Guard: a campaign stamped `2026-10-27.c6` or `2026-10-28.c7` is accepted by these four commands only (code is `2026-10-28.c8`).
+
 ### 6.0b Amendment C.7 - the OH result, the mis-specified recall, and the ONE paid command that follows (read before `oh-enrich`)
+
+> **C.8 supersedes the storage layout of this section:** the commands below default to the project layout (6.0c); what is described here
+> against the campaign's stored `ls-<id>-<sid>` HARS sessions is `--layout split-session`, DIAGNOSTIC ONLY.
 
 The question-time arms (`nc-chunks`, `nc-graph`) of the finished OH campaign recalled at ask time with a call that sends no keywords, top_k = 8
 and goes through our own packer; they are EXPLORATORY now (`REPORT-PROTOCOL.md` 4a.7). The primary treatment is **`nc-enriched`**: facts
@@ -268,7 +305,7 @@ uv run python home_run.py bundle    --resume $CAMP               # send the .tar
   Parity (realized `nc-enriched / baseline` ask-time memory in [0.80, 1.05]) is checked BEFORE the judge is paid; `--accept-parity-fail`
   overrides (recorded). Flags: `--enrich-queries K` (default 8), `--packer server|legacy` (legacy = packing v2, comparison only),
   `--skip-judge`, `--accept-partial`, `--budgets`.
-- **Guard rules.** The campaign was made under EVAL-VERSION `2026-10-27.c6`; the code is `2026-10-28.c7`. Every paid command still refuses
+- **Guard rules.** The campaign was made under EVAL-VERSION `2026-10-27.c6`; the code is `2026-10-28.c8`. Every paid command still refuses
   such a campaign EXCEPT `oh-probe` / `oh-enrich` (why that is valid: protocol 4a.7, "Reuse rule"). Caps (`[caps]` run / judge / total), the
   per-HARS lock / lease, the dry-run estimate check and the ledger apply as everywhere; the estimate contains NO ingest and NO baseline / note
   summaries. Typical size for 14 sessions / 140 questions: run well under USD 0.1, judge about 140 x USD 0.0034 = USD 0.48.

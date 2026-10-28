@@ -93,12 +93,15 @@ PHASES = ("gen", "run", "judge")
 CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
 PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
 PLACEHOLDER_CAP = 0.0
-HOME_RUN_VERSION = "2026-10-28.c7"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+HOME_RUN_VERSION = "2026-10-28.c8"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
 # Amendment C.7: `oh-probe` / `oh-enrich` may spend on a campaign made under one of these versions (only those,
 # only for those two commands). Why that is valid is written in REPORT-PROTOCOL.md Amendment C.7: the reused HARS
 # sessions, notes, baseline / nc-note-only rows and judge verdicts are artifacts of code that C.7 did not change.
-REUSE_COMPATIBLE_FROM = ("2026-10-27.c6",)
-REUSE_CMDS = ("oh-probe", "oh-enrich")
+# Amendment C.8: the same exception covers a campaign stamped c7 and the two new commands (provision / ingest) of the
+# project layout; nothing older, no other command.
+REUSE_COMPATIBLE_FROM = ("2026-10-27.c6", "2026-10-28.c7")
+REUSE_CMDS = ("oh-provision", "oh-ingest", "oh-probe", "oh-enrich")
+DEFAULT_PROJECTS_DIR = "~/.local/share/hars-longterm-memory/projects"    # hars_memory/projects/registry.py default
 EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
 HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
 BUDGET_TOTAL_DEFAULT = 30.0
@@ -133,7 +136,7 @@ DEFAULT_CONFIG: dict = {
            "n_unanswerable": 4,   # gen_longsession_qa menu-mode defaults (window-targeted); ~$0.3 on Sonnet per session
            "session_budget_usd": 2.5, "checkpoints": "every:3", "budgets": [1536], "max_questions": 0, "extra_args": []},
     "smoke": {"run_cap_oh": 0.90, "run_cap_ls": 0.25, "judge_cap": 0.25},
-    "hars": {"data_dir": "", "port": 8307},
+    "hars": {"data_dir": "", "port": 8307, "projects_dir": ""},     # projects_dir: where the owner's server discovers projects (C.8)
 }
 
 
@@ -513,7 +516,7 @@ class Campaign:
 # ---------------------------------------------------------------------------
 # campaign selection (owner bug 2): NEVER an implicit resume
 # ---------------------------------------------------------------------------
-READ_ONLY_CMDS = ("bundle", "status", "oh-probe", "oh-enrich")   # need an explicit target (--resume [ID|PATH])
+READ_ONLY_CMDS = ("bundle", "status", "oh-provision", "oh-ingest", "oh-probe", "oh-enrich")   # need an explicit target (--resume [ID|PATH])
 NOT_RESUMABLE_KINDS = ("smoke", "dry-run")      # `--resume` (newest) skips these throw-away campaigns
 _STAMP_RE = re.compile(r"^(\d{8}T\d{6}Z)-homerun-")
 
@@ -677,7 +680,7 @@ def spend_blockers(camp: "Campaign") -> list[str]:
     if made != code and not reuse_ok:
         why.append(f"the campaign was made under EVAL-VERSION {made or '(unknown)'!r}, the code is {code!r}: its "
                    "calibration, caps and records belong to another protocol version"
-                   + (f" (only {'/'.join(REUSE_CMDS)} may reuse a {'/'.join(REUSE_COMPATIBLE_FROM)} campaign, Amendment C.7)"
+                   + (f" (only {'/'.join(REUSE_CMDS)} may reuse a {'/'.join(REUSE_COMPATIBLE_FROM)} campaign, Amendments C.7 / C.8)"
                       if made in REUSE_COMPATIBLE_FROM else ""))
     cal = read_json(camp.p(CAL_FILE), None)
     if cal:
@@ -2639,8 +2642,8 @@ def oh_old_run(camp: Campaign, args, need_judged: bool = False) -> str:
     return d
 
 
-def oh_reuse_extra(cfg: dict, old: str, *, probe: bool = False, args=None) -> list[str]:
-    ex = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--reuse-arms", REUSE_ARMS]
+def oh_reuse_extra(cfg: dict, old: str, *, probe: bool = False, args=None, layout_extra: list[str] | None = None) -> list[str]:
+    ex = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--reuse-arms", REUSE_ARMS] + list(layout_extra or [])
     nq = getattr(args, "enrich_queries", None)
     if nq:
         ex += ["--enrich-queries", str(int(nq))]
@@ -2653,23 +2656,27 @@ def oh_reuse_extra(cfg: dict, old: str, *, probe: bool = False, args=None) -> li
     return ex
 
 
-def estimate_oh_enrich(camp: Campaign, args, old: str, *, probe: bool) -> dict:
+def estimate_oh_enrich(camp: Campaign, args, old: str, *, probe: bool, layout_extra: list[str] | None = None) -> dict:
     """run_longsession's own projection WITH --reuse-run: no ingest / extraction / memory_compact, no baseline / note
     summaries, no ask for the reused arms; judge items = the NEW nc-enriched rows only."""
     data = oh_convert(camp)
     b = [max(int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"]))] if probe else \
         [int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])]
     tag = ".probe" if probe else ".enrich"
-    s = estimate_ls(camp, "oh", data, b, "end", True, extra=oh_reuse_extra(camp.cfg, old, probe=probe, args=args), tag=tag,
+    s = estimate_ls(camp, "oh", data, b, "end", True, extra=oh_reuse_extra(camp.cfg, old, probe=probe, args=args, layout_extra=layout_extra), tag=tag,
                     only_arm=None if probe else "nc-enriched", reused=True)
     return {"track": "oh", "gen_usd": 0.0, "run_usd": s["run_usd"], "judge_usd": 0.0 if probe else s["judge_usd"],
             "judged_items": 0 if probe else s["judged_items"], "wall_hours": s["wall_hours"], "budgets": b,
-            "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": 0.0,
+            "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": s["ingest_hours"],
             "unpriced_models": s["unpriced_models"], "cache_saving_usd": s.get("cache_saving_usd", 0.0),
             "note": ("recall probe: one keyword-writing call per anchored answerable question; HARS recalls are free"
                      if probe else
-                     "nc-enriched only: query-writing call per boundary + its asks; NO ingest / extraction (reused HARS "
-                     "sessions), baseline / nc-note-only copied from the old run; judge = new rows only")}
+                     "nc-enriched only: query-writing call per boundary + its asks"
+                     + (" - NO ingest / extraction (reused HARS sessions; split-session = DIAGNOSTIC ONLY)" if "split-session" in (layout_extra or []) else
+                        "" if "--hars-ingested" in (layout_extra or []) else
+                        " + the INGEST of the dropped spans into the nc-* projects (server-side extraction cost and ingest "
+                        "wall-clock are in these numbers)")
+                     + "; baseline / nc-note-only copied from the old run; judge = new rows only")}
 
 
 def print_estimate(camp: Campaign, est: dict, what: str) -> None:
@@ -2696,24 +2703,154 @@ def mark_reuse(camp: Campaign, old: str, what: str) -> None:
             shutil.copy2(src, os.path.join(dst, fn))
 
 
+# ---------------------------------------------------------------------------
+# Amendment C.8: the project layout (one isolated project per eval session on the owner's EXISTING server)
+# ---------------------------------------------------------------------------
+def oh_layout(args) -> str:
+    return getattr(args, "layout", None) or "project"
+
+
+def layout_suffix(layout: str) -> tuple[str, str]:
+    """(step suffix, dir suffix): the diagnostic split-session path keeps its own steps / dirs."""
+    return ("", "") if layout == "project" else (".split", "-split")
+
+
+def projects_dir_of(cfg: dict, args=None) -> str:
+    raw = (getattr(args, "projects_dir", None) or cfg["hars"].get("projects_dir") or os.environ.get("HARS_MEMORY_PROJECTS_DIR")
+           or DEFAULT_PROJECTS_DIR)
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def oh_projects(camp: Campaign) -> dict:
+    """The provisioned projects of this campaign (campaign.json c8_projects), or a loud error."""
+    d = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects")
+    if not d or not d.get("pids"):
+        raise HomeRunError("no projects are provisioned for this campaign: run `home_run.py oh-provision --resume "
+                           f"{os.path.basename(camp.path)}`, restart your HARS server ONCE, then `doctor --resume ...`. "
+                           "(--layout split-session is the diagnostic side-channel path and needs none.)")
+    return d
+
+
+def layout_args(camp: Campaign, layout: str, *, ingested: bool) -> list[str]:
+    if layout != "project":
+        return ["--hars-layout", "split-session"]
+    pj = oh_projects(camp)
+    return ["--hars-layout", "project", "--hars-run-id", pj["hars_run_id"]] + (["--hars-ingested"] if ingested else [])
+
+
+def cmd_oh_provision(camp: Campaign, args) -> int:
+    """Write one project dir per eval session into the projects dir of the owner's server (nothing else: no server is
+    started or stopped, `default` and the global KB are never touched) and say what to do next."""
+    cfg = camp.cfg
+    chains_path = oh_inputs(camp)
+    data = oh_convert(camp)
+    import longsession as LS  # noqa: PLC0415
+    sessions = [x for x in LS.load_sessions([data])]
+    prev = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects") or {}
+    rid = prev.get("hars_run_id") or f"e{re.sub(r'[^0-9TZ]', '', os.path.basename(camp.path)[:16])}"
+    pdir = projects_dir_of(cfg, args)
+    pids = {x["sid"]: LS.make_project_id(rid, x["sid"]) for x in sessions}
+    if "default" in pids.values() or len(set(pids.values())) != len(pids):
+        raise HomeRunError("project ids collide or hit the reserved id `default`")
+    print(f"[oh-provision] {len(pids)} project(s) `nc-{rid}-<sid>` under {pdir} (run id {rid})")
+    if args.dry_run:
+        for sid, pid in pids.items():
+            print(f"  {pid}  <- session {sid}")
+        return 0
+    os.makedirs(pdir, exist_ok=True)
+    for sid, pid in pids.items():
+        d = os.path.join(pdir, pid)
+        os.makedirs(d, exist_ok=True)
+        meta = {"project_id": pid, "name": pid, "index_dir": os.path.join(d, "index"), "staging_dir": os.path.join(d, "staging"),
+                "visibility": "private", "description": f"neurocompact eval session {sid} (campaign {os.path.basename(camp.path)})"}
+        write_json(os.path.join(d, "project.json"), meta)
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj["c8_projects"] = {"ts": utc_iso(), "hars_run_id": rid, "projects_dir": pdir, "pids": pids, "eval_version": HOME_RUN_VERSION}
+    write_json(camp.p("campaign.json"), cj)
+    camp.step("oh.provision", lambda: {"projects": len(pids), "projects_dir": pdir, "hars_run_id": rid})
+    default_dir = os.path.abspath(os.path.expanduser(DEFAULT_PROJECTS_DIR))
+    print(f"\n[oh-provision] wrote {len(pids)} project.json under {pdir}.\n"
+          f"  NEXT (once): RESTART your existing HARS server so it discovers them (the registry reads the projects dir at start "
+          "only; there is no MCP/HTTP reload).\n"
+          + ("" if pdir == default_dir else
+             f"  Your server must run with HARS_MEMORY_PROJECTS_DIR={pdir} (not the default dir); also put `projects_dir = \"{pdir}\"` "
+             "under [hars] in home_run.toml.\n")
+          + f"  Then: home_run.py doctor --resume {os.path.basename(camp.path)}   (row projects.registered)\n"
+          f"        home_run.py oh-ingest --dry-run --resume {os.path.basename(camp.path)}   then without --dry-run\n"
+          f"        home_run.py oh-probe  --resume ...   then   home_run.py oh-enrich --resume ...\n"
+          "  The eval writes ONLY into these nc-* projects (memory_upsert_document) and never into `default`.")
+    return 0
+
+
+def estimate_oh_ingest(camp: Campaign, args, old: str) -> dict:
+    data = oh_convert(camp)
+    b = [int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])]
+    pj = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects") or {}
+    extra = oh_ls_extra(camp.cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--hars-layout", "project", "--ingest-only",
+                                                      "--hars-run-id", pj.get("hars_run_id") or "DRYRUN"]
+    s = estimate_ls(camp, "oh", data, b, "end", True, extra=extra, tag=".ingest", reused=True)
+    return {"track": "oh", "gen_usd": 0.0, "run_usd": s["run_usd"], "judge_usd": 0.0, "judged_items": 0,
+            "wall_hours": s["ingest_hours"], "budgets": b, "sessions": s["sessions"], "boundaries": s["boundaries"],
+            "ingest_hours": s["ingest_hours"], "unpriced_models": s["unpriced_models"], "cache_saving_usd": 0.0,
+            "note": "ingest only: memory_upsert_document of the dropped spans (same pieces, same boundaries) into the nc-* projects; "
+                    "cost = the flagged estimate of the SERVER-side extraction, wall-clock = pieces x extract_s_per_piece; "
+                    "no query writing, no asks, no judge"}
+
+
+def cmd_oh_ingest(camp: Campaign, args) -> int:
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-ingest")
+    cfg = camp.cfg
+    old = oh_old_run(camp, args)
+    data = oh_convert(camp)
+    if args.dry_run:
+        print_estimate(camp, estimate_oh_ingest(camp, args, old), "oh-ingest")
+        return 0
+    oh_projects(camp)
+    mark_reuse(camp, old, "oh-ingest")
+    est = camp.step("oh.ingest.estimate", lambda: {"estimate": estimate_oh_ingest(camp, args, old)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", "ingest-run")
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    ids = [c["chain_id"] for c in read_jsonl(oh_inputs(camp))]
+    extra = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old] + layout_args(camp, "project", ingested=False) + ["--ingest-only"]
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, extra, len(ids), args.accept_partial, "oh-ingest", step="oh.ingest.run")
+    rows = read_jsonl(os.path.join(run_dir, "ingest.jsonl"))
+    bad = [r for r in rows if not r.get("ok")]
+    camp.step("oh.ingest", lambda: {"projects": len(rows), "problems": len(bad), "dir": run_dir})
+    print(f"\n[oh-ingest] {len(rows)} project(s) written ({len(bad)} with problems). Next: home_run.py oh-probe --resume "
+          f"{os.path.basename(camp.path)}")
+    return 1 if bad else 0
+
+
 def cmd_oh_probe(camp: Campaign, args) -> int:
     camp.reuse_ok = True
     guard_spend(camp, "oh-probe")
     cfg = camp.cfg
+    layout = oh_layout(args)
+    S, D = layout_suffix(layout)
+    if layout != "project":
+        print("[oh-probe] --layout split-session is DIAGNOSTIC ONLY: it probes the server's session side channel, not the memory "
+              "(REPORT-PROTOCOL.md Amendment C.8)")
     old = oh_old_run(camp, args)
     chains_path = oh_inputs(camp)
     ids = [c["chain_id"] for c in read_jsonl(chains_path)]
     data = oh_convert(camp)
+    lx = layout_args(camp, layout, ingested=True) if not args.dry_run or layout == "project" and (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects") else \
+        (["--hars-layout", "project", "--hars-run-id", "DRYRUN", "--hars-ingested"] if layout == "project" else ["--hars-layout", "split-session"])
     if args.dry_run:
-        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=True), "oh-probe")
+        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=True, layout_extra=lx), f"oh-probe{D}")
         return 0
-    mark_reuse(camp, old, "oh-probe")
-    est = camp.step("oh.probe.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=True)})["estimate"]
+    if layout == "project" and not camp.is_done("oh.ingest"):
+        raise HomeRunError("the project layout probes INGESTED projects: run `home_run.py oh-ingest --resume "
+                           f"{os.path.basename(camp.path)}` first (provision -> restart server -> doctor -> oh-ingest)")
+    mark_reuse(camp, old, f"oh-probe{D}")
+    est = camp.step(f"oh.probe{S}.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=True, layout_extra=lx)})["estimate"]
     guard_estimate(camp, "oh", est, args.accept_partial)
-    run_dir = camp.p("oh", "probe-run")
+    run_dir = camp.p("oh", f"probe-run{D}")
     budgets = [max(int(b) for b in (args.budgets or cfg["oh"]["budgets"]))]
-    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, probe=True, args=args), len(ids),
-                args.accept_partial, "oh-probe", step="oh.probe.run")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, probe=True, args=args, layout_extra=lx),
+                len(ids), args.accept_partial, f"oh-probe{D}", step=f"oh.probe{S}.run")
     summ = read_json(os.path.join(run_dir, "probe-summary.json"), {}) or {}
     rep = os.path.join(run_dir, "REPORT-probe.md")
     if os.path.isfile(rep):
@@ -2721,11 +2858,12 @@ def cmd_oh_probe(camp: Campaign, args) -> int:
 
     def done():
         return {"summary": os.path.join(run_dir, "probe-summary.json"), "report": rep, "probe_jsonl": os.path.join(run_dir, "probe.jsonl"),
-                "n_questions": summ.get("n_questions"), "n_recoverable": summ.get("n_recoverable"),
+                "n_questions": summ.get("n_questions"), "n_recoverable": summ.get("n_recoverable"), "layout": layout,
                 "headline": {k: (summ.get("all", {}).get(k) or {}).get("rate") for k in
                              ("A_raw", "A_packed", "B_raw", "C_old_cap", "D_old_cap")}}
-    camp.step("oh.probe", done)
-    print(f"\n[oh-probe] done. Read {rep}; next (paid): home_run.py oh-enrich --resume {os.path.basename(camp.path)}")
+    camp.step(f"oh.probe{S}", done)
+    print(f"\n[oh-probe] done. Read {rep}; next (paid): home_run.py oh-enrich --resume {os.path.basename(camp.path)}"
+          + (" --layout split-session" if layout != "project" else ""))
     summarize_track(camp, "oh", run_dir)
     return 0
 
@@ -2751,17 +2889,26 @@ def cmd_oh_enrich(camp: Campaign, args) -> int:
     camp.reuse_ok = True
     guard_spend(camp, "oh-enrich")
     cfg = camp.cfg
+    layout = oh_layout(args)
+    S, D = layout_suffix(layout)
+    if layout != "project":
+        print("[oh-enrich] --layout split-session is DIAGNOSTIC ONLY: the recall is the server's session side channel, not the "
+              "memory (REPORT-PROTOCOL.md Amendment C.8). Use the project layout for the decision.")
+    have_pj = bool((read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects"))
+    ingested = layout == "project" and camp.is_done("oh.ingest")
+    lx = layout_args(camp, layout, ingested=ingested) if (not args.dry_run or have_pj or layout != "project") else \
+        ["--hars-layout", "project", "--hars-run-id", "DRYRUN"] + (["--hars-ingested"] if ingested else [])
     old = oh_old_run(camp, args, need_judged=True)
     chains_path = oh_inputs(camp)
     ids = [c["chain_id"] for c in read_jsonl(chains_path)]
     data = oh_convert(camp)
     budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
     if args.dry_run:
-        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=False), "oh-enrich")
+        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=False, layout_extra=lx), f"oh-enrich{D}")
         return 0
-    if not camp.is_done("oh.probe") and not args.skip_probe:
+    if not camp.is_done(f"oh.probe{S}") and not args.skip_probe:
         raise HomeRunError("run the recall probe first (it is cheap and tells whether the retrieval can work at all): "
-                           f"home_run.py oh-probe --resume {os.path.basename(camp.path)}; or pass --skip-probe (recorded)")
+                           f"home_run.py oh-probe --resume {os.path.basename(camp.path)}{' --layout split-session' if layout != 'project' else ''}; or pass --skip-probe (recorded)")
     if args.skip_probe:
         print("[oh-enrich] --skip-probe: the recall probe is skipped (recorded)")
     prof = P.load_profile(cfg["general"]["profile"])
@@ -2771,12 +2918,12 @@ def cmd_oh_enrich(camp: Campaign, args) -> int:
     if old_jm and old_jm != jm:
         raise HomeRunError(f"the old verdicts were made by judge {old_jm!r}, this profile judges with {jm!r}: a paired "
                            "contrast across two judges is not valid. Use the same profile / judge model.")
-    mark_reuse(camp, old, "oh-enrich")
-    est = camp.step("oh.enrich.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=False)})["estimate"]
+    mark_reuse(camp, old, f"oh-enrich{D}")
+    est = camp.step(f"oh.enrich{S}.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=False, layout_extra=lx)})["estimate"]
     guard_estimate(camp, "oh", est, args.accept_partial)
-    run_dir = camp.p("oh", "enrich-run")
-    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, args=args), len(ids),
-                args.accept_partial, "oh-enrich", step="oh.enrich.run")
+    run_dir = camp.p("oh", f"enrich-run{D}")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, args=args, layout_extra=lx), len(ids),
+                args.accept_partial, f"oh-enrich{D}", step=f"oh.enrich{S}.run")
     summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
     par = summ.get("parity_enriched") or {}
     bad = {B: v for B, v in par.items() if not v.get("in_window")}
@@ -2790,17 +2937,17 @@ def cmd_oh_enrich(camp: Campaign, args) -> int:
     rec = os.path.join(run_dir, "records.jsonl")
     ji, ji_new = os.path.join(run_dir, "judge-input.jsonl"), os.path.join(run_dir, "judge-input.new.jsonl")
     old_judged = os.path.join(old, "judged.jsonl")
-    camp.step("oh.enrich.export", lambda: (camp.run("oh.enrich.export", [camp.script("export_longsession_judge.py"), "--records", rec,
+    camp.step(f"oh.enrich{S}.export", lambda: (camp.run(f"oh.enrich{S}.export", [camp.script("export_longsession_judge.py"), "--records", rec,
                                                                            "--sessions", data, "--out", ji]), {"out": ji})[1])
-    camp.step("oh.enrich.export_new", lambda: (camp.run("oh.enrich.export_new", [
+    camp.step(f"oh.enrich{S}.export_new", lambda: (camp.run(f"oh.enrich{S}.export_new", [
         camp.script("export_longsession_judge.py"), "--records", rec, "--sessions", data, "--out", ji_new,
         "--skip-judged", old_judged]), {"out": ji_new, "items": sum(1 for _ in open(ji_new))})[1])
     if args.skip_judge:
         print("[oh-enrich] --skip-judge: stopping before the judge")
         return 0
     new_j, mp = os.path.join(run_dir, "judged.new.jsonl"), os.path.join(run_dir, "judge-mapping.json")
-    camp.step("oh.enrich.judge", lambda: judge_step(camp, "oh", "oh-enrich", ji_new, new_j, mp, args.accept_partial,
-                                                    step="oh.enrich.judge"))
+    camp.step(f"oh.enrich{S}.judge", lambda: judge_step(camp, "oh", f"oh-enrich{D}", ji_new, new_j, mp, args.accept_partial,
+                                                    step=f"oh.enrich{S}.judge"))
     merged = os.path.join(run_dir, "judged.jsonl")
 
     def do_merge():
@@ -2808,11 +2955,11 @@ def cmd_oh_enrich(camp: Campaign, args) -> int:
         if info["missing"]:
             raise HomeRunError(f"{len(info['missing'])} valid row(s) have no judge verdict (old or new): {info['missing'][:3]}")
         return info
-    camp.step("oh.enrich.merge", do_merge)
+    camp.step(f"oh.enrich{S}.merge", do_merge)
     excl = oh_exclusions(camp)
     xs = (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else [])
-    camp.step("oh.enrich.metrics", lambda: metrics_step(
-        camp, "oh.enrich.metrics", rec, merged, mp, ji, os.path.join(run_dir, "REPORT-oh-enrich.md"),
+    camp.step(f"oh.enrich{S}.metrics", lambda: metrics_step(
+        camp, f"oh.enrich{S}.metrics", rec, merged, mp, ji, os.path.join(run_dir, "REPORT-oh-enrich.md"),
         os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only", "--ls-family", "oh"] + xs))
 
     def do_funnel():
@@ -2820,9 +2967,9 @@ def cmd_oh_enrich(camp: Campaign, args) -> int:
                 "--out-md", os.path.join(run_dir, "funnel.md"), "--out-json", os.path.join(run_dir, "funnel.json")]
         if cfg["oh"].get("graph_store"):
             argv += ["--graph-store", cfg["oh"]["graph_store"]]
-        rc, _ = camp.run("oh.enrich.funnel", argv, check=False)
+        rc, _ = camp.run(f"oh.enrich{S}.funnel", argv, check=False)
         return {"md": os.path.join(run_dir, "funnel.md"), "rc": rc, "note": "best effort"}
-    camp.step("oh.enrich.funnel", do_funnel)
+    camp.step(f"oh.enrich{S}.funnel", do_funnel)
     summarize_track(camp, "oh", run_dir)
     print(f"\n[oh-enrich] report: {os.path.join(run_dir, 'REPORT-oh-enrich.md')}; next: home_run.py bundle --resume {os.path.basename(camp.path)}")
     return 0
@@ -3499,6 +3646,20 @@ def build_parser() -> argparse.ArgumentParser:
             t.add_argument("--pick", type=int, default=None, metavar="N", help="choose candidate N of --find/--session-id (non-interactive)")
             t.add_argument("--projects-root", default=None, help="where transcripts live (default [cc] root = ~/.claude/projects)")
             t.add_argument("--top", type=int, default=15, help="--list: how many sessions")
+    t = sub.add_parser("oh-provision", parents=[common],
+                       help="Amendment C.8: write one project dir per eval session (nc-<run id>-<sid>) into the projects dir of YOUR "
+                            "existing HARS server and tell you to restart it once; touches no server, never `default`")
+    t.add_argument("--dry-run", action="store_true", help="list the projects and stop")
+    t.add_argument("--projects-dir", default=None, metavar="DIR",
+                   help="the projects dir your server discovers (HARS_MEMORY_PROJECTS_DIR; default [hars] projects_dir or "
+                        f"{DEFAULT_PROJECTS_DIR})")
+    t = sub.add_parser("oh-ingest", parents=[common],
+                       help="Amendment C.8: write the dropped spans (same pieces / boundaries, the old notes) into the provisioned "
+                            "projects with memory_upsert_document; only server-side extraction is spent; run before oh-probe")
+    t.add_argument("--dry-run", action="store_true", help="print the estimate (ingest wall-clock + extraction cost) and stop")
+    t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+    t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
+    t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
     for name, hlp in (("oh-probe", "Amendment C.7: recall probe on a FINISHED oh campaign (reuses its HARS sessions; cents; no answer model, "
                                    "no judge): where is the anchor lost - old shape, packer, or retrieval?"),
                       ("oh-enrich", "Amendment C.7: run ONLY nc-enriched against a FINISHED oh campaign (reuses its HARS sessions, "
@@ -3508,6 +3669,10 @@ def build_parser() -> argparse.ArgumentParser:
         t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
         t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
         t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
+        t.add_argument("--layout", choices=("project", "split-session"), default=None,
+                       help="project (default, Amendment C.8): the memory = the session's own project, written by oh-ingest / "
+                            "read with memory_recall(project=...). split-session: the server's session SIDE CHANNEL - "
+                            "DIAGNOSTIC ONLY, it does not measure the memory")
         if name == "oh-probe":
             t.add_argument("--probe-caps", default=None, metavar="N,N", help="token caps of the max_chars sweep (default 800,1536,3000,6000)")
         else:
@@ -3558,10 +3723,48 @@ def overrides_from_args(args) -> dict:
     return o
 
 
+def project_doctor_rows(cfg: dict, probes: Probes, camp: Campaign) -> list[dict]:
+    """Amendment C.8 rows (only when the campaign was provisioned): the projects are registered on the server, the
+    eval never writes to `default`, and which of them already hold data."""
+    pj = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects")
+    if not pj:
+        return [check_row("projects.registered", "WARN", "this campaign is not provisioned (oh-provision) - the project layout needs it",
+                          scope="oh")]
+    rows: list[dict] = []
+    pids = sorted(pj["pids"].values())
+    rows.append(check_row("projects.default_untouched", "OK" if "default" not in pids else "FAIL",
+                          f"{len(pids)} nc-* project(s); the eval writes only into them (memory_upsert_document), never into "
+                          "`default` / the global KB", scope="oh"))
+    url = cfg["general"]["mcp"]
+    try:
+        lp = probes.mcp(url, "memory_list_projects", {}, 60)
+        have = {p.get("project_id") for p in (lp or {}).get("projects", [])}
+        missing = [p for p in pids if p not in have]
+        rows.append(check_row("projects.registered", "OK" if not missing else "FAIL",
+                              f"{len(pids) - len(missing)}/{len(pids)} registered on {url}" + (
+                                  f"; MISSING {missing[:3]}{'...' if len(missing) > 3 else ''}: the server reads its projects dir at "
+                                  f"start only - restart it once (HARS_MEMORY_PROJECTS_DIR={pj.get('projects_dir')})" if missing else ""),
+                              scope="oh"))
+        if not missing:
+            filled = []
+            for pid in pids:
+                st = probes.mcp(url, "memory_status", {"project": pid}, 60) or {}
+                if int(st.get("node_count") or 0):
+                    filled.append(pid)
+            rows.append(check_row("projects.state", "OK", f"{len(filled)}/{len(pids)} already hold entities "
+                                  f"({'ingest done' if len(filled) == len(pids) else 'oh-ingest not finished' if filled else 'all empty: ready for oh-ingest'})",
+                                  scope="oh"))
+    except Exception as e:  # noqa: BLE001
+        rows.append(check_row("projects.registered", "FAIL", f"memory_list_projects failed: {type(e).__name__}: {str(e)[:120]}", scope="oh"))
+    return rows
+
+
 def cmd_doctor(cfg: dict, args, probes: Probes, offline: bool, camp: Campaign | None) -> int:
     tracks = tuple(t for t in args.tracks.split(",") if t)
     rows = doctor_checks(cfg, probes, live=not args.no_live, deep=args.deep, tracks=tracks, offline=offline,
                          legacy_replay=bool(getattr(args, "legacy_replay", False)))
+    if camp is not None and not offline:
+        rows.extend(project_doctor_rows(cfg, probes, camp))
     tbl, _ = role_model_table(cfg)
     rep_ = {"ts": utc_iso(), "version": HOME_RUN_VERSION, "role_models": tbl, "checks": rows}
     if camp is not None:
@@ -3656,7 +3859,8 @@ def _main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
             return 0
         if args.cmd in REUSE_CMDS:
             camp.reuse_ok = True
-            return {"oh-probe": cmd_oh_probe, "oh-enrich": cmd_oh_enrich}[args.cmd](camp, args)
+            return {"oh-provision": cmd_oh_provision, "oh-ingest": cmd_oh_ingest, "oh-probe": cmd_oh_probe,
+                    "oh-enrich": cmd_oh_enrich}[args.cmd](camp, args)
         if args.cmd == "calibrate":
             return cmd_calibrate(camp, args)
         if args.cmd == "oh":

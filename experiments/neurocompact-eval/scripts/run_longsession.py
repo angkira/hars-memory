@@ -5,6 +5,11 @@ Input: longsession/1 sessions (see longsession.py docstring; import_beam.py, imp
 gen_longsession_qa.py produce them). Nothing here runs by itself: the OWNER runs it with their
 models / embedder / HARS. ``--dry-run`` needs no network at all.
 
+HARS LAYOUT (Amendment C.8, --hars-layout): `project` (default for nc-enriched) writes each session's dropped context with
+memory_upsert_document into its own project `nc-<run id>-<sid>` of the same server and reads it with memory_recall(project=...,
+NO session_id) = the memory used like the global memory. `split-session` (memory_compact + memory_recall(session_id)) only exercises
+the server's session SIDE CHANNEL - DIAGNOSTIC ONLY; it is the layout of the question-time arms nc-chunks / nc-graph.
+
 BOUNDARIES (arm-independent, so every arm sees the same history)
   synthetic  after message i joins the live context, if tokens(live) + reserve > W (--window) a
              compaction fires: the last <= T tokens (--keep-tail, whole messages) stay as the TAIL,
@@ -155,6 +160,7 @@ NOTE_ARMS = (ARM_CHUNKS, ARM_GRAPH, ARM_ENRICHED, ARM_NOTE)   # arms that carry 
 STORE_ARMS = (ARM_CHUNKS, ARM_GRAPH, ARM_ENRICHED)            # arms that need the HARS session (ingest or reuse)
 ENRICH_TOP_K = 8                                # frozen nc-chunks call shape: top_k = 8, no session_graph
 ENRICH_QUERY_MAX_CHARS = 300
+LAYOUT_SPLIT, LAYOUT_PROJECT = "split-session", "project"      # Amendment C.8: split-session = DIAGNOSTIC ONLY
 RECALL_RAW_FILE = "recall_raw.jsonl"            # sidecar: raw recall text per rid (never inline in records)
 PROMPT_VERSION = "ls-1"
 SUM_MAX_TOKENS_SLACK = 1.8        # summariser max_tokens = cap*slack+64: real provider tokens run up to ~1.7x the
@@ -871,9 +877,14 @@ def estimate_cost(plan: dict, args, prices: dict) -> dict:
                    "extract_usd": ext_usd, "est_ingest_hours": sum(pieces) * args.extract_s_per_piece / 3600.0}
     reuse = getattr(args, "reuse_info", None)
     reused_arms = set(reuse["arms"]) if reuse else set()
-    if reuse:      # --reuse-run: the HARS sessions exist already - no ingest, no extraction, no memory_compact
+    out["hars"]["layout"] = getattr(args, "hars_layout", LAYOUT_SPLIT)
+    if reuse and (getattr(args, "hars_layout", LAYOUT_SPLIT) == LAYOUT_SPLIT or getattr(args, "hars_ingested", False)):
+        # split reuse / projects already ingested: the data exists - no ingest, no extraction, no write calls
         out["hars"] = {"pieces": 0, "memory_compact_calls": 0, "extract_chunks": 0, "extract_usd": 0.0,
-                       "est_ingest_hours": 0.0, "reused_run": reuse["run_id"]}
+                       "est_ingest_hours": 0.0, "reused_run": reuse["run_id"], "layout": out["hars"]["layout"]}
+    elif not reuse and getattr(args, "hars_ingested", False):
+        out["hars"] = {"pieces": 0, "memory_compact_calls": 0, "extract_chunks": 0, "extract_usd": 0.0, "est_ingest_hours": 0.0,
+                       "layout": out["hars"]["layout"], "already_ingested": True}
     for B in args.budgets:
         ncap = note_cap_formula(B)
         res: dict[str, float] = {}
@@ -985,6 +996,8 @@ def print_dry_run(plans: list[dict], args, prices: dict, *, as_json: bool = Fals
         arms = args.arms_list
         hf = len(args.budgets) if args.hars_per_budget else 1
         tot = total_usd(est, arms, hf)
+        if getattr(args, "ingest_only", False):       # only the server-side extraction is paid (notes are reused)
+            tot = est["hars"]["extract_usd"] * hf
         grand += tot
         dr = [b["dropped_tokens"] for b in p["boundaries"]]
         sess = {"sid": p["sid"], "messages": p["n_messages"], "tokens": p["total_tokens"],
@@ -1019,11 +1032,14 @@ def print_dry_run(plans: list[dict], args, prices: dict, *, as_json: bool = Fals
                      f"questions asked per checkpoint: "
                      f"{dict(list(sess['questions_per_checkpoint'].items())[:6])}")
         h = est["hars"]
-        if h.get("reused_run"):
+        if h.get("already_ingested"):
+            lines.append("  HARS ingest: NONE (--hars-ingested: the projects were written by oh-ingest)")
+        elif h.get("reused_run"):
             lines.append(f"  HARS ingest: NONE (--reuse-run: HARS sessions of run {h['reused_run']} are reused; "
                          "no memory_compact, no extraction, no ingest wall-clock)")
         else:
-            lines.append(f"  HARS ingest: {h['pieces']:,} pieces in {h['memory_compact_calls']:,} memory_compact calls, "
+            lines.append(f"  HARS ingest ({'memory_upsert_document into project nc-*' if h.get('layout') == LAYOUT_PROJECT else 'memory_compact, split-session = DIAGNOSTIC'}): "
+                         f"{h['pieces']:,} pieces in {h['memory_compact_calls']:,} write calls, "
                          f"{h['extract_chunks']:,} extraction chunks ~{fmt_usd(h['extract_usd'])}"
                          f"{' x' + str(len(args.budgets)) + ' budgets' if args.hars_per_budget else ''}, "
                          f"~{h['est_ingest_hours']:.1f} h (guess {args.extract_s_per_piece}s/piece)")
@@ -1089,17 +1105,68 @@ class Hars:
                 args["run_tag"] = self.run_tag
             return self.rcm.mcp_call(self.url, "memory_compact", args, timeout=self.ct)
 
-    def recall(self, sid: str, question: str, graph: bool) -> dict:
+    def recall(self, sid: str, question: str, graph: bool, project: str | None = None) -> dict:
         with self.rs:
-            return self.rcm.hars_recall(self.url, sid, question, timeout=self.rt, graph=graph)
+            return self.rcm.hars_recall(self.url, sid, question, timeout=self.rt, graph=graph, project=project)
 
-    def recall_correct(self, sid: str, query: str, ll: list, hl: list, max_chars: int | None) -> dict:
-        """The C.7 shape: query + ll/hl keywords, mode hybrid, server default top_k, server max_chars."""
+    def recall_correct(self, sid: str, query: str, ll: list, hl: list, max_chars: int | None,
+                       project: str | None = None) -> dict:
+        """The C.7 shape: query + ll/hl keywords, mode hybrid, server default top_k, server max_chars. With `project`
+        (Amendment C.8) the call goes to that project's main index and carries NO session_id."""
         with self.rs:
-            return self.rcm.hars_recall_correct(self.url, sid, query, ll, hl, max_chars, timeout=self.rt)
+            return self.rcm.hars_recall_correct(self.url, sid, query, ll, hl, max_chars, timeout=self.rt, project=project)
+
+    def upsert(self, project: str, path: str, content: str) -> dict:
+        """Amendment C.8 write path: memory_upsert_document(project, virtual file_path, content) - the tool the global
+        memory is written with (full LightRAG extraction into the project's MAIN index and Qdrant collection)."""
+        check_project_writable(project)
+        with self.cs:
+            return self.rcm.mcp_call(self.url, "memory_upsert_document",
+                                     {"file_path": path, "content": content, "project": project}, timeout=self.ct)
+
+    def project_state(self, project: str) -> dict:
+        """memory_status(project): registered?, graph size, vectors (Qdrant points / NanoVectorDB files)."""
+        try:
+            st = self.rcm.mcp_call(self.url, "memory_status", {"project": project}, timeout=120)
+        except Exception as e:  # noqa: BLE001
+            return {"registered": False, "error": f"{type(e).__name__}: {str(e)[:160]}"}
+        return project_state_of(st, project)
 
     def status(self, sid: str) -> dict:
         return self.rcm.hars_status(self.url, sid)
+
+
+def check_project_writable(project) -> None:
+    """Amendment C.8: the owner's global memory (`default`) is never written by an eval."""
+    if not str(project or "").strip() or str(project).strip() == "default":
+        raise ValueError(f"refusing to write into project {project!r}: the eval writes only its own nc-* projects")
+
+
+def project_state_of(st: dict, project: str) -> dict:
+    """Normalise a memory_status payload: registered (ok and the server answered for THIS project), node/edge counts,
+    vectors (Qdrant: points in the project's workspace; NanoVectorDB: number of vdb_* files)."""
+    st = st if isinstance(st, dict) else {}
+    ok = st.get("ok") is not False and str(st.get("project") or "") == project
+    vec = ((st.get("storage") or {}).get("vector") or {}) if ok else {}
+    vectors = vec.get("points_count") if vec.get("points_count") is not None else vec.get("file_count")
+    return {"registered": ok, "error": None if ok else str(st.get("error") or "project not answered")[:160],
+            "nodes": st.get("node_count"), "edges": st.get("edge_count"), "vectors": vectors,
+            "vector_backend": vec.get("backend"), "index_exists": st.get("index_exists")}
+
+
+def project_doc_path(pid: str, j: int, call: int) -> str:
+    """Virtual (never opened) absolute file path of one ingest document: stable per (project, boundary, call), so a
+    re-run is a fingerprint no-op and a changed document is purged and re-inserted by the server."""
+    return f"/nc-eval/{pid}/j{j:03d}-c{call:02d}.md"
+
+
+def project_doc_content(hsid: str, j: int, call: int, calls: int, summary: str, pieces: list[str]) -> str:
+    """The compaction document of the split layout, as plain document text (same sections; pieces are the SAME
+    piece splitting, newlines collapsed like the server's compaction does)."""
+    facts = [re.sub(r"\s*\n\s*", " ", x).strip() for x in pieces]
+    lines = [f"Session: {hsid}", f"Boundary: {j}", f"Call: {call}/{calls}", "Tags: session, compaction", "",
+             "## Summary", summary.strip(), "", "## Dropped context facts", *(f"- {x}" for x in facts if x)]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 class FakeHars:
@@ -1114,6 +1181,43 @@ class FakeHars:
         self.fail_recall = False
         self.degraded = False
         self.correct_calls: list[dict] = []        # tests: the exact C.7 call arguments
+        # Amendment C.8 project layout: neighbour projects of the SAME server, each with its own docs / entities
+        self.projects: dict[str, dict] = {}
+        self.auto_register = True                  # False: an unknown project answers 404 like the real server
+        self.default_kb: list[str] = []            # chunks of the owner's global KB (the `default` project)
+        self.upsert_calls: list[dict] = []
+        self.recall_args: list[dict] = []
+
+    def register_project(self, pid: str) -> None:
+        self.projects.setdefault(pid, {"docs": {}, "ents": set()})
+
+    def _proj(self, pid: str):
+        if pid not in self.projects and self.auto_register:
+            self.register_project(pid)
+        return self.projects.get(pid)
+
+    def upsert(self, project, path, content):
+        check_project_writable(project)
+        with self.lock:
+            self.upsert_calls.append({"project": project, "path": path, "chars": len(content)})
+            st = self._proj(project)
+            if st is None:
+                return {"ok": False, "error": f"Project '{project}' not found", "code": 404}
+            action = "unchanged" if st["docs"].get(path) == content else ("updated" if path in st["docs"] else "inserted")
+            for k in [k for k in st["docs"] if k.startswith(path + "#")]:
+                del st["docs"][k]
+            for i, ch in enumerate(content.split("\n- ")):      # the server chunks a document; one chunk per fact here
+                st["docs"][f"{path}#{i}"] = ch
+            st["docs"][path] = content
+            st["ents"].update(re.findall(r"[A-Za-z_][\w./-]*\d[\w./-]*", content))
+            return {"ok": True, "action": action, "file_path": path}
+
+    def project_state(self, project):
+        st = self._proj(project)
+        if st is None:
+            return {"registered": False, "error": "project not found"}
+        return {"registered": True, "error": None, "nodes": len(st["ents"]), "edges": len(st["ents"]) // 2,
+                "vectors": len(st["docs"]), "vector_backend": "fake", "index_exists": bool(st["docs"])}
 
     def health(self) -> dict:
         return {"status": "ok", "fake": True}
@@ -1135,19 +1239,29 @@ class FakeHars:
         return {"compactions": st["seq"], "entities": len(st["ents"]), "relations": len(st["ents"]) // 2,
                 "vectors_indexed": len(st["docs"])}
 
-    def recall_correct(self, sid, query, ll, hl, max_chars):
+    def recall_correct(self, sid, query, ll, hl, max_chars, project=None):
         """Offline twin of memory_recall in the C.7 shape: ranks ALL docs (server default top_k 20), renders
         whole chunks under max_chars (a chunk that no longer fits is skipped), reports graph_branch like the
-        server (enabled only with keywords)."""
+        server (enabled only with keywords). With `project` (C.8) it searches ONLY that project's main index and the
+        session_id is not sent; without it the session's own chunks are scored as the server's side channel does and
+        the owner's global KB (`default_kb`) is searched too."""
         with self.lock:
             self.recall_calls += 1
-            self.correct_calls.append({"sid": sid, "query": query, "ll_keywords": list(ll), "hl_keywords": list(hl),
-                                       "max_chars": max_chars})
-            st = self.s.get(sid)
+            self.correct_calls.append({"sid": None if project else sid, "project": project, "query": query,
+                                       "ll_keywords": list(ll), "hl_keywords": list(hl), "max_chars": max_chars})
+            if project:
+                pst = self._proj(project)
+                st = ({"docs": [v for k, v in pst["docs"].items() if "#" in k], "ents": pst["ents"], "seq": 1} if pst else None)
+            else:
+                st = self.s.get(sid)
+                if st is not None and self.default_kb:
+                    st = {**st, "docs": list(st["docs"]) + list(self.default_kb)}
         if self.fail_recall:
             return {"context": "", "error": "fake recall failure"}
         kw = bool(ll or hl)
         gb = {"enabled": kw, "reason": "graph mode 'hybrid' requested with keywords" if kw else "no graph signal"}
+        if not st and project:
+            return {"ok": False, "context": "", "error": f"Project '{project}' not found", "code": 404}
         if not st:
             return {"ok": True, "context": "", "session": {"status": "unknown_session"}, "graph_branch": gb,
                     "lightrag_mode": "hybrid" if kw else "skipped"}
@@ -1162,16 +1276,24 @@ class FakeHars:
             used += len(line)
         raw = ["Document Chunks (each has a reference_id):", "```json", *kept, "```", "",
                "Reference Document List (for reference):", "```", f"[1] {sid}.md", "```"]
-        return {"ok": True, "context": "\n".join(raw),
-                "session": {"status": "ok", "vectors_indexed": len(st["docs"]), "entities": len(st["ents"])},
-                "graph_branch": gb, "lightrag_mode": "hybrid" if kw else "skipped", "mode_fallback": None}
+        out = {"ok": True, "context": "\n".join(raw), "graph_branch": gb,
+               "lightrag_mode": "hybrid" if kw else "skipped", "mode_fallback": None}
+        if not project:                 # the real server adds the session block only for a session_id call
+            out["session"] = {"status": "ok", "vectors_indexed": len(st["docs"]), "entities": len(st["ents"])}
+        return out
 
-    def recall(self, sid, question, graph):
+    def recall(self, sid, question, graph, project=None):
         with self.lock:
             self.recall_calls += 1
-            st = self.s.get(sid)
+            if project:
+                pst = self._proj(project)
+                st = ({"docs": [v for k, v in pst["docs"].items() if "#" in k], "ents": pst["ents"], "seq": 1} if pst else None)
+            else:
+                st = self.s.get(sid)
         if self.fail_recall:
             return {"context": "", "error": "fake recall failure"}
+        if not st and project:
+            return {"ok": False, "context": "", "error": f"Project '{project}' not found", "code": 404}
         if not st:
             return {"ok": True, "context": "", "session": {"status": "unknown_session"}}
         qw = set(re.findall(r"\w{3,}", question.lower()))
@@ -1283,13 +1405,17 @@ def make_hars_sid(run_id: str, sid: str, B: int, per_budget: bool) -> str:
     return f"ls-{run_id}-{sid}{f'-b{B}' if per_budget else ''}"[:128]
 
 
-def reuse_problems(plans: list[dict], reuse: dict) -> list[str]:
+def reuse_problems(plans: list[dict], reuse: dict, a_=None) -> list[str]:
     """Static checks of a --reuse-run (no network): load_reuse problems + end-only checkpoints + the copied arms'
     question sets. Any problem is fatal BEFORE anything is spent."""
     why = list(reuse["problems"])
     for p in plans:
         if not p["boundaries"]:
             continue
+        if (getattr(a_, "hars_layout", None) == LAYOUT_PROJECT and not getattr(a_, "hars_ingested", False)
+                and p["sid"] not in reuse["memory_cache"]):
+            why.append(f"{p['sid']}: the project layout re-ingests EVERY boundary with its original rolling note, which needs "
+                       f"{reuse['dir']}/memory/{p['sid']}.json (absent)")
         n = len(p["boundaries"])
         if p["checkpoints"] != [n]:
             why.append(f"{p['sid']}: --reuse-run needs end-only checkpoints (got {p['checkpoints']}): the reused HARS session "
@@ -1345,6 +1471,58 @@ def copy_reused_rows(ctx, plans: list[dict], reuse: dict) -> int:
     return n
 
 
+def post_project_gate(hars, pid: str | None, expected_calls: int = 0) -> list[str]:
+    """After ingest: the project exists on the server and its MAIN index holds vectors and entities."""
+    if not pid:
+        return ["no project id"]
+    try:
+        check_project_writable(pid)
+    except ValueError as e:
+        return [str(e)]
+    st = hars.project_state(pid)
+    why: list[str] = []
+    if not st.get("registered"):
+        return [f"{pid}: not registered on the server ({st.get('error')}): provision it and restart the server once"]
+    if not int(st.get("nodes") or 0):
+        why.append(f"{pid}: memory_status.node_count == {st.get('nodes')} (no entities extracted: extractor dead or misrouted?)")
+    if not int(st.get("vectors") or 0):
+        why.append(f"{pid}: no vectors in the project's index (memory_status vector storage: {st.get('vector_backend')})")
+    return why
+
+
+def pre_project_gate(hars, pid: str, fresh: bool) -> list[str]:
+    """Before any spend: the project is registered on the server, is not `default`, and (fresh ingest) is EMPTY."""
+    try:
+        check_project_writable(pid)
+    except ValueError as e:
+        return [str(e)]
+    st = hars.project_state(pid)
+    if not st.get("registered"):
+        return [f"{pid}: not registered on the server ({st.get('error')}). Projects are read at server start only: run "
+                "`home_run.py oh-provision --resume <campaign>`, restart the server once, retry"]
+    if fresh and (int(st.get("nodes") or 0) or int(st.get("vectors") or 0)):
+        return [f"{pid}: the project is not empty (nodes={st.get('nodes')}, vectors={st.get('vectors')}): a fresh ingest needs "
+                "an empty project (wipe <projects dir>/<pid>/ and restart the server, or resume the run that wrote it)"]
+    return []
+
+
+def layout_gate(ctx, a, plans: list[dict]) -> list[str]:
+    """Project layout, run before anything is spent (not skippable by --no-preflight)."""
+    why: list[str] = []
+    for p in plans:
+        if not p["boundaries"]:
+            continue
+        for B in (a.budgets if a.hars_per_budget else [max(a.budgets)]):
+            pid = L.make_project_id(ctx.hars_run_id, p["sid"], B, a.hars_per_budget)
+            mem = JsonCache(ctx.path("memory", f"{p['sid']}.json"))
+            resumed = any(str(k).startswith("ingest|") for k in mem.d)
+            if a.hars_ingested:
+                why += post_project_gate(ctx.hars, pid)
+            else:
+                why += pre_project_gate(ctx.hars, pid, fresh=not resumed)
+    return list(dict.fromkeys(why))
+
+
 class SessionRun:
     def check_budget(self):
         b = self.c.budget
@@ -1397,6 +1575,25 @@ class SessionRun:
 
     def hars_sid(self, B: int) -> str:
         return make_hars_sid(self.c.hars_run_id, self.sid, B, self.a.hars_per_budget)
+
+    def project_of(self, B: int) -> str | None:
+        """Amendment C.8: the isolated HARS project of (sid[, B]) in the project layout, else None."""
+        if self.a.hars_layout != LAYOUT_PROJECT:
+            return None
+        return L.make_project_id(self.c.hars_run_id, self.sid, B, self.a.hars_per_budget)
+
+    def expected_calls(self) -> int:
+        """memory_upsert_document calls of the WHOLE session (all boundaries) at this run's piece parameters."""
+        n = 0
+        for b in self.plan["boundaries"]:
+            pieces = L.split_pieces(self.msgs[b["drop_start"]:b["at_idx"]], self.a.piece_chars)
+            n += max(1, L.ceil_div(len(pieces), self.a.pieces_per_call))
+        return n
+
+    def ingest_marks(self) -> int:
+        """memory_upsert_document calls this run's cache records as finished (resume bookkeeping)."""
+        return sum(int(v.get("calls") or 0) for k, v in self.mem.d.items()
+                   if str(k).startswith("ingest|") and isinstance(v, dict) and v.get("ok"))
 
     def note_budget_for_store(self) -> int:
         bs = [B for B in self.a.budgets if self.need_store(B)] or self.a.budgets
@@ -1469,7 +1666,7 @@ class SessionRun:
         return entry
 
     # ------------------------------------------------------------- HARS ingest
-    def ingest(self, b: dict, dropped: list[dict], note: str, hsid: str, tag: str):
+    def ingest(self, b: dict, dropped: list[dict], note: str, hsid: str, tag: str, project: str | None = None):
         key = f"ingest|{tag}|j{b['j']}"
         done = self.mem.get(key)
         pieces = L.split_pieces(dropped, self.a.piece_chars)
@@ -1487,12 +1684,16 @@ class SessionRun:
             err = ""
             for attempt in (0, 1):
                 try:
-                    r = self.c.hars.compact(hsid, summary, chunk, meta)
+                    if project:        # C.8: the global memory's own write tool, into the session's neighbour project
+                        r = self.c.hars.upsert(project, project_doc_path(project, b["j"], c + 1),
+                                               project_doc_content(hsid, b["j"], c + 1, n_calls, summary, chunk))
+                    else:
+                        r = self.c.hars.compact(hsid, summary, chunk, meta)
                     if isinstance(r, dict) and r.get("ok") is not False:
-                        seqs.append(r.get("seq"))
+                        seqs.append(r.get("seq") or r.get("action"))
                         err = ""
                         break
-                    err = f"memory_compact ok=false: {str(r)[:200]}"
+                    err = f"{'memory_upsert_document' if project else 'memory_compact'} ok=false: {str(r)[:200]}"
                 except Exception as e:  # noqa: BLE001
                     err = f"{type(e).__name__}: {str(e)[:200]}"
                 if attempt == 0:
@@ -1505,7 +1706,7 @@ class SessionRun:
         self.mem.put(key, {"ok": True, "calls": n_calls, "seqs": seqs})
         self.charge_extraction_estimate(b, dropped)
         self.log_comp({"j": b["j"], "arm": "hars", "ok": True, "cached": False, "pieces": len(pieces),
-                       "calls": n_calls, "seconds": round(time.time() - t0, 2),
+                       "project": project, "calls": n_calls, "seconds": round(time.time() - t0, 2),
                        "drop_chars": sum(len(x) for x in pieces)})
 
     def charge_extraction_estimate(self, b: dict, dropped: list[dict]):
@@ -1559,8 +1760,9 @@ class SessionRun:
         prompt = enrich_query_prompt(note, recent, a.enrich_queries)
         sample = L.serialize(self.msgs[:b["at_idx"]])[:60000]
         cpt = chars_per_token(sample)
+        pid = self.project_of(B)
         sha = hashlib.sha256(json.dumps([prompt, hs, cap, a.packer, ENRICH_PROMPT_VERSION, self.c.sum_llm.model,
-                                         tok_label(), a.enrich_queries, cpt]).encode()).hexdigest()
+                                         tok_label(), a.enrich_queries, cpt, pid]).encode()).hexdigest()
         path = self.c.path("enrich", self.sid, f"j{j}.b{B}.json")
         if os.path.exists(path):
             old = json.load(open(path))
@@ -1576,7 +1778,8 @@ class SessionRun:
             i, q = i_q
             t1 = time.time()
             try:
-                pay = self.c.hars.recall_correct(hs, q["query"], q["ll_keywords"], q["hl_keywords"], max_chars)
+                pay = (self.c.hars.recall_correct(hs, q["query"], q["ll_keywords"], q["hl_keywords"], max_chars, project=pid)
+                       if pid else self.c.hars.recall_correct(hs, q["query"], q["ll_keywords"], q["hl_keywords"], max_chars))
             except Exception as e:  # noqa: BLE001
                 pay = {"context": "", "error": f"{type(e).__name__}: {str(e)[:200]}"}
             pay = dict(pay) if isinstance(pay, dict) else {"context": "", "error": "non-dict payload"}
@@ -1631,9 +1834,10 @@ class SessionRun:
         if cap_info["recall_cap_clamped_low"] and note_tokens > B:
             reasons.append(f"note alone busts the budget ({note_tokens} > {B})")
         raw_union = "\n".join(str((p or {}).get("context") or "") for p in pays)
-        en = {"sha": sha, "sid": self.sid, "j": j, "B": B, "hars_sid": hs, "n_questions": n_questions,
+        en = {"sha": sha, "sid": self.sid, "j": j, "B": B, "hars_sid": hs, "hars_project": pid, "hars_layout": a.hars_layout,
+              "n_questions": n_questions,
               "note_sha256": L.sha256_text(note), "note_tokens": note_tokens, "cap_info": cap_info, "chars_per_token": cpt,
-              "packer": a.packer, "top_k_sent": None, "recall_shape": "C.7 correct usage: query + ll/hl keywords, "
+              "packer": a.packer, "top_k_sent": None, "recall_shape": ("C.8 project memory: project=<pid>, NO session_id, " if pid else "") + "C.7 correct usage: query + ll/hl keywords, "
               "mode hybrid, server-default top_k, no session_graph, budget via max_chars" if a.packer != "legacy" else
               "C.7 shape without max_chars, then the legacy packer",
               "query_gen": {"model": self.c.sum_llm.model, "raw": r["text"], "prompt_sha256": L.sha256_text(prompt),
@@ -1783,6 +1987,7 @@ class SessionRun:
                 "persisted_compaction": (self.ingest_ok if arm in STORE_ARMS else (False if arm == ARM_BASELINE else None)),
                 "agent_model": self.c.sum_llm.model, "qa_model": self.c.qa_llm.model,
                 "agent_provider": a.provider, "tokenizer": tok_label(), "tokenizer_native": tok_native(),
+                "hars_layout": a.hars_layout, "hars_project": self.project_of(B) if arm in STORE_ARMS else None,
                 "_reasons": reasons,
             }
             row.update(cap_info)
@@ -1820,7 +2025,17 @@ class SessionRun:
             return
         tail = self.tail_text(b)
         tail_tokens = count_tokens(tail)
-        if self.need_store():
+        if self.need_store() and self.a.hars_layout == LAYOUT_PROJECT:
+            fails = []
+            for B in self.a.budgets:
+                if self.need_store(B):
+                    fails += post_project_gate(self.c.hars, self.project_of(B), self.expected_calls())
+            for (arm, B) in self.todo:
+                if arm in STORE_ARMS:
+                    self.reasons[(arm, B)] += [f"project gate: {f}" for f in fails]
+            self.log_comp({"j": j, "arm": "hars", "project_gate_fails": fails,
+                           "projects": [self.project_of(B) for B in self.a.budgets if self.need_store(B)]})
+        elif self.need_store():
             st = self.c.hars.status(self.hars_sid(max(self.a.budgets)))
             rcm = L.rc()
             fails, _warns = rcm.status_gate_problems(st) if rcm and hasattr(rcm, "status_gate_problems") else ([], [])
@@ -1881,14 +2096,16 @@ class SessionRun:
                     if not e.get("skipped"):
                         self.clip[("note", B)][0] += 1
                         self.clip[("note", B)][1] += int(e["clipped"] and not e["clipped_repaired"])
-            if any(self.need_store(B) for B in a.budgets) and self.ingest_ok and not self.c.reuse:
+            reuse_ingested = bool(self.c.reuse) and a.hars_layout == LAYOUT_SPLIT     # split reuse: sessions exist
+            if (any(self.need_store(B) for B in a.budgets) and self.ingest_ok and not reuse_ingested
+                    and not a.hars_ingested):
                 if a.hars_per_budget:
                     for B in a.budgets:
                         if self.need_store(B):
-                            self.ingest(b, dropped, self.note_text[B], self.hars_sid(B), f"b{B}")
+                            self.ingest(b, dropped, self.note_text[B], self.hars_sid(B), f"b{B}", self.project_of(B))
                 else:
-                    self.ingest(b, dropped, self.note_text[store_B], self.hars_sid(store_B), "shared")
-            if j in plan["checkpoints"]:
+                    self.ingest(b, dropped, self.note_text[store_B], self.hars_sid(store_B), "shared", self.project_of(store_B))
+            if j in plan["checkpoints"] and not a.ingest_only:
                 self.ask_checkpoint(b)
             if j % 10 == 0 or j == len(plan["boundaries"]):
                 print(f"  [{self.sid}] boundary {j}/{len(plan['boundaries'])} done in {time.time() - t0:.1f}s",
@@ -1897,6 +2114,18 @@ class SessionRun:
 
     def finish(self):
         a = self.a
+        if a.ingest_only:
+            st = post_project_gate(self.c.hars, self.project_of(self.note_budget_for_store()), self.expected_calls()) \
+                if self.ingest_ok else [f"ingest failed: {self.ingest_err}"]
+            self.c.append("ingest.jsonl", {"sid": self.sid, "project": self.project_of(self.note_budget_for_store()),
+                                           "hars_sid": self.hars_sid(self.note_budget_for_store()), "ok": not st,
+                                           "problems": st, "calls": self.expected_calls(),
+                                           "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+            print(f"[{self.sid}] ingest-only: project {self.project_of(self.note_budget_for_store())} "
+                  f"{'ok' if not st else 'PROBLEMS ' + '; '.join(st[:2])}", flush=True)
+            if st:
+                raise RuntimeError("; ".join(st))
+            return
         for (arm, B) in sorted(self.todo):
             rows = self.rows.get((arm, B), [])
             why = list(dict.fromkeys(self.reasons.get((arm, B), [])))
@@ -2027,7 +2256,8 @@ def run_recall_probe(ctx, a, sessions, plans) -> int:
     rcm = L.rc()
     import funnel_chains as FC
     reuse = ctx.reuse
-    gate = reuse_hars_gate(ctx.hars, plans, a, reuse)
+    project_layout = a.hars_layout == LAYOUT_PROJECT
+    gate = [] if project_layout else reuse_hars_gate(ctx.hars, plans, a, reuse)     # project layout: layout_gate ran in _run
     if gate:
         for g in gate:
             print(f"[probe] HARS gate FAIL: {g}", file=sys.stderr, flush=True)
@@ -2045,7 +2275,8 @@ def run_recall_probe(ctx, a, sessions, plans) -> int:
         sid, msgs = plan["sid"], plan["session"]["messages"]
         b = plan["boundaries"][-1]
         j = b["j"]
-        hs = make_hars_sid(reuse["run_id"], sid, B, a.hars_per_budget)
+        hs = make_hars_sid(ctx.hars_run_id if project_layout else reuse["run_id"], sid, B, a.hars_per_budget)
+        pid = L.make_project_id(ctx.hars_run_id, sid, B, a.hars_per_budget) if project_layout else None
         n = reuse["notes"].get((sid, B))
         note = n["text"] if n else ""
         if not note and sid in reuse["memory_cache"]:
@@ -2067,10 +2298,10 @@ def run_recall_probe(ctx, a, sessions, plans) -> int:
             anc = q["gold_anchor"].strip()
             pat = anchor_pattern(anc)
             has = lambda t: bool(pat.search(t or ""))  # noqa: E731
-            r: dict = {"sid": sid, "qid": q["qid"], "qtype": q.get("qtype"), "lag": lag, "gold_anchor": anc, "hars_sid": hs,
+            r: dict = {"sid": sid, "qid": q["qid"], "qtype": q.get("qtype"), "lag": lag, "gold_anchor": anc, "hars_sid": hs, "hars_project": pid,
                        "old_cap": old_cap, "hits": {"anchor_in_note": has(note)}, "anchor_in_dropped": has(dropped)}
             # (A) the old frozen shape + the legacy packer at the old cap
-            pa = ctx.hars.recall(hs, q["question"], False)
+            pa = ctx.hars.recall(hs, q["question"], False, project=pid) if pid else ctx.hars.recall(hs, q["question"], False)
             ctxA = str((pa or {}).get("context") or "")
             ctx.append(RECALL_RAW_FILE, {"rid": f"{sid}::probe::{q['qid']}::A", "sid": sid, "query": q["question"], "raw": ctxA,
                                          "raw_chars": len(ctxA), "error": (pa or {}).get("error"), "kind": "probe_A"})
@@ -2091,7 +2322,8 @@ def run_recall_probe(ctx, a, sessions, plans) -> int:
             r.update({"keywords": bool(kw["ll_keywords"] or kw["hl_keywords"]), "ll_keywords": kw["ll_keywords"],
                       "hl_keywords": kw["hl_keywords"], "keyword_cost_usd": kr["cost_usd"]})
             # (B) the correct shape, raw
-            pb = ctx.hars.recall_correct(hs, q["question"], kw["ll_keywords"], kw["hl_keywords"], None)
+            pb = (ctx.hars.recall_correct(hs, q["question"], kw["ll_keywords"], kw["hl_keywords"], None, project=pid) if pid
+                  else ctx.hars.recall_correct(hs, q["question"], kw["ll_keywords"], kw["hl_keywords"], None))
             ctxB = str((pb or {}).get("context") or "")
             ctx.append(RECALL_RAW_FILE, {"rid": f"{sid}::probe::{q['qid']}::B", "sid": sid, "query": q["question"], "raw": ctxB,
                                          "raw_chars": len(ctxB), "error": (pb or {}).get("error"), "kind": "probe_B",
@@ -2107,7 +2339,8 @@ def run_recall_probe(ctx, a, sessions, plans) -> int:
             for cap, key in [(old_cap, "old_cap")] + [(c, str(c)) for c in caps]:
                 try:
                     pay, inj, tot, att = budget_recall(
-                        lambda mc, kw=kw: ctx.hars.recall_correct(hs, q["question"], kw["ll_keywords"], kw["hl_keywords"], mc),
+                        lambda mc, kw=kw: (ctx.hars.recall_correct(hs, q["question"], kw["ll_keywords"], kw["hl_keywords"], mc, project=pid)
+                                           if pid else ctx.hars.recall_correct(hs, q["question"], kw["ll_keywords"], kw["hl_keywords"], mc)),
                         hs, cap, cpt)
                     r["hits"][f"C_{key}"] = None if pay.get("error") else has(str(pay.get("context") or ""))
                     r["C"][key] = {"cap": cap, "tokens": tot, "attempts": att, "error": pay.get("error")}
@@ -2127,7 +2360,7 @@ def run_recall_probe(ctx, a, sessions, plans) -> int:
     summ = probe_aggregate(rows, caps)
     summ["problems"] = problems
     summ["keyword_cost_usd"] = round(sum(r.get("keyword_cost_usd") or 0.0 for r in rows), 6)
-    meta = {"run_id": ctx.run_id, "reused_run": reuse["run_id"], "B": B, "old_caps": old_caps}
+    meta = {"run_id": ctx.run_id, "reused_run": reuse["run_id"], "B": B, "old_caps": old_caps, "hars_layout": a.hars_layout}
     atomic_write(ctx.path("probe-summary.json"), json.dumps({"meta": meta, "caps": caps, **summ}, indent=1))
     md = probe_report(summ, caps, meta)
     atomic_write(ctx.path("REPORT-probe.md"), md)
@@ -2244,6 +2477,8 @@ def preflight(ctx: Ctx, args) -> list[str]:
         print(f"[preflight] HARS healthz ok: {str(h)[:120]}", flush=True)
     except Exception as e:  # noqa: BLE001
         return fails + [f"HARS healthz failed: {type(e).__name__}: {e}"]
+    if args.hars_layout == LAYOUT_PROJECT:     # no session-recall probe: layout_gate checks the projects themselves
+        return fails
     rcm = L.rc_require("preflight_verdict")
     pf = ctx.hars.recall(args.preflight_session or f"ls-preflight-{ctx.run_id}", "preflight probe", False)
     f2, w2 = rcm.preflight_verdict(pf, args.preflight_session, args.allow_degraded)
@@ -2287,6 +2522,21 @@ def parse_args(argv=None):
                          "'' = copy nothing)")
     ap.add_argument("--reuse-regenerate-notes", action="store_true",
                     help="with --reuse-run: accept a summary that has to be regenerated because the old run's stored one does not match")
+    ap.add_argument("--hars-layout", choices=(LAYOUT_PROJECT, LAYOUT_SPLIT), default=None,
+                    help="Amendment C.8. project (default for nc-enriched): the session's dropped context is written with "
+                         "memory_upsert_document into its OWN project on the same server (`nc-<run id>-<sid>`, provisioned by "
+                         "`home_run.py oh-provision`) and read back with memory_recall(project=..., NO session_id), exactly like "
+                         "the global memory. split-session: memory_compact + memory_recall(session_id) = the server's session "
+                         "SIDE CHANNEL (cosine/F1 on the question over session chunks), NOT the memory - DIAGNOSTIC ONLY, and the "
+                         "only layout of the question-time arms nc-chunks / nc-graph")
+    ap.add_argument("--hars-run-id", default=None, metavar="ID",
+                    help="project layout: the id in the project names (provisioned up front; default: this run's id)")
+    ap.add_argument("--hars-ingested", action="store_true",
+                    help="project layout: the projects were ingested by an earlier run with the same --hars-run-id (oh-ingest): "
+                         "no ingest here, gate = projects registered and non-empty")
+    ap.add_argument("--ingest-only", action="store_true",
+                    help="project layout: write the dropped spans (+ the reused notes) into the projects and stop: no queries, "
+                         "no asks, no answer model; spends only the server-side extraction (estimated)")
     ap.add_argument("--recall-probe", action="store_true",
                     help="Amendment C.7 diagnostic, NO answer model and NO judge: with --reuse-run, for every answerable question compare "
                          "(A) the old frozen recall shape + legacy packer, (B) the correct shape raw, (C) the correct shape via max_chars at "
@@ -2390,6 +2640,21 @@ def parse_args(argv=None):
         if ARM_ENRICHED in [x.strip() for x in a.reuse_arms.split(",")]:
             raise SystemExit("--reuse-arms must not contain nc-enriched: that arm is the one being paid for")
     a.probe_caps = [int(x) for x in str(a.probe_caps).split(",") if x.strip()]
+    question_time = [x for x in a.arms_list if x in (ARM_CHUNKS, ARM_GRAPH)]
+    if a.hars_layout is None:
+        a.hars_layout = LAYOUT_SPLIT if question_time else LAYOUT_PROJECT
+    if a.hars_layout == LAYOUT_PROJECT and question_time:
+        raise SystemExit(f"--hars-layout project cannot run the question-time arms {question_time}: they recall with a session_id "
+                         "(split-session, diagnostic only)")
+    if a.hars_layout == LAYOUT_SPLIT and (a.hars_ingested or a.ingest_only or a.hars_run_id):
+        raise SystemExit("--hars-ingested / --ingest-only / --hars-run-id belong to --hars-layout project")
+    if a.ingest_only:
+        a.arms_list = [ARM_ENRICHED]
+        a.reuse_arms = ""
+        if a.recall_probe or a.hars_ingested:
+            raise SystemExit("--ingest-only excludes --recall-probe / --hars-ingested")
+    if a.recall_probe and a.hars_layout == LAYOUT_PROJECT and not a.hars_ingested:
+        raise SystemExit("--recall-probe in the project layout probes ingested projects: pass --hars-ingested (run oh-ingest first)")
     a.reuse_info = None
     resolve_models_into(a)
     return a
@@ -2461,7 +2726,7 @@ def main(argv=None) -> int:
     reuse_why: list[str] = []
     if a.reuse_run:
         a.reuse_info = load_reuse(a, plans)
-        reuse_why = reuse_problems(plans, a.reuse_info)
+        reuse_why = reuse_problems(plans, a.reuse_info, a)
         for w in a.reuse_info["warnings"]:
             print(f"[reuse] warning: {w}", file=sys.stderr)
         for w in reuse_why:
@@ -2529,7 +2794,10 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
     ctx.load_done()
     if a.reuse_info:
         ctx.reuse = a.reuse_info
-        ctx.hars_run_id = a.reuse_info["run_id"]
+        if a.hars_layout == LAYOUT_SPLIT:
+            ctx.hars_run_id = a.reuse_info["run_id"]
+    if a.hars_layout == LAYOUT_PROJECT and a.hars_run_id:
+        ctx.hars_run_id = a.hars_run_id
     print(f"run {run_id} -> {out} (tokenizer {tok_label()} native={tok_native()}, resume={resuming}, sessions={len(plans)})", flush=True)
     write_inputs_and_scripts(ctx, a, sessions)
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -2545,18 +2813,32 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
         print("preflight failed - nothing spent. Fix the above (the budget check cannot be skipped).",
               file=sys.stderr)
         return 3
+    if a.hars_layout == LAYOUT_PROJECT and (any(x in STORE_ARMS for x in a.arms_list) or a.recall_probe):
+        lg = layout_gate(ctx, a, plans)
+        if lg:
+            for g in lg:
+                print(f"[layout] GATE FAIL: {g}", file=sys.stderr, flush=True)
+            print("project-layout gate failed - nothing spent.", file=sys.stderr)
+            return 3
+    elif a.hars_layout == LAYOUT_SPLIT and (any(x in STORE_ARMS for x in a.arms_list) or a.recall_probe):
+        print("[layout] split-session is DIAGNOSTIC ONLY: the recall is the server's session side channel, not the memory "
+              "(REPORT-PROTOCOL.md Amendment C.8)", flush=True)
     if a.recall_probe:
         return run_recall_probe(ctx, a, sessions, plans)
     if ctx.reuse:
-        gate = reuse_hars_gate(hars, plans, a, ctx.reuse)
-        if gate:
-            for g in gate:
-                print(f"[reuse] HARS gate FAIL: {g}", file=sys.stderr, flush=True)
-            print("reuse gate failed - nothing spent (the reused HARS sessions are not usable on this server).", file=sys.stderr)
-            return 3
-        nrows = copy_reused_rows(ctx, plans, ctx.reuse)
-        print(f"[reuse] run {ctx.reuse['run_id']}: HARS gate ok for {len([p for p in plans if p['boundaries']])} session(s); "
-              f"{nrows} row(s) of arms {ctx.reuse['arms']} copied (reused_from set); no memory_compact will be called", flush=True)
+        if a.hars_layout == LAYOUT_SPLIT:
+            gate = reuse_hars_gate(hars, plans, a, ctx.reuse)
+            if gate:
+                for g in gate:
+                    print(f"[reuse] HARS gate FAIL: {g}", file=sys.stderr, flush=True)
+                print("reuse gate failed - nothing spent (the reused HARS sessions are not usable on this server).", file=sys.stderr)
+                return 3
+        nrows = 0 if a.ingest_only else copy_reused_rows(ctx, plans, ctx.reuse)
+        print(f"[reuse] run {ctx.reuse['run_id']}: {len([p for p in plans if p['boundaries']])} session(s); "
+              f"{nrows} row(s) of arms {ctx.reuse['arms']} copied (reused_from set); "
+              + ("HARS sessions reused, no memory_compact will be called" if a.hars_layout == LAYOUT_SPLIT else
+                 "notes reused; the dropped spans are written into the nc-* projects (data is NOT reusable across layouts)"),
+              flush=True)
     failed: list[str] = []
 
     def run_one(plan):

@@ -98,6 +98,7 @@ from hars_memory.projects import (
     ProjectMetadata,
     get_default_project_registry,
 )
+from hars_memory.projects.registry import qdrant_workspace_for
 from hars_memory.server.embedder import describe_embedder, qdrant_collection_names
 from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_query_event, log_write_event, setup_logging
@@ -1024,7 +1025,7 @@ def _index_status(project: ProjectMetadata | None = None) -> dict[str, Any]:
         staging_dir = Path(project.staging_dir) if project.staging_dir else Path(HARS_MEMORY_STAGING_DIR)
         graph_file = _graph_file_path(project)
         prefix = project.qdrant_collection_prefix or HARS_MEMORY_QDRANT_COLLECTION_PREFIX
-        workspace_id = project.qdrant_collection or HARS_MEMORY_QDRANT_COLLECTION
+        workspace_id = qdrant_workspace_for(project)
     else:
         working_dir = Path(HARS_MEMORY_INDEX_DIR)
         project_id = "default"
@@ -1305,9 +1306,9 @@ async def _get_graph(project_id: str = "default") -> tuple[Any, str]:
     Raises FileNotFoundError if the index has not been built yet.
     """
     global _graph_cache, _graph_cache_mtime
-    if _graph_cache is not None:
-        return _graph_cache, "hit"
     if project_id == "default":
+        if _graph_cache is not None:
+            return _graph_cache, "hit"
         graph_file = _graph_file_path()
         if not graph_file.exists():
             raise FileNotFoundError(f"Index not built yet: {graph_file}")
@@ -1334,8 +1335,11 @@ async def _get_graph(project_id: str = "default") -> tuple[Any, str]:
 def _clear_in_memory_graph_cache(project_id: str | None = None) -> None:
     """Reset cached NetworkX graph instance in memory."""
     global _graph_cache, _graph_cache_mtime
-    _graph_cache = None
-    _graph_cache_mtime = None
+    if not project_id or project_id == "default":
+        # the module-level cache belongs to the default project only: a write to a
+        # neighbour project must not evict (and force a rebuild of) its graph
+        _graph_cache = None
+        _graph_cache_mtime = None
     if project_id:
         get_default_project_registry().invalidate_caches(project_id)
     else:
@@ -1355,9 +1359,9 @@ _bm25_lock = asyncio.Lock()
 async def _get_bm25_index(project_id: str = "default") -> tuple[Any, str]:
     """Return (cached BM25SparseIndex, cache_status) for the given project."""
     global _bm25_cache, _bm25_cache_source_mtime
-    if _bm25_cache is not None:
-        return _bm25_cache, "hit"
     if project_id == "default":
+        if _bm25_cache is not None:
+            return _bm25_cache, "hit"
         from hars_memory.retrieval.bm25_index import (
             CHUNKS_FILENAME,
             BM25IndexUnavailableError,
@@ -1385,8 +1389,9 @@ async def _get_bm25_index(project_id: str = "default") -> tuple[Any, str]:
 def _invalidate_bm25_cache(project_id: str | None = None) -> None:
     """Reset cached BM25SparseIndex in memory."""
     global _bm25_cache, _bm25_cache_source_mtime
-    _bm25_cache = None
-    _bm25_cache_source_mtime = None
+    if not project_id or project_id == "default":
+        _bm25_cache = None
+        _bm25_cache_source_mtime = None
     if project_id:
         get_default_project_registry().invalidate_caches(project_id)
     else:

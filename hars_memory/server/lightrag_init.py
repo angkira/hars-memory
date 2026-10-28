@@ -609,7 +609,12 @@ def create_lightrag(
             os.environ["QDRANT_URL"] = _qdrant_url
         # QDRANT_WORKSPACE isolates data within a shared collection; map our
         # collection config to it so multi-tenant separation is preserved.
-        if not os.environ.get("QDRANT_WORKSPACE"):
+        # An EXPLICIT per-instance collection (multi-project server: registry.get_rag,
+        # subgraph compaction) must win over a value an earlier instance left in the
+        # process environment, otherwise every project after the first would read and
+        # write the first project's workspace. Without an explicit collection the
+        # operator's own QDRANT_WORKSPACE (or the env-derived default) is kept.
+        if qdrant_collection or not os.environ.get("QDRANT_WORKSPACE"):
             os.environ["QDRANT_WORKSPACE"] = _qdrant_coll
 
     Path(_wdir).mkdir(parents=True, exist_ok=True)

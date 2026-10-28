@@ -82,6 +82,7 @@ evidence (EMPTY). All gates passed at rate 1.000 on all 70 items; hard-gate fail
   appended after the question and carries no arm-specific abstention instruction.
 - Cost ceilings: pre-freeze gate $0.60; full run $2.50 hard (RUNBOOK-gate.md).
 
+> **Amendment C.8 (2026-10-28), section 4a.8:** the only memory configuration is the PROJECT layout (the session's dropped context lives in its own project on the owner's server and is read with the global memory's own call); every split-session result (C.6 nc arms, any C.7 run on split) measured the server's session side channel and is diagnostic only.
 > **Amendment C.7 (2026-10-28), section 4a.7:** the primary treatment is now `nc-enriched` (memory recalled at compaction time, none at ask time); `nc-chunks` / `nc-graph` are exploratory.
 
 ## 4. Budget parity protocol, and why (amendment log)
@@ -851,6 +852,52 @@ contrast (Amendment D), never a replacement of the primary.
 `nc-chunks` / `nc-graph` remain available with `--arms`. `home_run.py oh` runs the new arm set (fresh campaign: ingest happens in the run;
 parity check on the enriched arm). The legacy 4-arm regime still analyses (rows without `nc-enriched`), flagged exploratory by C. The
 section-5 gate table is unchanged and now reads `treatment = nc-enriched`.
+
+### 4a.8 PROTOCOL AMENDMENT C.8 (2026-10-28, written AFTER the C.6 result and the C.7 design, BEFORE any project-layout record exists)
+
+**C.8-1. The finding (verified in the server code, not in a result).** In `HARS_MEMORY_SESSION_MODE=split` (the server default and the mode of
+every run so far) `memory_recall(session_id=...)` runs the real pipeline (keywords, hybrid dense + BM25 fusion, LightRAG graph branch,
+`max_chars` budgeting) only over the MAIN index of the project (`default`, the owner's global KB). The session's own data reaches the answer only
+through `_compute_session_channel` (`hars_memory/mcp_server.py`): `max(cosine, lexical F1)` of the QUESTION TEXT alone against the session's
+chunks, appended after the fused chunks. It is a side channel, not the memory; ll/hl keywords, the graph branch and the fusion never see the
+session. With keywords (C.7) the same call additionally pulled unrelated `default` KB chunks into the result. Consequently the C.6 arms
+`nc-chunks` / `nc-graph`, and every C.7 `nc-enriched` / probe run on the split layout (the layout of `oh-probe` / `oh-enrich` as shipped with C.7),
+measured that side channel, NOT the owner's memory. They are DIAGNOSTIC ONLY (`--hars-layout split-session`, `--layout split-session`); their
+records stay in the artifacts, flagged, and never enter an inference about memory.
+
+**C.8-2. The one memory configuration: the project layout.** "Global versus session" is expressed with what the server already has: the dropped
+context of each eval session is written into a NEIGHBOUR project of the same server and read back with the very call used for the global memory.
+No new service, tool, server mode or env switch.
+1. One isolated project per eval session, `nc-<hars run id>-<sid>` (sanitised, <= 63 chars, never `default`), provisioned by writing
+   `<projects dir>/<pid>/project.json` (`home_run.py oh-provision`); the owner restarts the existing server ONCE (the registry reads its projects
+   dir at construction only; there is no MCP/HTTP reload). Each project has its own `index_dir`, BM25 index, graph and Qdrant collection
+   `<base>_<project id>`.
+2. Write: `memory_upsert_document(project=<pid>, file_path=<virtual absolute path>, content=<document>)` - the global memory's document tool, full
+   LightRAG extraction into the project's main index. The documents carry the same sections as the split layout's compaction documents (the rolling
+   note as `## Summary` in the first call of each boundary, the dropped span as `## Dropped context facts`); piece splitting (`--piece-chars`,
+   `--pieces-per-call`) and boundaries are unchanged. `memory_compact` is not used. The write is idempotent per (project, boundary, call).
+3. Read: `memory_recall(project=<pid>, question=<query>, ll_keywords, hl_keywords, mode="hybrid", max_chars)`, the server's default `top_k`, NO
+   `session_id`, no `session_graph` - identical to how global memory is read, and the C.7-2 shape otherwise unchanged (K queries from the note and the
+   kept tail only, dedupe, rank interleave, cap = `recall_cap`, block computed once per boundary, validity rules). Per query `graph_branch.enabled`,
+   `lightrag_mode` and the keywords are recorded.
+4. Gates (before any spend, not skippable by `--no-preflight`): the project is registered on the server, is not `default`, and a fresh ingest finds
+   it EMPTY (a resumed run is exempt); after ingest the project's index holds entities and vectors (`memory_status(project)`). The eval refuses to
+   write into `default`.
+5. Known limit, stated: the block is built from the `Document Chunks` section of each recall (C.7-2 step 3); entity / relation sections of the
+   full pipeline's context are not packed. The graph branch still shapes which chunks come back.
+
+**C.8-3. What is reused, and why it is valid; what is not.** Reused from the finished C.6 campaign exactly as in C.7-4: the `baseline` and
+`nc-note-only` rows, their judge verdicts (same judge model, refused otherwise), and the exact rolling notes of every boundary (`memory/<sid>.json`
+of the old run, sha-checked). These were produced by code that C.8 does not touch (conversion, boundaries, summariser prompts and trimmer, ask prompt,
+native token counting, judge and blinding); `baseline` and `nc-note-only` never read HARS. NOT reusable: the HARS data (a different layout and
+different projects). The dropped spans are therefore RE-INGESTED into the new projects (`oh-ingest`), with the same pieces, the same boundaries and
+the old notes, so the only thing that differs between `nc-enriched` and `nc-note-only` is the block recalled from the session's own memory.
+Residual risks as in C.7-4 (a)-(d), plus: the new ingest is a new realisation of the extractor (not deterministic), persisted in the projects.
+
+**C.8-4. Version and guard.** EVAL-VERSION moves to `2026-10-28.c8`. The paid-step guard keeps refusing every campaign made under another version,
+with ONE exception, for `oh-provision` / `oh-ingest` / `oh-probe` / `oh-enrich` only: a campaign stamped `2026-10-27.c6` or `2026-10-28.c7`
+(`REUSE_COMPATIBLE_FROM`). No hypothesis, threshold, budget, formula or judge of C.7-3 changes; `oh-ingest` spends only the flagged estimate of the
+server-side extraction, `oh-probe` cents, and the probe must precede `oh-enrich` as before.
 
 ## 5. Measurement stack
 
