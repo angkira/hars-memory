@@ -96,3 +96,28 @@ def test_explicit_collection_wins_over_a_workspace_left_by_an_earlier_instance()
     """create_lightrag: the QDRANT_WORKSPACE rule (source-level pin; the factory itself needs lightrag + qdrant)."""
     src = (Path(__file__).resolve().parents[1] / "hars_memory" / "server" / "lightrag_init.py").read_text()
     assert 'if qdrant_collection or not os.environ.get("QDRANT_WORKSPACE"):' in src
+
+
+# --- memory_upsert_document records the fingerprint only after real processing ---------------
+def test_doc_processing_state_reads_lightrag_doc_status():
+    import asyncio
+
+    from hars_memory import mcp_server as ms
+
+    class Store:
+        def __init__(self, row):
+            self.row = row
+
+        async def get_by_id(self, _id):
+            return self.row
+
+    class Rag:
+        def __init__(self, row):
+            self.doc_status = Store(row)
+
+    run = asyncio.run
+    assert run(ms._doc_processing_state(Rag({"status": "processed"}), "d")) == "processed"
+    assert run(ms._doc_processing_state(Rag({"status": "pending"}), "d")) == "pending"
+    assert run(ms._doc_processing_state(Rag(None), "d")) == "missing"
+    assert run(ms._doc_processing_state(Rag("not-a-dict"), "d")) is None
+    assert run(ms._doc_processing_state(object(), "d")) is None

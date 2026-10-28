@@ -277,13 +277,35 @@ class HomeProvision(T7H.Base):
         for pid in names:
             meta = json.load(open(os.path.join(pdir, pid, "project.json")))
             self.assertEqual(meta["project_id"], pid)
-            self.assertEqual(meta["index_dir"], os.path.join(pdir, pid, "index"))
+            self.assertEqual(meta["index_dir"], os.path.join(pdir, pid, pid))
             self.assertTrue(pid.startswith(f"nc-{pj['hars_run_id']}-"))
         self.assertIn("RESTART your existing HARS server", so)
         self.assertIn(f"HARS_MEMORY_PROJECTS_DIR={pdir}", so)
         # idempotent: a second provision keeps the same run id
         self.assertEqual(self.go8("oh-provision", "--projects-dir", pdir)[0], 0)
         self.assertEqual(H.read_json(os.path.join(self.camp, "campaign.json"))["c8_projects"]["hars_run_id"], pj["hars_run_id"])
+
+    def test_new_projects_mints_a_fresh_run_id_and_retires_dependent_results(self):
+        pdir = os.path.join(self.d.name, "projects")
+        self.assertEqual(self.go8("oh-provision", "--projects-dir", pdir)[0], 0)
+        old = H.read_json(os.path.join(self.camp, "campaign.json"))["c8_projects"]
+        os.makedirs(os.path.join(self.camp, "oh", "ingest-run"))
+        open(os.path.join(self.camp, "oh", "ingest-run", "ingest.jsonl"), "w").write("{}\n")
+        H.write_json(os.path.join(self.camp, "steps", "oh.ingest.json"), {"step": "oh.ingest"})
+        H.write_json(os.path.join(self.camp, "steps", "oh.workspaces.json"), {"step": "oh.workspaces"})
+        rc, so, se = self.go8("oh-provision", "--projects-dir", pdir, "--new-projects")
+        self.assertEqual(rc, 0, so + se)
+        new = H.read_json(os.path.join(self.camp, "campaign.json"))["c8_projects"]
+        self.assertNotEqual(new["hars_run_id"], old["hars_run_id"])
+        self.assertTrue(set(new["pids"].values()).isdisjoint(old["pids"].values()))
+        self.assertFalse(os.path.exists(os.path.join(self.camp, "oh", "ingest-run")))
+        self.assertFalse(os.path.exists(os.path.join(self.camp, "steps", "oh.ingest.json")))
+        self.assertTrue(os.path.exists(os.path.join(self.camp, "steps", "oh.workspaces.json")))   # not project-bound
+        voids = [x for x in os.listdir(os.path.join(self.camp, "oh")) if x.startswith("void-")]
+        self.assertEqual(len(voids), 1)
+        self.assertTrue(os.path.isfile(os.path.join(self.camp, "oh", voids[0], "ingest-run", "ingest.jsonl")))
+        for pid in old["pids"].values():                                    # old project dirs are left for the owner
+            self.assertTrue(os.path.isdir(os.path.join(pdir, pid)))
 
     def test_ingest_and_project_probe_need_provision_and_ingest(self):
         rc, so, se = self.go8("oh-ingest")

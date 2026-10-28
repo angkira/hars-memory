@@ -2753,6 +2753,10 @@ def cmd_oh_provision(camp: Campaign, args) -> int:
     sessions = [x for x in LS.load_sessions([data])]
     prev = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects") or {}
     rid = prev.get("hars_run_id") or f"e{re.sub(r'[^0-9TZ]', '', os.path.basename(camp.path)[:16])}"
+    if getattr(args, "new_projects", False):
+        # fresh, never-used project ids: the old nc-* projects may hold data mixed across projects by the
+        # pre-fix LightRAG workspace sharing (all instances of a server process bound to one in-memory store)
+        rid = f"e{re.sub(r'[^0-9TZ]', '', os.path.basename(camp.path)[:16])}r{time.strftime('%m%d%H%M', time.gmtime())}"
     pdir = projects_dir_of(cfg, args)
     pids = {x["sid"]: LS.make_project_id(rid, x["sid"]) for x in sessions}
     if "default" in pids.values() or len(set(pids.values())) != len(pids):
@@ -2762,11 +2766,30 @@ def cmd_oh_provision(camp: Campaign, args) -> int:
         for sid, pid in pids.items():
             print(f"  {pid}  <- session {sid}")
         return 0
+    if getattr(args, "new_projects", False) and prev:
+        void = camp.p("oh", f"void-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
+        moved = []
+        for rel in ("ingest-run", "probe-run", "enrich-run", "agentic-run", "agentic-projects.json"):
+            if os.path.exists(camp.p("oh", rel)):
+                os.makedirs(void, exist_ok=True)
+                shutil.move(camp.p("oh", rel), os.path.join(void, rel))
+                moved.append(rel)
+        sdir = camp.p("steps")
+        for fn in sorted(os.listdir(sdir)) if os.path.isdir(sdir) else []:
+            if re.match(r"oh\.(ingest|probe|enrich|agentic)", fn):
+                os.makedirs(os.path.join(void, "steps"), exist_ok=True)
+                shutil.move(os.path.join(sdir, fn), os.path.join(void, "steps", fn))
+                moved.append("steps/" + fn)
+        print(f"[oh-provision] --new-projects: old run id {prev.get('hars_run_id')} retired; moved {len(moved)} item(s) "
+              f"depending on it to {void}. The old nc-* project dirs are NOT deleted (remove them by hand once the new "
+              "ingest works).")
     os.makedirs(pdir, exist_ok=True)
     for sid, pid in pids.items():
         d = os.path.join(pdir, pid)
         os.makedirs(d, exist_ok=True)
-        meta = {"project_id": pid, "name": pid, "index_dir": os.path.join(d, "index"), "staging_dir": os.path.join(d, "staging"),
+        # the index dir's own name must be unique per project: the server isolates LightRAG instances by it
+        # (hars_memory.server.lightrag_init.isolated_workspace); `<pid>/index` for every project would collide
+        meta = {"project_id": pid, "name": pid, "index_dir": os.path.join(d, pid), "staging_dir": os.path.join(d, "staging"),
                 "visibility": "private", "description": f"neurocompact eval session {sid} (campaign {os.path.basename(camp.path)})"}
         write_json(os.path.join(d, "project.json"), meta)
     cj = read_json(camp.p("campaign.json"), {}) or {}
@@ -3836,6 +3859,9 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--projects-dir", default=None, metavar="DIR",
                    help="the projects dir your server discovers (HARS_MEMORY_PROJECTS_DIR; default [hars] projects_dir or "
                         f"{DEFAULT_PROJECTS_DIR})")
+    t.add_argument("--new-projects", action="store_true",
+                   help="mint a NEW run id (fresh nc-* projects) and move the ingest/probe/enrich/agentic results of the old "
+                        "ones to oh/void-<ts>/; use after the LightRAG workspace-isolation fix (old projects may hold mixed data)")
     t = sub.add_parser("oh-ingest", parents=[common],
                        help="Amendment C.8: write the dropped spans (same pieces / boundaries, the old notes) into the provisioned "
                             "projects with memory_upsert_document; only server-side extraction is spent; run before oh-probe")

@@ -323,7 +323,8 @@ async def _ingest_documents_async(
             if to_insert:
                 from hars_memory.ingest.migrate import backfill_after_ingest
 
-                backfill_after_ingest(getattr(rag, "working_dir", None), to_insert)
+                from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+                backfill_after_ingest(_rag_index_dir(rag), to_insert)
 
     return IngestResult(
         documents_written=written,

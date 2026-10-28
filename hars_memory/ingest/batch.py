@@ -1553,7 +1553,8 @@ async def _prime_and_index(index_dir: Path, docs: list[Any], answers: dict[str, 
     calls = statistic_data.get("llm_call", 0) - before.get("llm_call", 0)
     from hars_memory.ingest.migrate import backfill_after_ingest
 
-    backfill_after_ingest(getattr(rag, "working_dir", None), docs)
+    from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+    backfill_after_ingest(_rag_index_dir(rag), docs)
     return {"primed": len(entries), "cache_hits": hits, "sync_llm_calls": calls}
 
 

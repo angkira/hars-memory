@@ -514,7 +514,8 @@ async def _run_indexing(args: argparse.Namespace) -> None:
     # written (see ingest/migrate.py). Never fails the run.
     from hars_memory.ingest.migrate import backfill_after_ingest
 
-    backfill_after_ingest(getattr(rag, "working_dir", None), all_docs)
+    from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+    backfill_after_ingest(_rag_index_dir(rag), all_docs)
 
     # Fingerprints are persisted ONLY after a fully successful insert: an
     # exception re-raises above and a cancellation lands in `interrupted`,

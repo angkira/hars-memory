@@ -1184,6 +1184,25 @@ def _staging_backlog_info(staging_dir: Path | None = None) -> dict[str, Any]:
 _rag_instance: object | None = None
 
 
+async def _doc_processing_state(rag: object, doc_id: str) -> str | None:
+    """LightRAG doc_status of *doc_id* in *rag* ("processed", "pending", "failed", ...), "missing"
+    when the index has no status row for it, or None when it cannot be read (no doc_status store)."""
+    status_store = getattr(rag, "doc_status", None)
+    getter = getattr(status_store, "get_by_id", None)
+    if getter is None:
+        return None
+    try:
+        row = await getter(doc_id)
+    except Exception:  # noqa: BLE001 -- best effort; never fail a write on the check itself
+        return None
+    if row is None or row == {}:
+        return "missing"
+    if not isinstance(row, dict):         # LightRAG returns a dict; anything else is not a status we can trust
+        return None
+    status = row.get("status")
+    return str(getattr(status, "value", status) or "missing").lower()
+
+
 async def _get_rag(project_id: str = "default") -> object:
     """Lazily initialise the LightRAG instance (thread-safe, project-isolated)."""
     global _rag_instance
@@ -1965,7 +1984,8 @@ async def _compute_hybrid_block(
 
         # Location fields (heading_path/start_line/end_line/source_path) are
         # additive: absent for chunks of an index not yet migrated.
-        chunk_wdir = getattr(rag, "working_dir", None)
+        from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+        chunk_wdir = _rag_index_dir(rag)
         if not isinstance(chunk_wdir, (str, os.PathLike)):
             chunk_wdir = HARS_MEMORY_INDEX_DIR if project_id == "default" else None
 
@@ -6506,6 +6526,20 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
                 await rag.adelete_by_doc_id(doc.doc_id)
 
             await _insert_all_batches(rag, [doc], batch_size=1)
+
+            # Record the fingerprint only once THIS index really processed the document. LightRAG's
+            # ainsert can return with the document merely enqueued (pipeline busy) or failed; a fingerprint
+            # saved then makes every retry answer "unchanged" and the document never gets extracted.
+            doc_state = await _doc_processing_state(rag, doc.doc_id)
+            if doc_state not in (None, "processed"):
+                return json_text({
+                    "ok": False,
+                    "error_kind": "not_processed",
+                    "error": f"document {doc.doc_id} is '{doc_state}' after insert, not 'processed'; "
+                             "the fingerprint was not recorded, so a retry re-runs the extraction",
+                    "doc_id": doc.doc_id,
+                    "file_path": str(path),
+                })
 
             store.set(doc.doc_id, current_fp)
             store.save()

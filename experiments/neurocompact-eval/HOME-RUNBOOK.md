@@ -278,6 +278,11 @@ uv run python home_run.py oh-agentic --resume $CAMP --arms note+mem
 
 ### 6.0c Amendment C.8 - the memory is the session's own PROJECT (read before `oh-ingest` / `oh-enrich`)
 
+> **After the 2026-10-28 server fix (C.8-4):** an ingest done before it is void (projects mixed in one in-memory store). Do:
+> `git pull` -> restart your HARS server -> `home_run.py oh-provision --resume CAMP --new-projects` -> restart the server once more
+> (it discovers the new projects) -> `oh-ingest`. The old `nc-*` project dirs are left in place; delete them by hand afterwards.
+> Also check your MAIN index for eval documents: its `kv_store_full_docs.json` must hold no doc whose file path contains `nc-e`.
+
 The split-session runs (C.6 arms, C.7 as first shipped) measured the server's session side channel, not the memory (protocol 4a.8). The
 decision configuration writes each eval session's dropped context into ITS OWN project on your EXISTING server (`memory_upsert_document`,
 `project=nc-<id>-<sid>`) and reads it back with `memory_recall(project=..., ll/hl keywords, hybrid, max_chars)`, no `session_id` - like the

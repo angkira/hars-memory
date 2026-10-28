@@ -899,6 +899,20 @@ with ONE exception, for `oh-provision` / `oh-ingest` / `oh-probe` / `oh-enrich` 
 (`REUSE_COMPATIBLE_FROM`). No hypothesis, threshold, budget, formula or judge of C.7-3 changes; `oh-ingest` spends only the flagged estimate of the
 server-side extraction, `oh-probe` cents, and the probe must precede `oh-enrich` as before.
 
+**C.8-4. Server isolation bug found at the first live ingest (2026-10-28, before any project-layout record was used).** The first
+home ingest left 11 of 14 projects with no graph although their documents were stored, and one project's index held another session's
+document. Cause, verified in the code of the installed LightRAG (1.5.7): every LightRAG instance of one server process used workspace
+`""`, and LightRAG keeps all storages' data in process-global dicts keyed by `<workspace>:<namespace>`; so every project / session index
+in the process bound to the first instance's full_docs / doc_status / graph / vectors and to ONE shared pipeline (a second index does
+not even read its own files). Fixed in `hars_memory/server/lightrag_init.py` (`isolated_workspace`: a unique workspace per real
+index directory, files unchanged on disk via a symlink; the default index keeps `""`), with a test that reproduces the leak on the real
+LightRAG storage; and `memory_upsert_document` now records its fingerprint only when the document is `processed` in that index (a
+fingerprint recorded after a merely enqueued insert made every retry answer "unchanged"). Consequences: (1) every project-layout
+ingest made before the fix is void; `oh-provision --new-projects` mints fresh project ids and retires the dependent results; project
+index dirs are now `<projects>/<id>/<id>`. (2) Any earlier result whose server process held more than one LightRAG instance (C.6
+split-session arms: the default index plus per-session stores) may have read mixed state; this adds to C.8-1's reason that those
+results do not measure the memory.
+
 ### 4a.9 PROTOCOL AMENDMENT C.9 (2026-10-28, written BEFORE any agentic record exists; the PRIMARY question and design)
 
 Provenance: the owner's own question, 2026-10-28: *does our memory give a gain when used locally for a session - does the agent spend

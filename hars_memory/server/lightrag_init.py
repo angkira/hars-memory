@@ -477,6 +477,86 @@ def resolve_chunker() -> str:
     return chunker
 
 
+# ---------------------------------------------------------------------------
+# Per-instance namespace isolation inside ONE process.
+#
+# LightRAG keeps every storage's in-memory data in process-global shared
+# dicts keyed by "<workspace>:<namespace>" (lightrag.kg.shared_storage,
+# get_final_namespace). The workspace defaults to "" for every instance, so all
+# LightRAG instances of one server process (the default project, every other
+# project, split-session stores, session-graph readers) bound to the SAME
+# full_docs / text_chunks / doc_status / graph / vector dicts and the SAME
+# pipeline_status: the second instance does not even read its own files
+# (try_initialize_namespace returns False), it sees the first one's data, and
+# its flush writes that mixed data into its own directory. Symptoms: documents
+# of one project in another project's index; documents marked processed with
+# no graph built in their own project; an insert queued behind another
+# project's busy pipeline.
+#
+# Fix: every instance whose working dir is not the default index gets its own
+# workspace, unique per real directory. File-based storages put their files in
+# os.path.join(working_dir, workspace), so the instance gets
+# working_dir=<process link root> and workspace=<unique name>, where
+# <link root>/<unique name> is a symlink to the real index directory: the files
+# stay exactly where they always were, and no two directories can collide.
+# ---------------------------------------------------------------------------
+_LINK_ROOT_ENV = "HARS_MEMORY_WORKSPACE_LINK_ROOT"
+
+
+def _default_index_dir() -> str:
+    return os.path.realpath(os.path.expanduser(os.environ.get("HARS_MEMORY_INDEX_DIR", DEFAULT_WORKING_DIR)))
+
+
+def _workspace_link_root() -> str:
+    import tempfile
+
+    root = os.environ.get(_LINK_ROOT_ENV) or os.path.join(
+        tempfile.gettempdir(), f"hars-lightrag-workspaces-{os.getuid() if hasattr(os, 'getuid') else 'u'}"
+    )
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    return root
+
+
+def isolated_workspace(working_dir: str) -> tuple[str, str]:
+    """Return ``(lightrag_working_dir, workspace)`` for an index directory.
+
+    The default index keeps workspace ``""`` (unchanged namespace keys). An
+    operator-set ``WORKSPACE`` env var is respected as is.
+    """
+    if os.environ.get("WORKSPACE", "").strip():
+        return working_dir, os.environ["WORKSPACE"].strip()
+    real = os.path.realpath(os.path.expanduser(working_dir))
+    if real == _default_index_dir():
+        return working_dir, ""
+    import hashlib
+    import re as _re
+
+    base = _re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(real.rstrip(os.sep)) or "index").strip(".") or "index"
+    ws = f"{base[:48]}-{hashlib.sha1(real.encode()).hexdigest()[:12]}"
+    os.makedirs(real, exist_ok=True)
+    root = _workspace_link_root()
+    link = os.path.join(root, ws)
+    if os.path.realpath(link) != real:
+        tmp = f"{link}.{os.getpid()}.tmp"
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        os.symlink(real, tmp)
+        os.replace(tmp, link)          # atomic: concurrent creators agree on the same target
+    return root, ws
+
+
+def rag_index_dir(rag: object) -> str | None:
+    """The directory that actually holds *rag*'s files (``working_dir/workspace`` when a
+    workspace is set, see ``isolated_workspace``). Use this, never ``rag.working_dir``."""
+    wdir = getattr(rag, "working_dir", None)
+    if wdir is None:
+        return None
+    ws = getattr(rag, "workspace", "") or ""
+    return os.path.realpath(os.path.join(wdir, ws)) if isinstance(ws, str) and ws else wdir
+
+
 def create_lightrag(
     *,
     working_dir: str | None = None,
@@ -716,8 +796,10 @@ def create_lightrag(
                 "this Qdrant container (isolated only by workspace_id)."
             )
 
+    _lr_wdir, _workspace = isolated_workspace(_wdir)
     rag = LightRAG(
-        working_dir=_wdir,
+        working_dir=_lr_wdir,
+        workspace=_workspace,
         vector_storage=_vector_storage,
         graph_storage=_graph_storage,
         tokenizer=Tokenizer(_tokenizer_name, _tokenizer_impl),
