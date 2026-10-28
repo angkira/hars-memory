@@ -93,7 +93,7 @@ PHASES = ("gen", "run", "judge")
 CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
 PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
 PLACEHOLDER_CAP = 0.0
-HOME_RUN_VERSION = "2026-10-28.c9"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+HOME_RUN_VERSION = "2026-10-28.c10"     # must equal ../EVAL-VERSION (doctor warns on a stale copy)
 # Amendment C.7: `oh-probe` / `oh-enrich` may spend on a campaign made under one of these versions (only those,
 # only for those two commands). Why that is valid is written in REPORT-PROTOCOL.md Amendment C.7: the reused HARS
 # sessions, notes, baseline / nc-note-only rows and judge verdicts are artifacts of code that C.7 did not change.
@@ -101,8 +101,11 @@ HOME_RUN_VERSION = "2026-10-28.c9"      # must equal ../EVAL-VERSION (doctor war
 # project layout; nothing older, no other command.
 # Amendment C.9: oh-workspaces / oh-agentic accept the same campaigns (C.6 / C.7 / C.8 stamped); the agentic track reuses the
 # finished C.6 baseline / note rows, the C.8 projects and judge model, and changes no part of them.
-REUSE_COMPATIBLE_FROM = ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8")
-REUSE_CMDS = ("oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic")
+# Amendment C.10: the same list plus the c9 stamp (the owner's campaign was stamped by the c9 code); oh-agentic --controls /
+# --reuse-agentic-run and oh-ingest-measure may spend on such a campaign. They reuse the finished C.9 agentic run (rows, verdicts), the
+# C.8 projects and the C.6 baseline / note rows, and change none of them.
+REUSE_COMPATIBLE_FROM = ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8", "2026-10-28.c9")
+REUSE_CMDS = ("oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic", "oh-ingest-measure")
 DEFAULT_PROJECTS_DIR = "~/.local/share/hars-longterm-memory/projects"    # hars_memory/projects/registry.py default
 EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
 HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
@@ -519,7 +522,8 @@ class Campaign:
 # ---------------------------------------------------------------------------
 # campaign selection (owner bug 2): NEVER an implicit resume
 # ---------------------------------------------------------------------------
-READ_ONLY_CMDS = ("bundle", "status", "oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic")   # need an explicit target (--resume [ID|PATH])
+READ_ONLY_CMDS = ("bundle", "status", "oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic",
+                  "oh-ingest-measure")   # need an explicit target (--resume [ID|PATH])
 NOT_RESUMABLE_KINDS = ("smoke", "dry-run")      # `--resume` (newest) skips these throw-away campaigns
 _STAMP_RE = re.compile(r"^(\d{8}T\d{6}Z)-homerun-")
 
@@ -1778,8 +1782,31 @@ def genqa_spend(out: str) -> tuple[float, str]:
 
 
 def judge_spend_from_text(text: str) -> float | None:
-    m = re.search(r"judge spend: \$([\d.]+) over (\d+) calls", text)
-    return float(m.group(1)) if m else None
+    """Spend of a judge_v2 run from its output. Three forms (the LAST of the first kind wins):
+      * `judge spend: $X over N calls` - a finished run, and (since C.10) also an ABORTED one;
+      * `budget $L exhausted (spent $X over N calls)` / `judge budget exhausted after N calls: ... (spent $X ...)` - the abort message
+        of judge_v2 before C.10. The C.9 run booked $0.0 for its aborted first judge run ($1.0968 over 222 calls) because only the
+        first form was parsed and the abort path printed only the second."""
+    ms = re.findall(r"judge spend: \$([\d.]+) over (\d+) calls", text)
+    if ms:
+        return float(ms[-1][0])
+    ma = re.findall(r"spent \$([\d.]+)\s+over\s+(\d+)\s+calls", text)
+    return float(ma[-1][0]) if ma else None
+
+
+def judge_spend_of_run(judged: str, text: str) -> tuple[float, str]:
+    """(usd, how) of a judge run, aborted or not: the sidecar judge_v2 keeps on disk (<out>.spend.json, rewritten every 10 judgments
+    and at the end) and the printed line; the larger one wins (a killed run has only the sidecar, a crashed one only the line)."""
+    side = None
+    sp = read_json(judged + ".spend.json", None)
+    if isinstance(sp, dict) and sp.get("usd") is not None:
+        side = float(sp["usd"])
+    line = judge_spend_from_text(text)
+    vals = [v for v in (side, line) if v is not None]
+    if not vals:
+        return 0.0, "UNKNOWN: no spend line and no sidecar (the judge may have spent money; check the provider dashboard)"
+    how = ("sidecar " + str(sp.get("status"))) if (side is not None and side >= (line or 0.0)) else "printed line"
+    return max(vals), how
 
 
 # =============================================================================
@@ -1800,15 +1827,24 @@ def judge_step(camp: Campaign, track: str, tag: str, judge_in: str, judged: str,
         camp.quarantine(judged)
     argv = [camp.script("judge_v2.py"), "--in", judge_in, "--out", judged, "--mapping", mapping,
             *profile_args(camp.cfg), "--allow-same-family-judge", "--budget-usd", str(rem)] + list(extra_args or [])
+    partial = judged + ".partial"
+    if os.path.isfile(partial):                               # an aborted run's verdicts are kept, not paid for twice
+        argv += ["--resume-partial", partial]
+        print(f"[judge] resuming from the verdicts of an aborted run: {partial}")
+    for stale in (judged + ".spend.json",):
+        if os.path.isfile(stale):
+            os.replace(stale, stale + f".{utc_stamp()}")
     step = step or f"{track}.judge"
     rc, text = camp.run(step, argv, check=False)
-    spent = judge_spend_from_text(text)
-    if spent is None:
-        spent = 0.0
-    camp.charge(track, "judge", step, spent, source=judged + "#" + utc_stamp(), note=f"{n} items")
+    spent, how = judge_spend_of_run(judged, text)
+    # booked EVEN WHEN the run aborted (rc != 0): C.9 booked $0.0 for an aborted run that had spent $1.0968
+    camp.charge(track, "judge", step, spent, source=judged + "#" + utc_stamp() + f".{time.time_ns() % 10 ** 6:06d}",
+                note=f"{n} items; {how}" + (f"; ABORTED rc={rc}" if rc != 0 else ""))
     if rc != 0 or not os.path.isfile(judged):
-        raise HomeRunError(f"judging failed or hit the cap (exit {rc}); see logs/{step}.log. The spend so far is in the ledger; "
-                           "raise the judge cap and re-run to judge again.")
+        raise HomeRunError(f"judging failed or hit the cap (exit {rc}); see logs/{step}.log. The spend so far (${spent:.4f}, {how}) is in "
+                           f"the ledger; the verdicts so far are in {partial}. Raise the judge cap and re-run: it resumes from them.")
+    if os.path.isfile(partial):
+        os.replace(partial, partial + ".done")
     return {"judged": judged, "mapping": mapping, "items": n, "spent_usd": spent}
 
 
@@ -2846,6 +2882,14 @@ def cmd_oh_ingest(camp: Campaign, args) -> int:
     rows = read_jsonl(os.path.join(run_dir, "ingest.jsonl"))
     bad = [r for r in rows if not r.get("ok")]
     camp.step("oh.ingest", lambda: {"projects": len(rows), "problems": len(bad), "dir": run_dir})
+    eu = [r.get("extract_usage") for r in rows if isinstance(r.get("extract_usage"), dict)]
+    if eu:
+        tok = sum(int(x.get("total_tokens") or 0) for x in eu)
+        unm = sum(int(x.get("documents_unmeasured") or 0) for x in eu)
+        print(f"[oh-ingest] extractor usage reported by the server: {tok:,} tokens, {sum(int(x.get('calls') or 0) for x in eu)} calls"
+              + (f"; {unm} document(s) WITHOUT usage (an older server or unchanged documents): the figure is partial" if unm else ""))
+    else:
+        print("[oh-ingest] the server reported no extract_usage (it predates C.10): run `oh-ingest-measure` for the ingest cost")
     print(f"\n[oh-ingest] {len(rows)} project(s) written ({len(bad)} with problems). Next: home_run.py oh-probe --resume "
           f"{os.path.basename(camp.path)}")
     return 1 if bad else 0
@@ -3061,15 +3105,58 @@ def cmd_oh_workspaces(camp: Campaign, args) -> int:
     return 0
 
 
+def agentic_c10(args) -> bool:
+    """Amendment C.10 mode: the control arms and / or a reused C.9 run. Own run dir, own steps, so the finished C.9 run is untouched."""
+    return bool(getattr(args, "controls", False) or getattr(args, "reuse_agentic_run", None))
+
+
+def agentic_names(args) -> dict:
+    if agentic_c10(args):
+        return {"dir": "agentic-c10-run", "pmap": "agentic-c10-projects.json", "step": "oh.agentic.c10", "est": "oh-agentic-c10-estimate.json",
+                "report": "REPORT-oh-agentic-c10.md", "metrics": "metrics-agentic-c10.json"}
+    return {"dir": "agentic-run", "pmap": "agentic-projects.json", "step": "oh.agentic", "est": "oh-agentic-estimate.json",
+            "report": "REPORT-oh-agentic.md", "metrics": "metrics-agentic.json"}
+
+
+def agentic_arms(args) -> list[str]:
+    import run_agentic as RA  # noqa: PLC0415
+    if getattr(args, "controls", False) and getattr(args, "arms", None):
+        raise HomeRunError("--controls and --arms are alternatives (--controls = " + ",".join(RA.CONTROL_ARMS) + ")")
+    spec = ",".join(RA.CONTROL_ARMS) if getattr(args, "controls", False) else (getattr(args, "arms", None) or AGENTIC_ARMS)
+    arms = [x.strip() for x in spec.split(",") if x.strip()]
+    bad = [x for x in arms if x not in RA.ALL_ARMS]
+    if bad or not arms:
+        raise HomeRunError(f"--arms: unknown {bad}; choose from {RA.ALL_ARMS}")
+    return arms
+
+
+def agentic_reuse_dir(camp: Campaign, args) -> str:
+    """The finished C.9 agentic run whose rows / verdicts are reused ('' = none)."""
+    if not agentic_c10(args):
+        return ""
+    d = os.path.abspath(getattr(args, "reuse_agentic_run", None) or camp.p("oh", "agentic-run"))
+    miss = [fn for fn in ("records.jsonl", "judged.jsonl", "summary.json") if not os.path.isfile(os.path.join(d, fn))]
+    if miss:
+        raise HomeRunError(f"{d} is not a finished C.9 agentic run (missing {miss}): the control arms reuse its `sum` and `sum+mem` rows "
+                           "and verdicts. --reuse-agentic-run <that dir>, or run `oh-agentic` (without --controls) first.")
+    summ = read_json(os.path.join(d, "summary.json"), {}) or {}
+    if summ.get("n_missing"):
+        raise HomeRunError(f"{d} is incomplete ({summ.get('n_missing')} row(s) missing): finish it before reusing it")
+    return d
+
+
+def agentic_reuse_arms(arms: list[str], reuse_dir: str) -> list[str]:
+    """Arms of the old run to copy: those whose C.10 label is not itself a run arm."""
+    import run_agentic as RA  # noqa: PLC0415
+    return [o for o, lab in RA.REUSED_ARM_LABELS.items() if reuse_dir and lab not in arms]
+
+
 def agentic_sources(camp: Campaign, args, old: str):
     import longsession as LS  # noqa: PLC0415
     import run_agentic as RA  # noqa: PLC0415
     data = oh_convert(camp)
     sessions = {s["sid"]: s for s in LS.load_sessions([data])}
-    arms = [x.strip() for x in (args.arms or AGENTIC_ARMS).split(",") if x.strip()]
-    bad = [x for x in arms if x not in RA.ALL_ARMS]
-    if bad:
-        raise HomeRunError(f"--arms: unknown {bad}; choose from {RA.ALL_ARMS}")
+    arms = agentic_arms(args)
     mb = int((getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])[0])
     try:
         src = RA.load_sources(old, sessions, arms, mb)
@@ -3078,73 +3165,160 @@ def agentic_sources(camp: Campaign, args, old: str):
     return data, sessions, arms, src
 
 
+def piece_chars_of(cfg: dict) -> int:
+    """run_longsession --piece-chars of the OH track (default 8000; an [oh] extra_args override is honoured)."""
+    ex = [str(x) for x in (cfg["oh"].get("extra_args") or [])]
+    if "--piece-chars" in ex:
+        try:
+            return int(ex[ex.index("--piece-chars") + 1])
+        except (IndexError, ValueError):
+            pass
+    return 8000
+
+
+def retrieval_cap_of(args) -> int:
+    return int(getattr(args, "retrieval_max_chars", None) or getattr(args, "memory_max_chars", None) or 6000)
+
+
 def estimate_oh_agentic(camp: Campaign, args, old: str) -> dict:
     import run_agentic as RA  # noqa: PLC0415
     data, sessions, arms, src = agentic_sources(camp, args, old)
+    reuse = agentic_reuse_dir(camp, args)
+    reused = [RA.REUSED_ARM_LABELS[o] for o in agentic_reuse_arms(arms, reuse)]
     prof = P.load_profile(camp.cfg["general"]["profile"])
     model = P.resolve_models(prof, {})["agent"]
-    est = RA.estimate(arms, RA.summaries_tokens_of(src, arms), {s: len(q) for s, q in src["questions"].items()}, prof, model,
-                      args.max_steps, args.memory_max_chars, judge_unit_usd(camp.cfg))
+    old_rows = read_jsonl(os.path.join(reuse, "records.jsonl")) if reuse else []
+    sids = sorted(src["summary"])
+    est = RA.estimate_for(sessions, src, sids, arms, prof, model, args.max_steps, retrieval_cap_of(args), judge_unit_usd(camp.cfg),
+                          piece_chars_of(camp.cfg), old_rows, reused)
     est["run_usd"] = est["run_usd_expected_without_cache"]            # the cap check uses the no-cache expectation (conservative)
     est["judge_usd_total"] = est["judge_usd"]
+    est["reuse_dir"] = reuse or None
+    est["retrieval_max_chars"] = retrieval_cap_of(args)
     return est
 
 
-def print_agentic_estimate(camp: Campaign, est: dict) -> None:
+def print_agentic_estimate(camp: Campaign, est: dict, args=None) -> None:
     caps = {ph: cap_for(camp.cfg, "oh", ph) for ph in ("run", "judge")}
     print(f"\n[oh-agentic] estimate (zero spend), model: steps x tokens (assumptions below), cache reads priced separately:\n"
-          f"  {est['questions']} questions x {len(est['arms'])} arm(s) {est['arms']} = {est['judge_items']} agent runs, {est['sessions']} sessions\n"
+          f"  {est['questions']} questions x {len(est['arms'])} arm(s) {est['arms']} = {est['judge_items']} agent runs, {est['sessions']} sessions"
+          + (f"; REUSED from {est['reuse_dir']}: {est['reused_arms']} (no run, no judge)" if est.get("reuse_dir") else "") + "\n"
           f"  run: expected {fmt_usd(est['run_usd_expected_with_cache'])} with cache / {fmt_usd(est['run_usd_expected_without_cache'])} without; "
-          f"upper bound (every question runs {est['max_steps']} steps) {fmt_usd(est['run_usd_upper_bound'])}\n"
+          f"calibrated to the observed C.9 step counts {fmt_usd(est.get('run_usd_expected_calibrated', 0.0))}; "
+          f"upper bound (every question runs {est['max_steps']} steps, no cache) {fmt_usd(est['run_usd_upper_bound'])}\n"
           f"  judge: {est['judge_items']} items = {fmt_usd(est['judge_usd'])} | caps run {caps['run']:.2f} / judge {caps['judge']:.2f}\n"
           f"  mean tokens per question (all input incl. cache reads + output) ~{est['mean_tokens_per_question']}\n"
-          f"  power (pre-run guess): {est['mde_prior']['rule']} -> MDE ~{est['mde_prior']['mde_relative_to_mean_tokens']:.0%} of the mean "
+          f"  METHOD per arm: input_k = P0 + (k-1)(o + r) (P0 = system + tool schemas + summary + question [+ the whole dropped transcript for "
+          f"the oracle, cached once per session and read at every step], o = output per step, r = tool-result tokens: workspace result, or "
+          f"min(cap/3.6, 1800)*0.4 + 0.6*workspace for the capped retrieval arms, cap {est.get('retrieval_max_chars')} chars); step k reads "
+          f"step k-1 from the cache. Figures: (8 steps) = the stated assumption; (n steps) = the same model with the mean steps OBSERVED in the "
+          f"C.9 run (sum+mem, sum+bm25, sum+grep take sum+mem's, sum and oracle take sum's)")
+    for arm, v in est["per_arm"].items():
+        print(f"    {arm:9s} ${v['usd_with_cache']:.3f} (8 steps) | ${v['usd_calibrated']:.3f} ({v['steps_calibrated']} steps) | "
+              f"no cache ${v['usd_without_cache']:.3f} | ~{v['tokens_per_question']} tok/q")
+    print(f"  power (pre-run guess): {est['mde_prior']['rule']} -> MDE ~{est['mde_prior']['mde_relative_to_mean_tokens']:.0%} of the mean "
           f"(~{est['mde_prior']['mde_tokens']} tokens)\n"
           f"  assumptions: {est['assumptions']}")
-    write_json(camp.p("oh-agentic-estimate.json"), {"ts": utc_iso(), **est})
+    write_json(camp.p(agentic_names(args)["est"] if args is not None else "oh-agentic-estimate.json"), {"ts": utc_iso(), **est})
+
+
+def merge_agentic_judged(old_judged: str, new_judged: str, records: list[dict], out: str, remap: dict[str, str] | None = None) -> dict:
+    """judged.jsonl for metrics_agentic = the C.9 verdicts of the REUSED rows (rid mapped to the C.10 label: `q::sum+mem` ->
+    `q::sum+mem@uncapped`) + the new verdicts. Every valid row must carry one (a missing verdict is an error, not a zero)."""
+    rids = {r["rid"] for r in records if r.get("valid") is True}
+    reused = {r["rid"]: r.get("reused_rid") or r["rid"] for r in records if r.get("valid") is True and r.get("reused_from")}
+    back = {old: new for new, old in reused.items()}
+    rows, have = [], set()
+    for j in read_jsonl(old_judged):
+        new = back.get(j.get("rid"))
+        if new and new not in have:
+            rows.append({**j, "rid": new, "reused_rid": j.get("rid"), "reused_verdict": True})
+            have.add(new)
+    for j in read_jsonl(new_judged):
+        if j.get("rid") in rids and j["rid"] not in have:
+            rows.append(j)
+            have.add(j["rid"])
+    missing = sorted(rids - have)
+    with open(out, "w") as f:
+        for j in rows:
+            f.write(json.dumps(j, ensure_ascii=False) + "\n")
+    return {"rows": len(rows), "from_old": sum(1 for j in rows if j.get("reused_verdict")), "from_new": len(rows) - sum(1 for j in rows if j.get("reused_verdict")),
+            "missing": missing, "unparsed": sum(1 for j in rows if j.get("judge_unparsed"))}
+
+
+def ingest_for_metrics(camp: Campaign) -> str:
+    """The MEASURED ingest cost file for metrics_agentic --ingest-json, best first: the C.8 ingest run itself when every document
+    reported its extract_usage (a server older than C.10 did not), else the oh-ingest-measure extrapolation. '' = none."""
+    s1 = read_json(camp.p("oh", "ingest-run", "summary.json"), {}) or {}
+    m1 = s1.get("hars_extraction_measured") or {}
+    if m1.get("complete") and m1.get("total_tokens"):
+        return camp.p("oh", "ingest-run", "summary.json")
+    m2 = camp.p("oh", "ingest-measure", "measure.json")
+    return m2 if os.path.isfile(m2) else ""
+
+
+def metrics_agentic_argv(camp: Campaign, rec: str, judged: str, report: str, mj: str) -> list[str]:
+    argv = [camp.script("metrics_agentic.py"), "--records", rec, "--judged", judged, "--out", report, "--json", mj]
+    ing = ingest_for_metrics(camp)
+    if ing:
+        argv += ["--ingest-json", ing]
+    return argv
 
 
 def cmd_oh_agentic(camp: Campaign, args) -> int:
-    """Amendment C.9 (PRIMARY): agents with workspace tools, with / without memory_recall, per question; judge --outcome; metrics_agentic."""
+    """Amendment C.9 (PRIMARY) / C.10: agents with workspace tools, with / without memory_recall, per question; the C.10 control arms
+    (sum+bm25, sum+grep, oracle) on the same questions; judge --outcome; metrics_agentic."""
     camp.reuse_ok = True
     guard_spend(camp, "oh-agentic")
     cfg = camp.cfg
+    nm = agentic_names(args)
     old = oh_old_run(camp, args, need_judged=True)
     est = estimate_oh_agentic(camp, args, old)
     if args.dry_run:
-        print_agentic_estimate(camp, est)
+        print_agentic_estimate(camp, est, args)
         return 0
     arms = est["arms"]
+    reuse = est["reuse_dir"] or ""
     if any(a in ("sum+mem", "note+mem") for a in arms) and not camp.is_done("oh.ingest"):
         raise HomeRunError("oh-agentic needs the C.8 project layout ingested: run `home_run.py oh-provision`, restart the server, "
                            f"`oh-ingest --resume {os.path.basename(camp.path)}` first")
     if not camp.is_done("oh.workspaces"):
         raise HomeRunError(f"run `home_run.py oh-workspaces --resume {os.path.basename(camp.path)}` first (workspaces are provisioned at home)")
-    if "note+mem" in arms and not camp.is_done("oh.agentic.run"):
-        print("[oh-agentic] note+mem is the OPTIONAL arm: the protocol runs it only if sum+mem showed a gain")
+    if "note+mem" in arms and not camp.is_done(nm["step"] + ".run"):
+        print("[oh-agentic] note+mem is the OPTIONAL arm: the protocol (C.10) runs it only if the GAIN rule of metrics_agentic is met "
+              "(sum+mem gain over sum >= +0.10 accuracy with CI_lo > 0 and an A_BETTER* verdict, and neither bm25 nor grep beats sum+mem)")
     prof = P.load_profile(cfg["general"]["profile"])
     jm = P.resolve_models(prof, {})["judge"]
     old_map = read_json(os.path.join(old, "judge-mapping.json"), {}) or {}
     old_jm = old_map.get("judge_model") or old_map.get("model")
     if old_jm and old_jm != jm:
         raise HomeRunError(f"the C.6 campaign was judged by {old_jm!r}, this profile judges with {jm!r}: refusing (same judge required)")
+    if reuse:
+        rj = read_json(os.path.join(reuse, "judge-mapping.json"), {}) or {}
+        rjm = rj.get("judge_model") or rj.get("model")
+        if rjm and rjm != jm:
+            raise HomeRunError(f"the reused C.9 agentic verdicts were made by judge {rjm!r}, this profile judges with {jm!r}: refusing")
     mark_reuse(camp, old, "oh-agentic")
     guard_estimate(camp, "oh", est, args.accept_partial)
-    print_agentic_estimate(camp, est)
+    print_agentic_estimate(camp, est, args)
     data = oh_convert(camp)
     pj = oh_projects(camp) if any(a in ("sum+mem", "note+mem") for a in arms) else {"pids": {}}
-    pmap = camp.p("oh", "agentic-projects.json")
+    pmap = camp.p("oh", nm["pmap"])
     write_json(pmap, pj["pids"])
     ws_dest = (read_json(camp.p("campaign.json"), {}) or {}).get("c9_workspaces", {}).get("dest") or ""
-    run_dir = camp.p("oh", "agentic-run")
+    run_dir = camp.p("oh", nm["dir"])
     mb = int((getattr(args, "budgets", None) or cfg["oh"]["budgets"])[0])
+    cap = retrieval_cap_of(args)
 
     def go():
         rem = camp.remaining("oh", "run")
         argv = [camp.script("run_agentic.py"), "--sessions", data, "--reuse-run", old, "--workspaces", ws_dest, "--projects-map", pmap,
                 "--arms", ",".join(arms), "--mem-budget", str(mb), "--max-steps", str(args.max_steps),
-                "--max-question-tokens", str(args.max_question_tokens), "--memory-max-chars", str(args.memory_max_chars),
+                "--max-question-tokens", str(args.max_question_tokens), "--retrieval-max-chars", str(cap),
+                "--piece-chars", str(piece_chars_of(cfg)), "--bm25-passage-chars", str(getattr(args, "bm25_passage_chars", 1500)),
                 "--concurrency", str(args.concurrency), "--mcp", cfg["general"]["mcp"], "--budget-usd", str(rem)]
+        if reuse:
+            argv += ["--reuse-agentic-run", reuse, "--reuse-arms", ",".join(agentic_reuse_arms(arms, reuse))]
         argv += profile_args(cfg) if not cfg["general"].get("_offline") else ["--mock-llm", "--fake-hars"]
         if os.path.isfile(os.path.join(run_dir, "config.json")):
             argv += ["--resume", run_dir]
@@ -3152,32 +3326,186 @@ def cmd_oh_agentic(camp: Campaign, args) -> int:
             if os.path.isdir(run_dir) and os.listdir(run_dir):
                 camp.quarantine(run_dir)
             argv += ["--out", run_dir, "--name", "oh"]
-        rc, _ = camp.run("oh.agentic.run", argv, check=False)
+        rc, _ = camp.run(nm["step"] + ".run", argv, check=False)
         spent, src_ = longsession_spend(run_dir)
-        camp.charge("oh", "run", "oh.agentic.run", spent, source=run_dir, note=src_)
+        camp.charge("oh", "run", nm["step"] + ".run", spent, source=run_dir, note=src_)
         summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
         if rc != 0 or summ.get("n_missing"):
-            raise HomeRunError(f"oh.agentic.run incomplete (exit {rc}, {summ.get('n_missing')} of {summ.get('expected')} rows missing); "
-                               f"log logs/oh.agentic.run.log. Re-run the same command to RESUME (finished rows are kept).")
-        return {"out": run_dir, "rows": summ.get("rows"), "spent_usd": spent}
-    camp.step("oh.agentic.run", go)
+            raise HomeRunError(f"{nm['step']}.run incomplete (exit {rc}, {summ.get('n_missing')} of {summ.get('expected')} rows missing); "
+                               f"log logs/{nm['step']}.run.log. Re-run the same command to RESUME (finished rows are kept).")
+        return {"out": run_dir, "rows": summ.get("rows"), "spent_usd": spent, "retrieval_cap": summ.get("retrieval_cap")}
+    camp.step(nm["step"] + ".run", go)
     rec, ji = os.path.join(run_dir, "records.jsonl"), os.path.join(run_dir, "judge-input.jsonl")
-    camp.step("oh.agentic.export", lambda: (camp.run("oh.agentic.export", [camp.script("run_agentic.py"), "--export-judge", "--out", run_dir,
-                                                                          "--sessions", data]), {"out": ji})[1])
+    camp.step(nm["step"] + ".export", lambda: (camp.run(nm["step"] + ".export", [camp.script("run_agentic.py"), "--export-judge", "--out", run_dir,
+                                                                                  "--sessions", data, "--piece-chars", str(piece_chars_of(cfg))]), {"out": ji})[1])
     if args.skip_judge:
         print("[oh-agentic] --skip-judge: stopping before the judge")
         return 0
     judged, mp = os.path.join(run_dir, "judged.jsonl"), os.path.join(run_dir, "judge-mapping.json")
-    camp.step("oh.agentic.judge", lambda: judge_step(camp, "oh", "oh-agentic", ji, judged, mp, args.accept_partial,
-                                                    step="oh.agentic.judge", extra_args=["--outcome"]))
-    report, mj = os.path.join(run_dir, "REPORT-oh-agentic.md"), os.path.join(run_dir, "metrics-agentic.json")
+    if reuse:
+        new_j = os.path.join(run_dir, "judged.new.jsonl")
+        camp.step(nm["step"] + ".judge", lambda: judge_step(camp, "oh", "oh-agentic", ji, new_j, mp, args.accept_partial,
+                                                           step=nm["step"] + ".judge", extra_args=["--outcome"]))
+
+        def do_merge():
+            info = merge_agentic_judged(os.path.join(reuse, "judged.jsonl"), new_j, read_jsonl(rec), judged)
+            if info["missing"]:
+                raise HomeRunError(f"{len(info['missing'])} valid row(s) have no judge verdict (reused or new): {info['missing'][:3]}")
+            if info["unparsed"]:
+                print(f"[oh-agentic] {info['unparsed']} verdict(s) are judge_unparsed: excluded from accuracy by metrics_agentic (reported)")
+            return info
+        camp.step(nm["step"] + ".merge", do_merge)
+    else:
+        camp.step(nm["step"] + ".judge", lambda: judge_step(camp, "oh", "oh-agentic", ji, judged, mp, args.accept_partial,
+                                                           step=nm["step"] + ".judge", extra_args=["--outcome"]))
+    report, mj = os.path.join(run_dir, nm["report"]), os.path.join(run_dir, nm["metrics"])
 
     def do_metrics():
-        camp.run("oh.agentic.metrics", [camp.script("metrics_agentic.py"), "--records", rec, "--judged", judged, "--out", report, "--json", mj])
+        camp.run(nm["step"] + ".metrics", metrics_agentic_argv(camp, rec, judged, report, mj))
         return {"report": report, "json": mj}
-    camp.step("oh.agentic.metrics", do_metrics)
+    camp.step(nm["step"] + ".metrics", do_metrics)
     summarize_track(camp, "oh", run_dir)
-    print(f"\n[oh-agentic] report: {report}; next: home_run.py bundle --resume {os.path.basename(camp.path)}")
+    print(f"\n[oh-agentic] report: {report}; next: home_run.py oh-ingest-measure --resume {os.path.basename(camp.path)} (the ingest "
+          f"cost for the token comparison), then home_run.py bundle --resume {os.path.basename(camp.path)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Amendment C.10: measure the ingest (extractor) tokens and USD on a few throwaway projects
+# ---------------------------------------------------------------------------
+def measure_sids(all_sids: list[str], k: int) -> list[str]:
+    """K sessions spread over the sorted sids (deterministic): every (n/K)-th."""
+    ss = sorted(all_sids)
+    k = max(1, min(int(k), len(ss)))
+    step = max(1, len(ss) // k)
+    return ss[::step][:k]
+
+
+def measure_delete_instructions(pdir: str, pids: list[str], base_collection: str = "<base collection>") -> str:
+    lines = [f"  rm -r {os.path.join(pdir, pid)}" for pid in pids]
+    q = [f"  curl -X DELETE http://localhost:6333/collections/{base_collection}_{pid}" for pid in pids]
+    return ("The throwaway projects (they are NOT the nc-* projects of the main ingest and nothing reads them):\n"
+            + "\n".join(f"  {pid}" for pid in pids)
+            + "\nDelete them when done (stop nothing; restart the server once afterwards so it forgets them):\n"
+            + "\n".join(lines) + "\n  # and their Qdrant collections (if Qdrant is the vector store; the collection name is "
+            "<your base collection>_<project id>):\n" + "\n".join(q))
+
+
+def cmd_oh_ingest_measure(camp: Campaign, args) -> int:
+    """Re-ingest K sessions into FRESH THROWAWAY projects (ids `nc-<run id>m<MMDDHHMM>-<sid>`, never the main nc-* projects) with the
+    fixed server, to MEASURE the extractor's calls / tokens / USD per session (the server's `extract_usage`). Two invocations: the first
+    writes the project dirs (the server reads its projects dir at start only), you restart the server, the second ingests. The mean
+    per session x the number of sessions is the extrapolated ingest cost the token comparison amortises over the questions."""
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-ingest-measure")
+    cfg = camp.cfg
+    import longsession as LS  # noqa: PLC0415
+    old = oh_old_run(camp, args)
+    data = oh_convert(camp)
+    pj = oh_projects(camp)
+    sessions = [x for x in LS.load_sessions([data])]
+    k = int(getattr(args, "sessions", None) or 3)
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    plan = cj.get("c10_ingest_measure") if not getattr(args, "new_measure", False) else None
+    if plan and plan.get("k") != k:
+        plan = None
+    if not plan:
+        sids = measure_sids([x["sid"] for x in sessions], k)
+        rid_m = f"{pj['hars_run_id']}m{time.strftime('%m%d%H%M', time.gmtime())}"
+        pdir = projects_dir_of(cfg, args)
+        plan = {"k": k, "hars_run_id": rid_m, "sids": sids, "projects_dir": pdir, "pids": {sid: LS.make_project_id(rid_m, sid) for sid in sids},
+                "ts": utc_iso(), "provisioned": False, "main_run_id": pj["hars_run_id"], "n_sessions_total": len(sessions)}
+        if set(plan["pids"].values()) & set(pj["pids"].values()) or "default" in plan["pids"].values():
+            raise HomeRunError("a throwaway project id collides with a main nc-* project or `default`")
+    print(f"[oh-ingest-measure] {len(plan['sids'])} of {len(sessions)} session(s) {plan['sids']} -> throwaway projects `nc-{plan['hars_run_id']}-<sid>` "
+          f"under {plan['projects_dir']} (the main nc-{pj['hars_run_id']}-* projects are not touched)")
+    est = estimate_oh_ingest(camp, args, old)
+    sc = len(plan["sids"]) / max(1, len(sessions))
+    print(f"  estimate (zero spend, flagged: the SERVER-side extraction, scaled to {len(plan['sids'])}/{len(sessions)} sessions): "
+          f"~{fmt_usd(est['run_usd'] * sc)}, ~{est['ingest_hours'] * sc:.1f} h of ingest wall-clock; the measurement REPLACES this guess with the "
+          "server's own token counts")
+    print(measure_delete_instructions(plan["projects_dir"], sorted(plan["pids"].values())))
+    if args.dry_run:
+        return 0
+    if not plan.get("provisioned"):
+        os.makedirs(plan["projects_dir"], exist_ok=True)
+        for sid, pid in plan["pids"].items():
+            d = os.path.join(plan["projects_dir"], pid)
+            os.makedirs(d, exist_ok=True)
+            write_json(os.path.join(d, "project.json"), {"project_id": pid, "name": pid, "index_dir": os.path.join(d, pid),
+                                                         "staging_dir": os.path.join(d, "staging"), "visibility": "private",
+                                                         "description": f"THROWAWAY ingest-cost measurement of session {sid} (campaign {os.path.basename(camp.path)}); delete me"})
+        plan["provisioned"] = True
+        cj["c10_ingest_measure"] = plan
+        write_json(camp.p("campaign.json"), cj)
+        print(f"\n[oh-ingest-measure] wrote {len(plan['pids'])} throwaway project.json. NEXT: restart your HARS server ONCE (it reads its "
+              f"projects dir at start only; HARS_MEMORY_PROJECTS_DIR={plan['projects_dir']}), then re-run THE SAME command:\n"
+              f"  home_run.py oh-ingest-measure --resume {os.path.basename(camp.path)} --sessions {k}")
+        return 3
+    cj["c10_ingest_measure"] = plan
+    write_json(camp.p("campaign.json"), cj)
+    if not cfg["general"].get("_offline") and camp.guards_enabled:          # a fake runner (tests) has no server to ask
+        try:
+            lp = (getattr(camp, "probes", None) or Probes()).mcp(cfg["general"]["mcp"], "memory_list_projects", {}, 60)
+            have = {p.get("project_id") for p in (lp or {}).get("projects", [])}
+        except Exception as e:  # noqa: BLE001
+            raise HomeRunError(f"memory_list_projects failed ({type(e).__name__}: {str(e)[:120]}): is the server up?")
+        miss = [p for p in plan["pids"].values() if p not in have]
+        if miss:
+            raise HomeRunError(f"{len(miss)} throwaway project(s) are not registered on the server ({miss[:2]}): restart it once, then re-run")
+    ddir = camp.p("oh", "ingest-measure", "ls-data")                  # the K sessions only (run_longsession --sessions takes files / dirs)
+    os.makedirs(ddir, exist_ok=True)
+    wanted = set(plan["sids"])
+    for x in sessions:
+        if x["sid"] in wanted and x.get("_path"):
+            shutil.copy2(x["_path"], os.path.join(ddir, os.path.basename(x["_path"])))
+    run_dir = camp.p("oh", "ingest-measure", "run")
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    extra = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--hars-layout", "project", "--hars-run-id", plan["hars_run_id"], "--ingest-only"]
+    ls_run_step(camp, "oh", ddir, run_dir, budgets, "end", True, extra, len(plan["sids"]), args.accept_partial, "oh-ingest-measure",
+                step="oh.ingest.measure.run")
+    rows = read_jsonl(os.path.join(run_dir, "ingest.jsonl"))
+    ext_price = None
+    summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
+    m = (summ.get("hars_extraction_measured") or {})
+    per = []
+    for r in rows:
+        eu = r.get("extract_usage") or {}
+        per.append({"sid": r["sid"], "ok": r.get("ok"), "calls": eu.get("calls"), "prompt_tokens": eu.get("prompt_tokens"),
+                    "completion_tokens": eu.get("completion_tokens"), "total_tokens": eu.get("total_tokens"), "usd": eu.get("usd"),
+                    "estimated": eu.get("estimated"), "documents": eu.get("documents"), "documents_unmeasured": eu.get("documents_unmeasured")})
+    good = [x for x in per if x["ok"] and x["total_tokens"]]
+    n = len(good)
+    if n == 0:
+        raise HomeRunError("no session reported extract_usage: the server predates the C.10 `extract_usage` field (restart it from this "
+                           "checkout) or the extractor is not an OpenAI-compatible endpoint with usage")
+    mean = lambda key: sum(float(x[key] or 0) for x in good) / n  # noqa: E731
+    total_n = plan["n_sessions_total"]
+    out = {"ts": utc_iso(), "sessions_measured": n, "sessions_total": total_n, "per_session": per,
+           "mean_per_session": {"usd": mean("usd"), "tokens": mean("total_tokens"), "calls": mean("calls")},
+           "extrapolated_total": {"usd": mean("usd") * total_n, "total_tokens": mean("total_tokens") * total_n, "tokens": mean("total_tokens") * total_n,
+                                  "calls": mean("calls") * total_n,
+                                  "estimated": any(x["estimated"] or x["documents_unmeasured"] for x in good),
+                                  "note": f"mean of {n} measured session(s) x {total_n} sessions (the sessions differ in size by ~10%: a mean, not a sum)"},
+           "run_summary": m, "throwaway_projects": plan["pids"]}
+    out.update(out["extrapolated_total"])                                 # metrics_agentic.load_ingest reads usd / total_tokens
+    out["usd"], out["total_tokens"] = out["extrapolated_total"]["usd"], out["extrapolated_total"]["total_tokens"]
+    write_json(camp.p("oh", "ingest-measure", "measure.json"), out)
+    camp.step("oh.ingest.measure", lambda: {"sessions": n, "mean_usd": out["mean_per_session"]["usd"], "extrapolated_usd": out["usd"],
+                                             "extrapolated_tokens": out["total_tokens"]})
+    print(f"\n[oh-ingest-measure] MEASURED over {n} session(s): mean {out['mean_per_session']['tokens']:,.0f} tokens "
+          f"({out['mean_per_session']['calls']:.0f} extractor calls), ${out['mean_per_session']['usd']:.4f} per session; "
+          f"extrapolated to {total_n} sessions: {out['total_tokens']:,.0f} tokens, ${out['usd']:.4f}"
+          f"{' (some figures are ESTIMATES: the provider returned no usage)' if out['extrapolated_total']['estimated'] else ''}\n"
+          f"  file: {camp.p('oh', 'ingest-measure', 'measure.json')}")
+    # refresh the metrics of a finished C.10 run so its per-correct figures include the ingest
+    nm = agentic_names(argparse.Namespace(controls=True))
+    rd = camp.p("oh", nm["dir"])
+    if camp.is_done(nm["step"] + ".metrics") and os.path.isfile(os.path.join(rd, "judged.jsonl")):
+        camp.run(nm["step"] + ".metrics2", metrics_agentic_argv(camp, os.path.join(rd, "records.jsonl"), os.path.join(rd, "judged.jsonl"),
+                                                              os.path.join(rd, nm["report"]), os.path.join(rd, nm["metrics"])), check=False)
+        print(f"  metrics of the C.10 run re-computed WITH the ingest cost: {os.path.join(rd, nm['report'])}")
+    print("\n" + measure_delete_instructions(plan["projects_dir"], sorted(plan["pids"].values())))
     return 0
 
 
@@ -3584,12 +3912,27 @@ RAW_DIRS = {"sessions", "recall", "partial", "memory", "data", "data-qa", "dry-d
 NEVER_DIRS = {"bundle", "accepted", "__pycache__", "scripts-copy"}
 RAW_FILE_RES = (re.compile(r"^chains.*\.jsonl$"), re.compile(r"^judge-input.*\.jsonl$"), re.compile(r"^traces.*\.jsonl$"),
                 re.compile(r"^qa-raw.*\.jsonl$"), re.compile(r"^all\.jsonl$"))
+# Amendment C.10: raw files that ARE part of the default bundle of the (public) OH track, gzip-compressed and under --max-raw-mb:
+# the agentic traces (every step's messages and tool results), the recall / probe sidecars. The owner's private Claude Code track keeps
+# every raw file behind --include-raw.
+DEFAULT_RAW_FILE_RES = (re.compile(r"^traces.*\.jsonl$"), re.compile(r"^recall_raw.*\.jsonl$"), re.compile(r"^probe.*\.jsonl$"))
+DEFAULT_RAW_DIRS = {"recall"}
+DEFAULT_RAW_TRACKS = ("oh",)
+DEFAULT_MAX_RAW_MB = 200.0
 CC_TEXT_FIELDS = ("memory_text", "injected")
+
+
+def is_default_raw(rel: str) -> bool:
+    parts = rel.split(os.sep)
+    if not parts or parts[0] not in DEFAULT_RAW_TRACKS or any(".failed-" in x for x in parts):
+        return False
+    return any(r.match(parts[-1]) for r in DEFAULT_RAW_FILE_RES) or any(x in DEFAULT_RAW_DIRS for x in parts[1:-1])
 SECRET_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD)", re.I)
 
 
-def bundle_candidates(camp_path: str, include_raw: bool, tracks) -> tuple[list[tuple[str, str]], list[dict]]:
-    """(include [(abs, rel)], excluded [{rel, reason, bytes}]) for a campaign dir."""
+def bundle_candidates(camp_path: str, include_raw: bool, tracks, default_raw: bool = False) -> tuple[list[tuple[str, str]], list[dict]]:
+    """(include [(abs, rel)], excluded [{rel, reason, bytes}]) for a campaign dir. `default_raw`: also include the
+    `is_default_raw` files (the caller compresses them and applies the size guard)."""
     inc, exc = [], []
     for dp, dns, fns in os.walk(camp_path, followlinks=False):
         rel_dir = os.path.relpath(dp, camp_path)
@@ -3619,7 +3962,7 @@ def bundle_candidates(camp_path: str, include_raw: bool, tracks) -> tuple[list[t
                 reason = "not a text artifact"
             elif failed and not include_raw:
                 reason = "failed/unfinished attempt (kept in the campaign dir)"
-            elif (raw_dir or raw_file) and not include_raw:
+            elif (raw_dir or raw_file) and not include_raw and not (default_raw and is_default_raw(rel)):
                 reason = "raw (transcripts / session graph stores / recall payloads / judge input)"
             else:
                 inc.append((full, rel))
@@ -3639,14 +3982,17 @@ def env_secrets() -> list[str]:
     return vals
 
 
-def stage_file(src: str, dst: str, rel: str, secrets: list[str], drop_fields: tuple, redact: bool) -> dict:
-    """Copy src -> dst line by line, dropping fields and redacting; returns {counts, env_hits, dropped}."""
+def stage_file(src: str, dst: str, rel: str, secrets: list[str], drop_fields: tuple, redact: bool, gz: bool = False) -> dict:
+    """Copy src -> dst line by line, dropping fields and redacting; returns {counts, env_hits, dropped}. `gz`: dst is written gzip-compressed
+    (the caller names it *.gz); redaction runs BEFORE compression, so a compressed file is never an unredacted copy."""
     counts: dict[str, int] = {}
     env_hits = 0
     dropped = 0
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     is_jsonl = src.endswith(".jsonl")
-    with open(src, encoding="utf-8", errors="replace") as fi, open(dst, "w", encoding="utf-8") as fo:
+    import gzip  # noqa: PLC0415
+    with open(src, encoding="utf-8", errors="replace") as fi, (gzip.open(dst, "wt", encoding="utf-8", compresslevel=6) if gz
+                                                              else open(dst, "w", encoding="utf-8")) as fo:
         for line in fi:
             if drop_fields and is_jsonl and line.strip():
                 try:
@@ -3670,7 +4016,7 @@ def stage_file(src: str, dst: str, rel: str, secrets: list[str], drop_fields: tu
     ok_json = True
     if src.endswith((".jsonl", ".json")):
         try:
-            with open(dst, encoding="utf-8") as f:
+            with (gzip.open(dst, "rt", encoding="utf-8") if gz else open(dst, encoding="utf-8")) as f:
                 if src.endswith(".jsonl"):
                     for ln in f:
                         if ln.strip():
@@ -3682,9 +4028,28 @@ def stage_file(src: str, dst: str, rel: str, secrets: list[str], drop_fields: tu
     return {"counts": counts, "env_hits": env_hits, "dropped_fields": dropped, "json_ok": ok_json}
 
 
+def workspace_kinds_of(camp: Campaign) -> dict:
+    """{sid: workspace_kind} of the C.9 workspaces (per-session meta next to the workspaces, outside the campaign dir)."""
+    dest = ((read_json(camp.p("campaign.json"), {}) or {}).get("c9_workspaces") or {}).get("dest") or ""
+    out: dict = {}
+    summ = read_json(os.path.join(dest, "workspaces.json"), {}) if dest else {}
+    for sid, m in ((summ or {}).get("workspaces") or {}).items():
+        out[sid] = {"workspace_kind": m.get("workspace_kind"), "patch_applied": m.get("patch_applied"), "instance_id": m.get("instance_id")}
+    if dest and os.path.isdir(dest):
+        for fn in sorted(os.listdir(dest)):
+            if fn.endswith(".json") and fn != "workspaces.json" and fn[:-5] not in out:
+                m = read_json(os.path.join(dest, fn), {}) or {}
+                if m.get("workspace_kind"):
+                    out[fn[:-5]] = {"workspace_kind": m.get("workspace_kind"), "patch_applied": m.get("patch_applied"),
+                                    "instance_id": m.get("instance_id")}
+    return out
+
+
 def cmd_bundle(camp: Campaign, args) -> int:
     tracks = tuple(t for t in (args.tracks.split(",") if args.tracks else TRACKS) if t)
-    inc, exc = bundle_candidates(camp.path, args.include_raw, tracks)
+    use_default_raw = not getattr(args, "no_default_raw", False)
+    max_raw = int(float(getattr(args, "max_raw_mb", DEFAULT_MAX_RAW_MB)) * 1024 * 1024)
+    inc, exc = bundle_candidates(camp.path, args.include_raw, tracks, default_raw=use_default_raw)
     stamp = utc_stamp()
     bdir = camp.p("bundle")
     stage = os.path.join(bdir, f"stage-{stamp}")
@@ -3695,9 +4060,16 @@ def cmd_bundle(camp: Campaign, args) -> int:
     totals: dict[str, int] = {}
     env_total = 0
     bad_json = []
-    for src, rel in inc:
+    staged: list[tuple[str, str]] = []                     # (src, staged rel)
+    scanned_bytes = 0
+    # plain files first, then the default-raw files (gzip-compressed) smallest first, under the size guard
+    plain = [(s_, r_) for s_, r_ in inc if args.include_raw or not (use_default_raw and is_default_raw(r_))]
+    plain_set = set(plain)
+    rawd = sorted([(s_, r_) for s_, r_ in inc if (s_, r_) not in plain_set], key=lambda x: os.path.getsize(x[0]))
+    for src, rel in plain:
         drop = CC_TEXT_FIELDS if (rel.split(os.sep)[0] == "cc" and not args.include_raw
                                    and rel.endswith((".jsonl",))) else ()
+        scanned_bytes += os.path.getsize(src)
         r = stage_file(src, os.path.join(stage, rel), rel, secrets, drop, not args.no_redact)
         if r["counts"] or r["env_hits"] or r["dropped_fields"] or not r["json_ok"]:
             report["files"][rel] = r
@@ -3706,19 +4078,57 @@ def cmd_bundle(camp: Campaign, args) -> int:
         env_total += r["env_hits"]
         if not r["json_ok"]:
             bad_json.append(rel)
+        staged.append((src, rel))
+    raw_used, raw_skipped, raw_packed = 0, [], []
+    for src, rel in rawd:
+        size = os.path.getsize(src)
+        dst_rel = rel + ".gz"
+        dst = os.path.join(stage, dst_rel)
+        scanned_bytes += size
+        r = stage_file(src, dst, rel, secrets, (), not args.no_redact, gz=True)
+        gz_size = os.path.getsize(dst)
+        if raw_used + gz_size > max_raw:
+            os.remove(dst)                                  # the redaction scan of a skipped file still counted (it was not shipped)
+            raw_skipped.append({"rel": rel, "bytes": size, "bytes_gz": gz_size,
+                                "reason": f"size guard: --max-raw-mb {getattr(args, 'max_raw_mb', DEFAULT_MAX_RAW_MB)} would be exceeded"})
+            continue
+        raw_used += gz_size
+        raw_packed.append({"rel": dst_rel, "bytes": size, "bytes_gz": gz_size})
+        if r["counts"] or r["env_hits"] or r["dropped_fields"] or not r["json_ok"]:
+            report["files"][dst_rel] = r
+        for k, v in r["counts"].items():
+            totals[k] = totals.get(k, 0) + v
+        env_total += r["env_hits"]
+        if not r["json_ok"]:
+            bad_json.append(dst_rel)
+        staged.append((src, dst_rel))
     for rel in bad_json:                                  # never ship a file the redaction broke
         os.remove(os.path.join(stage, rel))
         report["files"][rel]["removed"] = "unparseable after redaction"
-    inc = [(s, r) for s, r in inc if r not in bad_json]
+    inc = [(s_, r_) for s_, r_ in staged if r_ not in bad_json]
+    wk = workspace_kinds_of(camp)
+    if wk:
+        write_json(os.path.join(stage, "oh", "workspace-kinds.json"), wk)
+        inc.append(("", os.path.join("oh", "workspace-kinds.json")))
     report["hits_by_kind"] = totals
     report["env_secret_hits"] = env_total
     report["total_hits"] = sum(totals.values()) + env_total
+    # hits inside the campaign's COPIES OF THE SCRIPTS are pattern false positives of the `assign` kind (`"unsupported_tokens": ...`,
+    # `SUM_MAX_TOKENS_SLACK = 1.8`), not leaks: the verdict is on every other file (and any env-secret hit anywhere)
+    code_hits = sum(sum(v["counts"].values()) for k, v in report["files"].items() if k.startswith("scripts" + os.sep) and k.endswith(".py"))
+    report["code_copy_hits"] = code_hits
+    report["data_hits"] = report["total_hits"] - code_hits
+    report["files_scanned"] = len(staged)
+    report["bytes_scanned"] = scanned_bytes
     report["excluded"] = {"count": len(exc), "bytes": sum(e["bytes"] for e in exc),
                           "by_reason": {k: sum(1 for e in exc if e["reason"] == k) for k in sorted({e["reason"] for e in exc})},
                           "examples": [e["rel"] for e in exc[:12]]}
+    report["raw_default"] = {"enabled": use_default_raw and not args.include_raw, "max_raw_mb": getattr(args, "max_raw_mb", DEFAULT_MAX_RAW_MB),
+                             "packed": raw_packed, "packed_bytes_gz": raw_used, "skipped": raw_skipped}
     write_json(os.path.join(stage, "bundle-redaction-report.json"), report)
     man = {"campaign": os.path.basename(camp.path), "ts": utc_iso(), "git_head": git_head(), "include_raw": args.include_raw,
            "tracks": list(tracks), "spend_usd": camp.ledger()["totals"],
+           "workspace_kinds": wk, "raw_default": report["raw_default"],
            "files": {rel: {"bytes": os.path.getsize(os.path.join(stage, rel)),
                            "sha256": sha256_file(os.path.join(stage, rel))} for _, rel in inc}}
     write_json(os.path.join(stage, "bundle-manifest.json"), man)
@@ -3730,12 +4140,26 @@ def cmd_bundle(camp: Campaign, args) -> int:
     digest = sha256_file(out)
     print(f"\nbundle: {len(inc)} file(s) packed, {len(exc)} excluded "
           f"({human_size(report['excluded']['bytes'])}: {report['excluded']['by_reason']})")
+    if raw_packed or raw_skipped:
+        print(f"raw (gzip) by default: {len(raw_packed)} file(s) packed, {human_size(raw_used)} compressed (guard --max-raw-mb "
+              f"{getattr(args, 'max_raw_mb', DEFAULT_MAX_RAW_MB)}); SKIPPED by the guard: {len(raw_skipped)}"
+              + (" -> " + ", ".join(f"{x['rel']} ({human_size(x['bytes'])} raw / {human_size(x['bytes_gz'])} gz)" for x in raw_skipped[:5])
+                 if raw_skipped else ""))
+    if wk:
+        kinds: dict[str, int] = {}
+        for v in wk.values():
+            kinds[v["workspace_kind"]] = kinds.get(v["workspace_kind"], 0) + 1
+        print(f"workspace kinds (oh/workspace-kinds.json): {kinds}")
     if report["total_hits"]:
         print(f"REDACTION SCAN: {report['total_hits']} secret-looking string(s) redacted in the packed copy "
               f"(kinds {totals}, env-secret values {env_total}); files: {sorted(report['files'])[:8]} -> REVIEW "
               "bundle-redaction-report.json inside the archive before sending")
     else:
-        print("REDACTION SCAN: 0 hits")
+        print(f"REDACTION SCAN: 0 hits")
+    print(f"LEAK SCAN: {'PASS' if not report['data_hits'] else 'REVIEW'} - {report['files_scanned']} file(s), "
+          f"{human_size(scanned_bytes)} scanned, {len(secrets)} env secret value(s) checked, {report['data_hits']} hit(s)"
+          f"{f' (+{code_hits} known pattern false positive(s) in the script copies)' if code_hits else ''}"
+          f"{'' if not args.no_redact else ' (REDACTION OFF)'}")
     if any(rel.split(os.sep)[0] == "cc" for _, rel in inc):
         print("NOTE: cc records/judged files contain excerpts of your private Claude Code sessions (questions, answers); "
               "memory_text/injected were dropped. Use --tracks oh,beam to leave them out.")
@@ -3906,20 +4330,42 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Amendment C.9 (PRIMARY): agents with workspace tools, with / without memory_recall, per question of the "
                             "finished campaign; judge (outcome schema), metrics_agentic, bundle")
     t.add_argument("--dry-run", action="store_true", help="print the steps x tokens cost estimate and the pre-run power guess; spend nothing")
-    t.add_argument("--arms", default=AGENTIC_ARMS, help="comma list of sum, sum+mem, note+mem (note+mem is OPTIONAL: run it only if sum+mem showed a gain)")
+    t.add_argument("--arms", default=None, help=f"comma list of sum, sum+mem, note+mem, sum+bm25, sum+grep, oracle (default {AGENTIC_ARMS}; note+mem is "
+                                                "OPTIONAL: only if the GAIN rule of Amendment C.10 is met)")
+    t.add_argument("--controls", action="store_true",
+                   help="Amendment C.10 preset: --arms sum+mem,sum+bm25,sum+grep,oracle on the SAME questions, `sum` and the C.9 sum+mem rows "
+                        "(labelled sum+mem@uncapped) REUSED from the finished C.9 agentic run (own run dir oh/agentic-c10-run; the ingest is reused)")
+    t.add_argument("--reuse-agentic-run", default=None, metavar="DIR",
+                   help="the finished C.9 agentic run whose sum / sum+mem rows and verdicts are copied (default with --controls: <campaign>/oh/agentic-run)")
     t.add_argument("--max-steps", type=int, default=12)
     t.add_argument("--max-question-tokens", type=int, default=400000)
-    t.add_argument("--memory-max-chars", type=int, default=6000)
+    t.add_argument("--retrieval-max-chars", "--memory-max-chars", dest="retrieval_max_chars", type=int, default=6000,
+                   help="ONE cap for every retrieval arm (sent as memory_recall max_chars and enforced client-side; the server now bounds the whole context)")
+    t.add_argument("--bm25-passage-chars", type=int, default=1500, help="sum+bm25: retrieval unit (passages cut from the ingested pieces; 0 = whole pieces)")
     t.add_argument("--concurrency", type=int, default=2, help="sessions in parallel")
     t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
     t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir (default <campaign>/oh/run)")
     t.add_argument("--accept-partial", action="store_true")
     t.add_argument("--skip-judge", action="store_true")
+    t = sub.add_parser("oh-ingest-measure", parents=[common],
+                       help="Amendment C.10: re-ingest K sessions into FRESH THROWAWAY projects with the fixed server to MEASURE the extractor's "
+                            "tokens / USD (never the main nc-* projects); first call provisions + asks for a server restart, second ingests")
+    t.add_argument("--sessions", type=int, default=3, metavar="K", help="sessions to re-ingest (default 3, spread over the sorted sids)")
+    t.add_argument("--dry-run", action="store_true", help="print the plan, the estimate and the delete instructions; write nothing")
+    t.add_argument("--new-measure", action="store_true", help="forget the recorded throwaway ids and mint new ones")
+    t.add_argument("--projects-dir", default=None, metavar="DIR")
+    t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+    t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
+    t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
     sub.add_parser("status", parents=[common], help="read-only: campaigns under the artifact root, or (with --resume) one "
                                                     "campaign's steps / spend / calibration / validity")
     b = sub.add_parser("bundle", parents=[common], help="tar.gz of what the analyst needs (redaction-scanned)")
     b.add_argument("--include-raw", action="store_true", help="also pack raw transcripts, session stores, judge input")
     b.add_argument("--no-redact", action="store_true", help="skip the redaction pass (scan report still written)")
+    b.add_argument("--max-raw-mb", type=float, default=DEFAULT_MAX_RAW_MB,
+                   help=f"size guard for the raw files packed by default (agentic traces, recall / probe sidecars of the OH track, gzip-compressed, "
+                        f"redacted): their compressed total stays under this (default {DEFAULT_MAX_RAW_MB:.0f}); the bundle lists what it skipped")
+    b.add_argument("--no-default-raw", action="store_true", help="do not pack the traces / recall sidecars (the C.9 behaviour)")
     b.add_argument("--tracks", default=None, help="comma list (default all present)")
     b.add_argument("--out", default=None)
     return ap
@@ -3978,6 +4424,19 @@ def project_doctor_rows(cfg: dict, probes: Probes, camp: Campaign) -> list[dict]
                                   f"start only - restart it once (HARS_MEMORY_PROJECTS_DIR={pj.get('projects_dir')})" if missing else ""),
                               scope="oh"))
         if not missing:
+            # Amendment C.10: does the running server bound memory_recall's whole context by max_chars and say so (`context_cap`)? A
+            # server started before `git pull` does not: its capped arms would be client-truncated and the HARS arm not comparable.
+            try:
+                pr = probes.mcp(url, "memory_recall", {"project": pids[0], "question": "cap probe", "mode": "hybrid", "ll_keywords": ["probe"],
+                                                       "hl_keywords": ["probe"], "max_chars": 2000}, 120) or {}
+                has_cap = isinstance(pr.get("context_cap"), dict)
+                over = len(str(pr.get("context") or "")) > 2000
+                rows.append(check_row("hars.hard_cap", "OK" if has_cap and not over else "FAIL",
+                                      "memory_recall reports `context_cap` and returned <= max_chars" if has_cap and not over else
+                                      ("the server has no `context_cap` in its recall payload: it predates the C.10 hard cap - `git pull` and "
+                                       "RESTART it (HOME-RUNBOOK C.10)" if not has_cap else "the server returned more than max_chars=2000"), scope="oh"))
+            except Exception as e:  # noqa: BLE001
+                rows.append(check_row("hars.hard_cap", "WARN", f"cap probe failed: {type(e).__name__}: {str(e)[:100]}", scope="oh"))
             filled = []
             for pid in pids:
                 st = probes.mcp(url, "memory_status", {"project": pid}, 60) or {}
@@ -4081,6 +4540,7 @@ def _main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
         camp = open_campaign(cfg, args, args.cmd, runner=runner)
         GUARD_CTX["campaign"] = os.path.basename(camp.path)
         camp.cfg = cfg
+        camp.probes = probes
         camp.legacy_replay = bool(getattr(args, "legacy_replay", False))
         if args.cmd == "doctor":
             return cmd_doctor(cfg, args, probes, offline, camp)
@@ -4092,7 +4552,8 @@ def _main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
         if args.cmd in REUSE_CMDS:
             camp.reuse_ok = True
             return {"oh-provision": cmd_oh_provision, "oh-ingest": cmd_oh_ingest, "oh-probe": cmd_oh_probe,
-                    "oh-enrich": cmd_oh_enrich, "oh-workspaces": cmd_oh_workspaces, "oh-agentic": cmd_oh_agentic}[args.cmd](camp, args)
+                    "oh-enrich": cmd_oh_enrich, "oh-workspaces": cmd_oh_workspaces, "oh-agentic": cmd_oh_agentic,
+                    "oh-ingest-measure": cmd_oh_ingest_measure}[args.cmd](camp, args)
         if args.cmd == "calibrate":
             return cmd_calibrate(camp, args)
         if args.cmd == "oh":

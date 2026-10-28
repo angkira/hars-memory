@@ -242,6 +242,43 @@ campaign may still spend.
 Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~2.3 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
 
+### 6.0e Amendment C.10 - control arms, a true retrieval cap, measured ingest cost (protocol 4a.10; read after the C.9 run)
+
+What the C.9 result does and does not say, and why this run exists, is in `REPORT-PROTOCOL.md` 4a.10 (C.10-1). In short: `sum+mem` beat `sum` because the questions are
+transcript-only (access to the dropped conversation, not retrieval quality), `max_chars` was not a cap, the token question was unanswered. C.10 re-runs `sum+mem` with a
+real cap and adds the controls on the SAME 140 questions: `sum+bm25` (same tool, BM25 over the ingested text), `sum+grep` (`transcript_grep`), `oracle` (the whole dropped
+transcript in the prompt). `sum` and the old `sum+mem` (relabelled `sum+mem@uncapped`) are REUSED from the C.9 run (rows and verdicts); nothing is re-ingested.
+
+Exact sequence for the executor (the C.9 run in `$CAMP/oh/agentic-run`, the workspaces and the C.8 ingest are already there; the same campaign, the same server env):
+
+```bash
+cd <your checkout of this repo>
+git pull                                              # branch claude/youthful-thompson-yv6xqd (or main once merged)
+# 1) RESTART your HARS server from THIS checkout (it must have the C.10 server code: the hard cap on max_chars and extract_usage).
+#    Same env as before (HARS_MEMORY_PROJECTS_DIR, extractor, embedder); the nc-* projects keep their data.
+cd experiments/neurocompact-eval/scripts
+CAMP=<the finished oh campaign>                       # the one whose oh/agentic-run you already have
+# 2) doctor: row hars.hard_cap must be OK (the payload carries `context_cap`, <= max_chars); projects.registered 14/14; projects.state 14/14 hold entities
+uv run python home_run.py doctor --resume $CAMP
+# 3) the cost estimate PER ARM (zero spend): the stated steps x tokens model (8 steps) and the same model with the step counts observed in the C.9 run
+uv run python home_run.py oh-agentic --controls --resume $CAMP --dry-run
+# 4) the PAID run: sum+mem (capped), sum+bm25, sum+grep, oracle on the 140 questions; the judge sees ONLY the new rows; old verdicts are merged; metrics
+uv run python home_run.py oh-agentic --controls --resume $CAMP        # [--retrieval-max-chars 6000] [--concurrency 2] [--bm25-passage-chars 1500]
+# 5) the ingest cost (extractor calls / tokens / USD) measured on 3 THROWAWAY projects, never the main nc-* ones:
+uv run python home_run.py oh-ingest-measure --resume $CAMP --dry-run
+uv run python home_run.py oh-ingest-measure --resume $CAMP --sessions 3   # first call: writes 3 throwaway project dirs and exits 3 -> RESTART the server ONCE
+uv run python home_run.py oh-ingest-measure --resume $CAMP --sessions 3   # second call: ingests them, writes oh/ingest-measure/measure.json, recomputes the C.10 report
+# 6) the bundle (now includes the agentic traces, ingest.jsonl, recall/probe sidecars, gzip-compressed, redacted, <= --max-raw-mb 200)
+uv run python home_run.py bundle --resume $CAMP
+# 7) delete the 3 throwaway projects with the commands step 5 printed (rm -r <projects dir>/nc-<run id>m<MMDDHHMM>-<sid>; their Qdrant collections), restart once
+```
+- Outputs: `oh/agentic-c10-run/` (`records.jsonl`, `traces.jsonl`, `judged.jsonl`, `REPORT-oh-agentic-c10.md`, `metrics-agentic-c10.json`, `summary.json`); the C.9 run in `oh/agentic-run/` is untouched. Steps: `oh.agentic.c10.{run,export,judge,merge,metrics}`, `oh.ingest.measure`.
+- The run refuses to start the HARS arms against a server that does not report `context_cap` (exit 4, nothing spent): restart it from the pulled checkout. (`--allow-old-server` overrides; the rows then record the server's cap violations and the client guard cuts the text.)
+- Caps are the existing `[caps] run / judge / total`; the estimate guard, the per-HARS lock and the server lease apply as before. A campaign stamped `2026-10-27.c6` ... `2026-10-28.c9` is accepted by `oh-agentic` and `oh-ingest-measure` (code `2026-10-28.c10`).
+- Judge: an unparseable reply is re-asked once; if it still fails the row is `judge_unparsed` (excluded from accuracy, counted). An aborted judge run is now booked in the ledger (the C.9 run booked USD 0.0 for one that had spent 1.0968) and resumes from `judged.new.jsonl.partial` when you re-run the same command.
+- Reading `REPORT-oh-agentic-c10.md`: the PAIRS table (verdict by the pre-registered decision rule, `sum+mem` vs `sum+bm25` FIRST: that is the HARS-specific contrast), the `note+mem` trigger line, tokens and USD per correct answer (the HARS arms include the amortised ingest once step 5 is done), the fresh vs cached token columns, the accuracy-matched cost table, and the sessions WITHOUT the final patch reported apart.
+- `note+mem` is NOT run. The redesign with workspace-findable questions and longer sessions is future work (protocol C.10-9).
+
 ### 6.0d Amendment C.9 - the agentic runs (PRIMARY question; read after `oh-ingest`)
 
 The owner's question: does the agent spend MORE tokens finding a fact WITHOUT memory than when it fetches it from memory? `oh-agentic` runs, for each of the 140
@@ -268,7 +305,7 @@ uv run python home_run.py bundle --resume $CAMP                                 
 uv run python home_run.py oh-agentic --resume $CAMP --arms note+mem
 ```
 - Requirements (enforced): `oh-ingest` done (the C.8 projects hold the data; your HARS server running, the same one), the workspaces step done, the same judge model as
-  the C.6 campaign, the caps (`[caps] run / judge / total`), the per-HARS lock. A campaign stamped `2026-10-27.c6`, `2026-10-28.c7` or `2026-10-28.c8` is accepted (code `2026-10-28.c9`).
+  the C.6 campaign, the caps (`[caps] run / judge / total`), the per-HARS lock. A campaign stamped `2026-10-27.c6`, `2026-10-28.c7` or `2026-10-28.c8` is accepted (code `2026-10-28.c9` at the time; C.10: `2026-10-28.c10`, see 6.0e).
 - It is resumable: re-running the same command keeps finished (question, arm) rows (`oh/agentic-run/records.jsonl`) and finished steps. Outputs in `oh/agentic-run/`:
   `records.jsonl` (per step tokens, totals, USD, tool and memory calls, answer, anchor-in-tool-result flags), `traces.jsonl` (full traces, raw: not in the default bundle),
   `samples.jsonl`, `judge-input.jsonl`, `judged.jsonl`, `REPORT-oh-agentic.md`, `metrics-agentic.json`, `summary.json`, `MANIFEST.json`, `scripts/`, `inputs/`.

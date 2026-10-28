@@ -1187,6 +1187,8 @@ class FakeHars:
         self.default_kb: list[str] = []            # chunks of the owner's global KB (the `default` project)
         self.upsert_calls: list[dict] = []
         self.recall_args: list[dict] = []
+        self.honour_cap = True                     # False: behaves like a server older than the C.10 hard cap (tests)
+        self.report_cap = True                     # False: no `context_cap` field in the recall payload (old server)
 
     def register_project(self, pid: str) -> None:
         self.projects.setdefault(pid, {"docs": {}, "ents": set()})
@@ -1210,7 +1212,13 @@ class FakeHars:
                 st["docs"][f"{path}#{i}"] = ch
             st["docs"][path] = content
             st["ents"].update(re.findall(r"[A-Za-z_][\w./-]*\d[\w./-]*", content))
-            return {"ok": True, "action": action, "file_path": path}
+            out = {"ok": True, "action": action, "file_path": path}
+            if action != "unchanged":              # like the server: an unchanged document runs no extraction
+                n = max(1, len(content) // 2000)
+                out["extract_usage"] = {"calls": n, "prompt_tokens": n * 1000, "completion_tokens": n * 100,
+                                        "total_tokens": n * 1100, "calls_estimated": 0, "estimated": False,
+                                        "scope": "this_call"}
+            return out
 
     def project_state(self, project):
         st = self._proj(project)
@@ -1268,16 +1276,23 @@ class FakeHars:
         qw = set(re.findall(r"\w{3,}", " ".join([query, *ll, *hl]).lower()))
         ranked = sorted(st["docs"], key=lambda d: -len(qw & set(re.findall(r"\w{3,}", d.lower()))))[:20]
         kept, used = [], 0
+        # the real server (C.10) bounds the WHOLE rendered context: reserve the fixed section text
+        overhead = len("\n".join(["Document Chunks (each has a reference_id):", "```json", "```", "",
+                                   "Reference Document List (for reference):", "```", f"[1] {sid}.md", "```"])) + 4
         for c in ranked:
             line = json.dumps({"reference_id": str(len(kept) + 1), "content": c, "section": ""})
-            if max_chars and used + len(line) > max_chars:
+            if max_chars and (used + len(line) + 1 > max_chars - overhead if self.honour_cap else used + len(line) > max_chars):
                 continue
             kept.append(line)
-            used += len(line)
+            used += len(line) + (1 if self.honour_cap else 0)
         raw = ["Document Chunks (each has a reference_id):", "```json", *kept, "```", "",
                "Reference Document List (for reference):", "```", f"[1] {sid}.md", "```"]
-        out = {"ok": True, "context": "\n".join(raw), "graph_branch": gb,
+        ctx_text = "\n".join(raw)
+        out = {"ok": True, "context": ctx_text, "graph_branch": gb,
                "lightrag_mode": "hybrid" if kw else "skipped", "mode_fallback": None}
+        if max_chars and self.report_cap:
+            out["context_cap"] = {"max_chars": max_chars, "chars_before": len(ctx_text), "chars_after": len(ctx_text),
+                                  "applied": False, "cut": {}}
         if not project:                 # the real server adds the session block only for a session_id call
             out["session"] = {"status": "ok", "vectors_indexed": len(st["docs"]), "entities": len(st["ents"])}
         return out
@@ -1339,6 +1354,34 @@ class Tee:
         return False
 
 
+def new_extract_totals() -> dict:
+    return {"documents": 0, "documents_measured": 0, "documents_unmeasured": 0, "calls": 0, "prompt_tokens": 0,
+            "completion_tokens": 0, "calls_estimated": 0}
+
+
+def add_extract_usage(tot: dict, eu) -> None:
+    """Fold one memory_upsert_document `extract_usage` (None = the server did not report it) into `tot`."""
+    tot["documents"] += 1
+    if not isinstance(eu, dict):
+        tot["documents_unmeasured"] += 1
+        return
+    tot["documents_measured"] += 1
+    for k in ("calls", "prompt_tokens", "completion_tokens", "calls_estimated"):
+        tot[k] += int(eu.get(k) or 0)
+
+
+def extract_totals_view(tot: dict, ext_price: tuple | None = None) -> dict:
+    """The totals as written to ingest.jsonl / summary.json: tokens, an `estimated` flag (any call without provider
+    usage, or any document the server did not report on) and, with the extractor's price (USD per Mtok in, out), USD."""
+    out = dict(tot)
+    out["total_tokens"] = tot["prompt_tokens"] + tot["completion_tokens"]
+    out["estimated"] = bool(tot["calls_estimated"] or tot["documents_unmeasured"])
+    out["complete"] = tot["documents_unmeasured"] == 0 and tot["documents"] > 0
+    if ext_price:
+        out["usd"] = round((tot["prompt_tokens"] * ext_price[0] + tot["completion_tokens"] * ext_price[1]) / 1e6, 6)
+    return out
+
+
 class Ctx:
     """Shared run state: models, HARS handle, artifact dir, locks, done set."""
 
@@ -1346,6 +1389,7 @@ class Ctx:
         self.args, self.out, self.hars, self.sum_llm, self.qa_llm, self.run_id = args, out, hars, sum_llm, qa_llm, run_id
         self.budget = budget                  # providers.Budget (hard cap) or None (mock/dry)
         self.est_hars_usd = 0.0               # flagged ESTIMATE of the HARS-side extraction
+        self.extract = new_extract_totals()   # MEASURED extractor usage reported by the server (C.10), project layout
         self.lock = threading.Lock()
         self.done: set[tuple[str, str, int]] = set()
         self.totals = Counter()
@@ -1553,6 +1597,7 @@ class SessionRun:
         self.note_text: dict[int, str] = {}
         self.ingest_ok = True
         self.ingest_err = ""
+        self.extract = new_extract_totals()        # this session's measured extractor usage (all boundaries, from the cache)
         self.hars_keys: dict[object, str] = {}
         self.enriched: dict[int, dict] = {}
         self.old_mem: dict | None = None            # --reuse-run: the old run's memory/<sid>.json (read-only)
@@ -1673,9 +1718,11 @@ class SessionRun:
         n_calls = max(1, L.ceil_div(len(pieces), self.a.pieces_per_call))
         if done and done.get("ok"):
             self.log_comp({"j": b["j"], "arm": "hars", "cached": True, "calls": done["calls"]})
+            self.fold_cached_usage(done)
             return
         t0 = time.time()
         seqs = []
+        bt = new_extract_totals()                # this boundary's measured extractor usage (the server's extract_usage)
         for c in range(n_calls):
             chunk = pieces[c * self.a.pieces_per_call:(c + 1) * self.a.pieces_per_call]
             summary = note if c == 0 else f"Boundary {b['j']} continuation {c + 1}/{n_calls}: dropped context of the same compaction."
@@ -1691,6 +1738,8 @@ class SessionRun:
                         r = self.c.hars.compact(hsid, summary, chunk, meta)
                     if isinstance(r, dict) and r.get("ok") is not False:
                         seqs.append(r.get("seq") or r.get("action"))
+                        if project:
+                            add_extract_usage(bt, r.get("extract_usage"))
                         err = ""
                         break
                     err = f"{'memory_upsert_document' if project else 'memory_compact'} ok=false: {str(r)[:200]}"
@@ -1703,11 +1752,26 @@ class SessionRun:
                 self.ingest_err = f"boundary {b['j']} call {c + 1}: {err}"
                 self.log_comp({"j": b["j"], "arm": "hars", "ok": False, "error": err})
                 return
-        self.mem.put(key, {"ok": True, "calls": n_calls, "seqs": seqs})
+        self.mem.put(key, {"ok": True, "calls": n_calls, "seqs": seqs, **({"extract_usage": bt} if project else {})})
+        if project:
+            self.fold_usage(bt)
         self.charge_extraction_estimate(b, dropped)
         self.log_comp({"j": b["j"], "arm": "hars", "ok": True, "cached": False, "pieces": len(pieces),
                        "project": project, "calls": n_calls, "seconds": round(time.time() - t0, 2),
                        "drop_chars": sum(len(x) for x in pieces)})
+
+    def fold_usage(self, bt: dict) -> None:
+        for k, v in bt.items():
+            self.extract[k] += v
+        with self.c.lock:
+            for k, v in bt.items():
+                self.c.extract[k] += v
+
+    def fold_cached_usage(self, done: dict) -> None:
+        """A resumed run: the boundary was ingested by an earlier invocation; its usage is in the cache entry."""
+        bt = done.get("extract_usage")
+        if isinstance(bt, dict) and all(k in bt for k in self.extract):
+            self.fold_usage(bt)
 
     def charge_extraction_estimate(self, b: dict, dropped: list[dict]):
         """The HARS server bills its own extractor calls; this run charges a flagged ESTIMATE
@@ -2117,9 +2181,11 @@ class SessionRun:
         if a.ingest_only:
             st = post_project_gate(self.c.hars, self.project_of(self.note_budget_for_store()), self.expected_calls()) \
                 if self.ingest_ok else [f"ingest failed: {self.ingest_err}"]
+            ep = (getattr(self.a, "prices_cache", None) or {}).get("ext")
             self.c.append("ingest.jsonl", {"sid": self.sid, "project": self.project_of(self.note_budget_for_store()),
                                            "hars_sid": self.hars_sid(self.note_budget_for_store()), "ok": not st,
                                            "problems": st, "calls": self.expected_calls(),
+                                           "extract_usage": extract_totals_view(self.extract, tuple(ep) if ep else None),
                                            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
             print(f"[{self.sid}] ingest-only: project {self.project_of(self.note_budget_for_store())} "
                   f"{'ok' if not st else 'PROBLEMS ' + '; '.join(st[:2])}", flush=True)
@@ -2876,6 +2942,8 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
                    "tokenizer_native": tok_native(),
                    "token_counter": (tokcount.get_default().manifest() if tokcount.get_default() else None),
                    "hars_extraction_estimated_usd": round(ctx.est_hars_usd, 6),
+                   "hars_extraction_measured": extract_totals_view(
+                       ctx.extract, tuple((getattr(a, "prices_cache", None) or {}).get("ext") or ()) or None),
                    "budget_usd": a.budget_usd}
         atomic_write(ctx.path("summary.json"), json.dumps(summary, indent=1))
         rcm = L.rc()
@@ -2895,6 +2963,7 @@ def _run(a, sessions, plans, prices, out, resuming, cfg, run_id) -> int:
                                              "prefix = memory + verbatim tail"},
                     "spend_usd": {"llm_measured": round(sum_llm.cost + qa_llm.cost, 6),
                                   "hars_extraction_estimated": round(ctx.est_hars_usd, 6),
+                                  "hars_extraction_measured_usd": summary["hars_extraction_measured"].get("usd"),
                                   "unpriced_calls": sum_llm.unpriced_calls + qa_llm.unpriced_calls,
                                   "budget_spent_total": round(budget.spent, 6) if budget else None},
                     "prices_usd_per_mtok": {k: list(v) for k, v in prices.items()},

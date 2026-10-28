@@ -48,19 +48,36 @@ import traceback
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
+import funnel_chains as FC  # noqa: E402  (BM25 of the C.7 funnel: the control arm reuses it)
 import longsession as L  # noqa: E402
 import providers as P  # noqa: E402
 from anchors import anchor_found  # noqa: E402
 
 ARM_SUM, ARM_SUM_MEM, ARM_NOTE_MEM = "sum", "sum+mem", "note+mem"
-ALL_ARMS = (ARM_SUM, ARM_SUM_MEM, ARM_NOTE_MEM)
+# Amendment C.10 control arms (same questions, summary, workspace and prompts as sum / sum+mem):
+ARM_SUM_BM25 = "sum+bm25"        # the SAME tool (name, schema, prompt) as sum+mem, backed by BM25 over the ingested pieces
+ARM_SUM_GREP = "sum+grep"        # transcript_grep(pattern) over the same dropped text
+ARM_ORACLE = "oracle"            # the full dropped transcript in the system prompt, no retrieval tool
+ARM_SUM_MEM_UNCAPPED = "sum+mem@uncapped"       # label of the C.9 sum+mem rows (the server ignored max_chars for them)
+ALL_ARMS = (ARM_SUM, ARM_SUM_MEM, ARM_NOTE_MEM, ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE)
 DEFAULT_ARMS = (ARM_SUM, ARM_SUM_MEM)
-MEM_ARMS = (ARM_SUM_MEM, ARM_NOTE_MEM)
-SUMMARY_SOURCE = {ARM_SUM: "baseline", ARM_SUM_MEM: "baseline", ARM_NOTE_MEM: "nc-note-only"}   # old-run arm whose memory_text is used
+CONTROL_ARMS = (ARM_SUM_MEM, ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE)     # `--controls`; `sum` is reused from the C.9 run
+MEM_ARMS = (ARM_SUM_MEM, ARM_NOTE_MEM)                      # backed by HARS
+RECALL_TOOL_ARMS = MEM_ARMS + (ARM_SUM_BM25,)               # arms that are given the memory_recall tool (identical schema / prompt)
+CAPPED_ARMS = RECALL_TOOL_ARMS + (ARM_SUM_GREP,)            # arms whose retrieval tool output is capped at --retrieval-max-chars
+REUSED_ARM_LABELS = {ARM_SUM: ARM_SUM, ARM_SUM_MEM: ARM_SUM_MEM_UNCAPPED}    # arm of the C.9 run -> its label in a C.10 run
+SUMMARY_SOURCE = {ARM_SUM: "baseline", ARM_SUM_MEM: "baseline", ARM_NOTE_MEM: "nc-note-only",
+                  ARM_SUM_BM25: "baseline", ARM_SUM_GREP: "baseline", ARM_ORACLE: "baseline"}   # old-run arm whose memory_text is used
 WORKSPACE_TOOLS = ("ls", "read_file", "grep")
 DEFAULT_MAX_STEPS = 12
 DEFAULT_QUESTION_TOKEN_CAP = 400_000
-DEFAULT_MEMORY_MAX_CHARS = 6000
+DEFAULT_RETRIEVAL_MAX_CHARS = 6000
+DEFAULT_MEMORY_MAX_CHARS = DEFAULT_RETRIEVAL_MAX_CHARS      # legacy name
+DEFAULT_PIECE_CHARS = 8000                                  # run_longsession --piece-chars (the ingested pieces)
+DEFAULT_BM25_PASSAGE_CHARS = 1500
+TRANSCRIPT_LINE_CHARS = 320
+TRANSCRIPT_CONTEXT_LINES = 1
+CLIENT_CUT_MARKER = "\n[cut at the retrieval cap]"
 DEFAULT_TOOL_OUT_CHARS = 6000
 READ_MAX_LINES = 250
 LS_MAX_ENTRIES = 200
@@ -69,6 +86,7 @@ GREP_PER_FILE = 15
 FILE_MAX_BYTES = 2_000_000
 AGENT_MAX_TOKENS = 1024
 JUDGE_VISIBLE_CAP = 150_000
+EVAL_VERSION_TAG = "2026-10-28.c10"
 
 SYSTEM_BASE = (
     "You are continuing a long software-engineering working session on a repository. Your earlier context was compacted; what you "
@@ -84,10 +102,17 @@ SYSTEM_MEMORY = (
     "dropped from your context when it was compacted). Write the query in English. Put exact identifiers (file names, function "
     "names, error strings, numbers) in ll_keywords and topics or themes in hl_keywords."
 )
+SYSTEM_GREP = (
+    "\n\nYou also have a transcript_grep tool: a regular-expression search (ripgrep syntax) over the text of the earlier part of "
+    "this session (the conversation that was dropped from your context when it was compacted). It returns the matching lines with "
+    "one line of context around each. Put exact identifiers (file names, function names, error strings, numbers) in the pattern; "
+    "use | to try alternatives."
+)
+ORACLE_SENTENCE = "The earlier conversation is reproduced in full below, after the session memory."
 LAST_STEP_NOTICE = "[This is your last step. Call the answer tool now with what you know, or say that you do not know.]"
 
 
-def tool_specs(with_memory: bool) -> list[dict]:
+def tool_specs(with_memory: bool, with_grep: bool = False) -> list[dict]:
     t = [
         {"name": "ls", "description": "List a directory of the workspace (directories end with '/').",
          "input_schema": {"type": "object", "properties": {"path": {"type": "string", "description": "directory, default '.'"}},
@@ -110,6 +135,11 @@ def tool_specs(with_memory: bool) -> list[dict]:
                                       "description": "exact identifiers: file names, functions, errors, numbers"},
                       "hl_keywords": {"type": "array", "items": {"type": "string"}, "description": "topics / themes"}},
                       "required": ["query"]}})
+    if with_grep:
+        t.append({"name": "transcript_grep",
+                  "description": "Regular-expression search (ripgrep syntax) over the text of the earlier part of this session. "
+                                 "Returns matching lines with one line of context. Result size is capped.",
+                  "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}})
     t.append({"name": "answer", "description": "Give the final answer (1-3 sentences) or say that you do not know. Ends the task.",
               "input_schema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}})
     return t
@@ -286,20 +316,27 @@ def transcript_probes(session: dict, n: int = 60, width: int = 80) -> list[str]:
     return sorted({re.sub(r"\s+", " ", t)[:width] for t in msgs[::step][:n]})
 
 
-def leak_scan(root: str, probes: list[str], extra_strings: list[str] | None = None, max_bytes: int = FILE_MAX_BYTES) -> list[dict]:
-    """Search every text file under `root` for the probes (whitespace-normalised substring). Returns hits (empty = clean)."""
+def leak_scan(root: str, probes: list[str], extra_strings: list[str] | None = None, max_bytes: int = FILE_MAX_BYTES,
+              stats: dict | None = None) -> list[dict]:
+    """Search every text file under `root` for the probes (whitespace-normalised substring). Returns hits (empty = clean).
+    `stats`, when given, is filled with {files_scanned, files_skipped, needles}."""
     needles = [p for p in list(probes) + list(extra_strings or []) if p]
     hits = []
+    st = stats if stats is not None else {}
+    st.update({"files_scanned": 0, "files_skipped": 0, "needles": len(needles)})
     for dp, dns, fns in os.walk(root):
         for fn in fns:
             fp = os.path.join(dp, fn)
             try:
                 if os.path.islink(fp) or os.path.getsize(fp) > max_bytes:
+                    st["files_skipped"] += 1
                     continue
                 with open(fp, "r", encoding="utf-8", errors="replace") as f:
                     txt = f.read()
             except OSError:
+                st["files_skipped"] += 1
                 continue
+            st["files_scanned"] += 1
             flat = re.sub(r"\s+", " ", txt)
             for nd in needles:
                 if nd in flat:
@@ -313,10 +350,14 @@ def check_workspace_clean(root: str, session: dict, forbidden_dirs: list[str]) -
         dr = os.path.realpath(d)
         if dr == rr or dr.startswith(rr + os.sep) or rr.startswith(dr + os.sep):
             raise SystemExit(f"workspace {root} overlaps {d} (campaign / transcript data): refusing")
-    anchors = [q.get("gold_anchor") for q in session.get("questions", []) if q.get("gold_anchor")]
-    hits = leak_scan(root, transcript_probes(session))
+    stats: dict = {}
+    hits = leak_scan(root, transcript_probes(session), stats=stats)
     if hits:
         raise SystemExit(f"LEAK: transcript strings found in the workspace of {session['sid']}: {hits[:3]}")
+    # explicit PASS line (C.10): a silent scan cannot be told from one that did not run. Gold anchors are NOT scanned for: they
+    # legitimately occur in the repository (identifiers, file names); a transcript-only fact is caught by the probes.
+    print(f"[leak-scan] PASS {session['sid']}: {stats['files_scanned']} file(s) scanned ({stats['files_skipped']} skipped: "
+          f"symlink / > {FILE_MAX_BYTES} bytes), {stats['needles']} transcript probe(s), 0 hits", flush=True)
 
 
 # =============================================================================
@@ -328,17 +369,39 @@ def _str_list(v, cap: int = 20, width: int = 120) -> list[str]:
     return [str(x).strip()[:width] for x in (v or []) if str(x).strip()][:cap]
 
 
-class MemoryTool:
-    """memory_recall -> HARS with the C.8 project shape (run_chainreplay.recall_args_correct minus session_id)."""
+def cap_text(text: str, max_chars: int) -> tuple[str, bool]:
+    """Client-side hard cap: text of at most `max_chars` characters (marker included). Returns (text, was_cut)."""
+    if not max_chars or len(text) <= max_chars:
+        return text, False
+    mk = CLIENT_CUT_MARKER
+    if max_chars <= len(mk) * 2:
+        return text[:max_chars], True
+    cut = text[:max_chars - len(mk)]
+    nl = cut.rfind("\n")
+    if nl > (max_chars - len(mk)) * 0.5:
+        cut = cut[:nl]
+    return cut.rstrip() + mk, True
 
-    def __init__(self, hars, project: str, max_chars: int = DEFAULT_MEMORY_MAX_CHARS):
+
+class CapViolation(RuntimeError):
+    """A capped arm's tool output exceeded the cap AFTER the client-side enforcement: a bug, never silently ignored."""
+
+
+class MemoryTool:
+    """memory_recall -> HARS with the C.8 project shape (run_chainreplay.recall_args_correct minus session_id).
+
+    Amendment C.10: `max_chars` is sent to the server (which now bounds the whole rendered context) AND enforced here
+    (`cap_text`) as a guard. The meta records what the server returned, whether it honoured the cap, and what was shown."""
+
+    def __init__(self, hars, project: str, max_chars: int = DEFAULT_RETRIEVAL_MAX_CHARS):
         self.hars, self.project, self.max_chars = hars, project, int(max_chars)
 
     def call(self, args: dict) -> tuple[str, dict]:
         q = str((args or {}).get("query") or "").strip()[:600]
         ll, hl = _str_list((args or {}).get("ll_keywords")), _str_list((args or {}).get("hl_keywords"))
-        meta = {"query": q, "ll_keywords": ll, "hl_keywords": hl, "returned_chars": 0, "error": None, "graph_branch": None,
-                "lightrag_mode": None, "seconds": 0.0}
+        meta = {"query": q, "ll_keywords": ll, "hl_keywords": hl, "returned_chars": 0, "server_chars": 0, "error": None,
+                "graph_branch": None, "lightrag_mode": None, "seconds": 0.0, "backend": "hars", "cap": self.max_chars,
+                "server_cap_honoured": None, "client_cut": False, "server_context_cap": None}
         if not q:
             meta["error"] = "empty query"
             return "memory_recall error: query is required", meta
@@ -351,12 +414,161 @@ class MemoryTool:
         pay = pay if isinstance(pay, dict) else {"context": "", "error": "non-dict payload"}
         meta["graph_branch"] = (pay.get("graph_branch") or {}).get("enabled") if isinstance(pay.get("graph_branch"), dict) else None
         meta["lightrag_mode"] = pay.get("lightrag_mode")
+        cc = pay.get("context_cap")
+        if isinstance(cc, dict):
+            meta["server_context_cap"] = {k: cc.get(k) for k in ("applied", "chars_before", "chars_after", "cut")}
         if pay.get("error") or pay.get("ok") is False:
             meta["error"] = str(pay.get("error") or "recall failed")[:200]
             return f"memory_recall error: {meta['error']}", meta
         ctx = str(pay.get("context") or "")
+        meta["server_chars"] = len(ctx)
+        meta["server_cap_honoured"] = (len(ctx) <= self.max_chars) if self.max_chars else None
+        ctx, meta["client_cut"] = cap_text(ctx, self.max_chars)
         meta["returned_chars"] = len(ctx)
+        if self.max_chars and len(ctx) > self.max_chars:
+            raise CapViolation(f"memory_recall output {len(ctx)} > cap {self.max_chars}")
         return (ctx if ctx.strip() else "(memory returned nothing)"), meta
+
+
+# =============================================================================
+# control arms (Amendment C.10): the same dropped text, no HARS
+# =============================================================================
+def span_bounds(session: dict, keep_tail: int = 0) -> list[tuple[int, int]]:
+    """(drop_start, at_idx) of every compaction boundary of the session, derived exactly as run_longsession does for the OH
+    campaign (`--use-real-compactions --keep-tail 0`, no synthetic final boundary): contiguous spans from message 0."""
+    msgs = session["messages"]
+    real = [c for c in session.get("compactions") or []]
+    bs = L.compute_boundaries(L.message_tokens(msgs), window=1, keep_tail=keep_tail, reserve=0, real=real, final=False)
+    return [(b["drop_start"], b["at_idx"]) for b in bs]
+
+
+def ingested_pieces(session: dict, piece_chars: int = DEFAULT_PIECE_CHARS, keep_tail: int = 0) -> list[str]:
+    """The dropped-context pieces that were written into the session's HARS project: per boundary span the same
+    `longsession.split_pieces` (`--piece-chars`, default 8000) as `SessionRun.ingest`. The union of the spans is the text
+    before the last boundary, i.e. `dropped_text`'s range."""
+    msgs = session["messages"]
+    out: list[str] = []
+    for lo, hi in span_bounds(session, keep_tail):
+        out += L.split_pieces(msgs[lo:hi], piece_chars)
+    return out
+
+
+def transcript_text(pieces: list[str]) -> str:
+    """The dropped transcript as one text (grep corpus, oracle context): the ingested pieces, in order."""
+    return "\n\n".join(pieces)
+
+
+def _kw_query(query: str, ll, hl) -> str:
+    return " ".join([query] + list(ll) + list(hl)).strip()
+
+
+class Bm25Tool:
+    """sum+bm25: the SAME memory_recall tool (name, schema, prompt) as sum+mem, with BM25 over EXACTLY the dropped text that
+    was ingested into the HARS project (`ingested_pieces`, the same split). Retrieval unit: each piece is cut into passages of
+    ~`passage_chars` (line-greedy, `funnel_chains.chunk_text`) because an 8000-char piece cannot fill a 6000-char cap with more
+    than one unit; `passage_chars=0` ranks whole pieces. Query = query + ll + hl keywords. The result is the best passages in
+    rank order until the cap (headers counted), at most `top_k` of them."""
+
+    def __init__(self, pieces: list[str], max_chars: int = DEFAULT_RETRIEVAL_MAX_CHARS, passage_chars: int = DEFAULT_BM25_PASSAGE_CHARS,
+                 top_k: int = 20):
+        self.max_chars, self.top_k, self.passage_chars = int(max_chars), int(top_k), int(passage_chars)
+        self.passages: list[tuple[int, str]] = []
+        for i, pc in enumerate(pieces):
+            if self.passage_chars > 0 and len(pc) > self.passage_chars:
+                parts = FC.chunk_text(pc, max(1, int(self.passage_chars / 3.6)), lambda t: int(round(len(t) / 3.6)))
+            else:
+                parts = [pc]
+            self.passages += [(i + 1, x.strip()) for x in parts if x.strip()]
+        self.index = FC.BM25([t for _, t in self.passages])
+        self.corpus_chars = sum(len(p) for p in pieces)
+
+    def call(self, args: dict) -> tuple[str, dict]:
+        q = str((args or {}).get("query") or "").strip()[:600]
+        ll, hl = _str_list((args or {}).get("ll_keywords")), _str_list((args or {}).get("hl_keywords"))
+        meta = {"query": q, "ll_keywords": ll, "hl_keywords": hl, "returned_chars": 0, "server_chars": 0, "error": None,
+                "graph_branch": None, "lightrag_mode": None, "seconds": 0.0, "backend": "bm25", "cap": self.max_chars,
+                "server_cap_honoured": None, "client_cut": False, "passages": 0, "corpus_chars": self.corpus_chars}
+        if not q:
+            meta["error"] = "empty query"
+            return "memory_recall error: query is required", meta
+        t0 = time.time()
+        sc = self.index.scores(_kw_query(q, ll, hl))
+        order = sorted((i for i, x in enumerate(sc) if x > 0), key=lambda i: (-sc[i], i))[:self.top_k]
+        parts, used = [], 0
+        for rank, i in enumerate(order, 1):
+            piece_no, text = self.passages[i]
+            block = f"[{rank}] (earlier session, part {piece_no}, bm25 {sc[i]:.2f})\n{text}\n"
+            if self.max_chars and used + len(block) > self.max_chars:
+                if parts:
+                    continue                                       # a passage that no longer fits is skipped (as the server does)
+                block, _ = cap_text(block, self.max_chars)         # the best passage alone may exceed the cap: cut it
+            parts.append(block)
+            used += len(block)
+        out = "".join(parts)
+        meta["seconds"] = round(time.time() - t0, 3)
+        meta["passages"] = len(parts)
+        meta["server_chars"] = len(out)
+        out, meta["client_cut"] = cap_text(out, self.max_chars)
+        meta["returned_chars"] = len(out)
+        meta["server_cap_honoured"] = True
+        if self.max_chars and len(out) > self.max_chars:
+            raise CapViolation(f"bm25 output {len(out)} > cap {self.max_chars}")
+        return (out if out.strip() else "(memory returned nothing)"), meta
+
+
+class TranscriptGrepTool:
+    """sum+grep: transcript_grep(pattern) over the same dropped text (`transcript_text(ingested_pieces)`). Python `re`
+    (smart case: case-insensitive unless the pattern has an upper-case letter, like `rg -S`). Matching lines with
+    `TRANSCRIPT_CONTEXT_LINES` line(s) of context, long lines cut to a window around the first match, non-adjacent groups
+    separated by `--`; the result is capped at `max_chars`."""
+
+    def __init__(self, text: str, max_chars: int = DEFAULT_RETRIEVAL_MAX_CHARS, context_lines: int = TRANSCRIPT_CONTEXT_LINES,
+                 line_chars: int = TRANSCRIPT_LINE_CHARS):
+        self.lines = text.split("\n")
+        self.max_chars, self.ctx, self.line_chars = int(max_chars), int(context_lines), int(line_chars)
+        self.corpus_chars = len(text)
+
+    def _show(self, line: str, m=None) -> str:
+        if len(line) <= self.line_chars:
+            return line
+        start = max(0, (m.start() if m else 0) - self.line_chars // 3)
+        seg = line[start:start + self.line_chars]
+        return ("..." if start else "") + seg + "..."
+
+    def call(self, args: dict) -> tuple[str, dict]:
+        pat = (args or {}).get("pattern")
+        meta = {"pattern": str(pat or "")[:300], "returned_chars": 0, "server_chars": 0, "error": None, "backend": "transcript_grep",
+                "cap": self.max_chars, "client_cut": False, "matches": 0, "corpus_chars": self.corpus_chars,
+                "server_cap_honoured": True}
+        if not isinstance(pat, str) or not pat:
+            meta["error"] = "pattern is required"
+            return "error: pattern is required", meta
+        try:
+            rx = re.compile(pat, 0 if re.search(r"[A-Z]", pat) else re.I)
+        except re.error as e:
+            meta["error"] = f"bad pattern: {e}"
+            return f"error: grep: bad pattern: {e}", meta
+        hits = [i for i, ln in enumerate(self.lines) if rx.search(ln)]
+        meta["matches"] = len(hits)
+        if not hits:
+            meta["returned_chars"] = len("(no matches)")
+            return "(no matches)", meta
+        out, last = [], -2
+        for i in hits:
+            lo, hi = max(0, i - self.ctx), min(len(self.lines) - 1, i + self.ctx)
+            if lo > last + 1 and out:
+                out.append("--")
+            for k in range(max(lo, last + 1), hi + 1):
+                m = rx.search(self.lines[k])
+                out.append(f"{k + 1}{':' if m else '-'}{self._show(self.lines[k], m)}")
+            last = hi
+        text = "\n".join(out)
+        meta["server_chars"] = len(text)
+        text, meta["client_cut"] = cap_text(text, self.max_chars)
+        meta["returned_chars"] = len(text)
+        if self.max_chars and len(text) > self.max_chars:
+            raise CapViolation(f"transcript_grep output {len(text)} > cap {self.max_chars}")
+        return text, meta
 
 
 # =============================================================================
@@ -509,9 +721,15 @@ def subset_flags(q: dict, summary: str, dropped: str) -> dict:
 # =============================================================================
 # one question x one arm
 # =============================================================================
-def system_for(arm: str, memory_text: str) -> str:
+def system_for(arm: str, memory_text: str, oracle_text: str | None = None) -> str:
+    """sum, sum+mem, note+mem and sum+bm25 share one prompt skeleton: sum+bm25's text is byte-identical to sum+mem's."""
     mem = memory_text if memory_text else "(none)"
-    return (SYSTEM_BASE + (SYSTEM_MEMORY if arm in MEM_ARMS else "") + "\n\n[Session memory]\n" + mem + "\n[End of session memory]")
+    if arm == ARM_ORACLE:
+        base = SYSTEM_BASE.replace("You cannot see the earlier conversation any more.", ORACLE_SENTENCE)
+        return (base + "\n\n[Session memory]\n" + mem + "\n[End of session memory]"
+                + "\n\n[Earlier conversation, complete]\n" + (oracle_text or "") + "\n[End of earlier conversation]")
+    return (SYSTEM_BASE + (SYSTEM_MEMORY if arm in RECALL_TOOL_ARMS else "") + (SYSTEM_GREP if arm == ARM_SUM_GREP else "")
+            + "\n\n[Session memory]\n" + mem + "\n[End of session memory]")
 
 
 def build_row(run_id: str, sid: str, arm: str, q: dict, trace: dict, *, summary_text: str, flags: dict, wall_s: float,
@@ -521,6 +739,8 @@ def build_row(run_id: str, sid: str, arm: str, q: dict, trace: dict, *, summary_
     cost = sum(float(s.get("cost_usd") or 0.0) for s in steps)
     ws_calls = [c for c in calls if c["kind"] == "workspace"]
     mem_calls = [c for c in calls if c["kind"] == "memory"]
+    tr_calls = [c for c in calls if c["kind"] == "transcript"]
+    ret_calls = mem_calls + tr_calls                       # every call to a retrieval tool over the dropped text
     by_type: dict[str, int] = {}
     for c in calls:
         by_type[c["name"]] = by_type.get(c["name"], 0) + 1
@@ -528,6 +748,11 @@ def build_row(run_id: str, sid: str, arm: str, q: dict, trace: dict, *, summary_
     final = trace["final"]
     in_ws = any(c["anchor_in_result"] for c in ws_calls)
     in_mem = any(c["anchor_in_result"] for c in mem_calls)
+    in_tr = any(c["anchor_in_result"] for c in tr_calls)
+    in_ret = in_mem or in_tr
+    rc_chars = [int((c.get("meta") or {}).get("returned_chars") or 0) for c in ret_calls]
+    rc_server = [int((c.get("meta") or {}).get("server_chars") or 0) for c in ret_calls]
+    cap = args_meta.get("retrieval_max_chars", args_meta.get("memory_max_chars")) if arm in CAPPED_ARMS else None
     in_in = sums("input_uncached")
     row = {
         "run_id": run_id, "rid": f"{q['qid']}::{arm}", "sid": sid, "chain_id": sid, "cluster_session": sid, "qid": q["qid"],
@@ -542,6 +767,23 @@ def build_row(run_id: str, sid: str, arm: str, q: dict, trace: dict, *, summary_
         "workspace_calls": len(ws_calls), "memory_calls_n": len(mem_calls),
         "memory_calls": [{"step": c["step"], **(c.get("meta") or {}), "anchor_in_result": c["anchor_in_result"]} for c in mem_calls],
         "memory_returned_chars": sum(int((c.get("meta") or {}).get("returned_chars") or 0) for c in mem_calls),
+        "transcript_calls_n": len(tr_calls),
+        "transcript_calls": [{"step": c["step"], **(c.get("meta") or {}), "anchor_in_result": c["anchor_in_result"]} for c in tr_calls],
+        "retrieval_calls_n": len(ret_calls),
+        # C.10: the cap that applied, what the retrieval tools returned (after the client-side guard) and what the SERVER sent
+        "retrieval_max_chars": cap,
+        "retrieval_chars_total": sum(rc_chars), "retrieval_chars_max": max(rc_chars, default=0),
+        "retrieval_server_chars_max": max(rc_server, default=0),
+        "retrieval_cap_server_violations": (sum(1 for c in ret_calls if (c.get("meta") or {}).get("server_cap_honoured") is False)
+                                            if cap else None),
+        "retrieval_client_cuts": sum(1 for c in ret_calls if (c.get("meta") or {}).get("client_cut")),
+        "retrieval_cap_ok": (all(x <= cap for x in rc_chars) if cap else None),
+        "workspace_kind": args_meta.get("workspace_kind"),
+        "oracle_context_chars": args_meta.get("oracle_chars") if arm == ARM_ORACLE else None,
+        "oracle_context_tokens": args_meta.get("oracle_tokens") if arm == ARM_ORACLE else None,
+        "corpus_chars": args_meta.get("corpus_chars") if arm in (ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE) else None,
+        "corpus_pieces": args_meta.get("corpus_pieces") if arm in (ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE) else None,
+        "reused_from": None, "eval_version": args_meta.get("eval_version"),
         "unknown_tool_calls": len([c for c in calls if c["kind"] == "unknown"]),
         "tokens_input_uncached": in_in, "tokens_cache_read": sums("cache_read"), "tokens_cache_write": sums("cache_write"),
         "tokens_input_total": sums("input_total"), "tokens_output": sums("output"),
@@ -551,21 +793,24 @@ def build_row(run_id: str, sid: str, arm: str, q: dict, trace: dict, *, summary_
                                            "cost_usd", "latency_s", "stop_reason")} for s in steps],
         "cost_usd": round(cost, 8), "latency_s": round(wall_s, 3),
         "anchor_in_workspace_results": in_ws if anc else None, "anchor_in_memory_results": in_mem if anc else None,
-        "anchor_in_any_result": (in_ws or in_mem) if anc else None,
+        "anchor_in_transcript_results": in_tr if anc else None, "anchor_in_retrieval_results": in_ret if anc else None,
+        "anchor_in_any_result": (in_ws or in_ret) if anc else None,
         "anchor_hit": anchor_found(final, anc) if anc else None,
         **flags,
         "summary_sha256": sha256_text(summary_text), "memory_text": summary_text, "memory_tokens": L.count_tokens(summary_text),
         "agent_model": args_meta.get("agent_model"), "qa_model": args_meta.get("agent_model"), "profile": args_meta.get("profile"),
         "max_steps": args_meta.get("max_steps"), "question_token_cap": args_meta.get("token_cap"),
-        "memory_max_chars": args_meta.get("memory_max_chars") if arm in MEM_ARMS else None,
+        "memory_max_chars": args_meta.get("retrieval_max_chars", args_meta.get("memory_max_chars")) if arm in RECALL_TOOL_ARMS else None,
         "persisted_compaction": None,
     }
     return row
 
 
-def visible_context_of(row: dict, trace_calls: list[dict], cap: int = JUDGE_VISIBLE_CAP) -> str:
-    """What the agent actually saw: the memory text + every tool result (workspace and memory). Question / answer excluded."""
-    parts = [row.get("memory_text") or ""] + [c.get("result") or "" for c in trace_calls if c.get("kind") in ("workspace", "memory")]
+def visible_context_of(row: dict, trace_calls: list[dict], cap: int = JUDGE_VISIBLE_CAP, oracle_text: str = "") -> str:
+    """What the agent actually saw: the memory text (+ the whole dropped transcript for the oracle arm) + every tool result
+    (workspace, memory, transcript). Question / answer excluded."""
+    parts = [row.get("memory_text") or "", oracle_text or ""] + [
+        c.get("result") or "" for c in trace_calls if c.get("kind") in ("workspace", "memory", "transcript")]
     ctx = "\n\n".join(p.strip() for p in parts if p and p.strip())
     return ctx[:cap]
 
@@ -606,7 +851,8 @@ class Ctx:
                 f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
-def exec_tool_factory(ws: Workspace, mem: MemoryTool | None):
+def exec_tool_factory(ws: Workspace, mem, tgrep: TranscriptGrepTool | None = None):
+    """`mem` is any object with .call(args) -> (text, meta): MemoryTool (HARS) or Bm25Tool, both exposed as `memory_recall`."""
     def run(name, args):
         try:
             if name in WORKSPACE_TOOLS:
@@ -614,26 +860,51 @@ def exec_tool_factory(ws: Workspace, mem: MemoryTool | None):
             if name == "memory_recall" and mem is not None:
                 text, meta = mem.call(args)
                 return text, bool(meta.get("error")), "memory", meta
+            if name == "transcript_grep" and tgrep is not None:
+                text, meta = tgrep.call(args)
+                return text, bool(meta.get("error")), "transcript", meta
             return f"unknown tool {name!r}", True, "unknown", {}
         except ToolError as e:
             return f"error: {e}", True, "workspace", {}
     return run
 
 
-def ask_one(ctx: Ctx, sid: str, session: dict, arm: str, q: dict, ws: Workspace, summaries: dict, flags: dict, project: str | None):
+class SessionKit:
+    """Per-session material shared by the arms: the workspace, the ingested pieces and the control-arm backends."""
+
+    def __init__(self, a, session: dict, ws: Workspace, ws_meta: dict, arms):
+        self.ws, self.ws_meta = ws, ws_meta
+        need_pieces = any(x in (ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE) for x in arms)
+        self.pieces = ingested_pieces(session, a.piece_chars) if need_pieces else []
+        self.text = transcript_text(self.pieces) if need_pieces else ""
+        cap = a.retrieval_max_chars
+        self.bm25 = Bm25Tool(self.pieces, cap, a.bm25_passage_chars) if ARM_SUM_BM25 in arms else None
+        self.tgrep = TranscriptGrepTool(self.text, cap) if ARM_SUM_GREP in arms else None
+
+
+def ask_one(ctx: Ctx, sid: str, session: dict, arm: str, q: dict, kit: SessionKit, summaries: dict, flags: dict, project: str | None):
     a = ctx.a
     memory_text = summaries[arm]
-    mem = MemoryTool(ctx.hars, project, a.memory_max_chars) if arm in MEM_ARMS else None
-    tools = tool_specs(arm in MEM_ARMS)
-    system = system_for(arm, memory_text)
+    if arm in MEM_ARMS:
+        mem = MemoryTool(ctx.hars, project, a.retrieval_max_chars)
+    elif arm == ARM_SUM_BM25:
+        mem = kit.bm25
+    else:
+        mem = None
+    tgrep = kit.tgrep if arm == ARM_SUM_GREP else None
+    tools = tool_specs(arm in RECALL_TOOL_ARMS, arm == ARM_SUM_GREP)
+    system = system_for(arm, memory_text, kit.text if arm == ARM_ORACLE else None)
     prompt = L.ask_prompt() + q["question"]
     t0 = time.time()
-    trace = run_agent(ctx.llm, system, prompt, tools, exec_tool_factory(ws, mem), max_steps=a.max_steps,
+    trace = run_agent(ctx.llm, system, prompt, tools, exec_tool_factory(kit.ws, mem, tgrep), max_steps=a.max_steps,
                       token_cap=a.max_question_tokens, anchor=(q.get("gold_anchor") or ""))
     wall = time.time() - t0
     row = build_row(ctx.run_id, sid, arm, q, trace, summary_text=memory_text, flags=flags, wall_s=wall,
                     args_meta={"agent_model": a.agent_model, "profile": a.provider, "max_steps": a.max_steps,
-                               "token_cap": a.max_question_tokens, "memory_max_chars": a.memory_max_chars})
+                               "token_cap": a.max_question_tokens, "retrieval_max_chars": a.retrieval_max_chars,
+                               "workspace_kind": (kit.ws_meta or {}).get("workspace_kind"), "eval_version": EVAL_VERSION_TAG,
+                               "oracle_chars": len(kit.text), "oracle_tokens": L.count_tokens(kit.text) if arm == ARM_ORACLE else None,
+                               "corpus_chars": len(kit.text), "corpus_pieces": len(kit.pieces)})
     tr = {"rid": row["rid"], "sid": sid, "arm": arm, "qid": q["qid"], "system": system, "question_prompt": prompt,
           "tools": [t["name"] for t in tools], "steps": trace["steps"], "calls": trace["calls"], "messages": trace["messages"],
           "final": trace["final"], "status": trace["status"], "ended_by": trace["ended_by"]}
@@ -644,14 +915,24 @@ def ask_one(ctx: Ctx, sid: str, session: dict, arm: str, q: dict, ws: Workspace,
     return row, tr, sample
 
 
+def load_ws_meta(a, sid: str) -> dict:
+    """The per-session meta oh_workspaces wrote next to (not inside) the workspace: workspace_kind, patch_applied, ..."""
+    fp = os.path.join(a.workspaces, f"{sid}.json")
+    try:
+        return json.load(open(fp)) if os.path.isfile(fp) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def run_session(ctx: Ctx, sid: str, session: dict, src: dict, ws_root: str, project: str | None, done: set) -> int:
     a = ctx.a
     if ctx.stop.is_set():
         return 0
     check_workspace_clean(ws_root, session, [ctx.out, a.sessions_dir or "", a.reuse_run or ""] if not a.skip_leak_check else [])
     ws = Workspace(ws_root, a.tool_output_chars, use_rg=not a.no_rg)
+    kit = SessionKit(a, session, ws, load_ws_meta(a, sid), a.arms_list)
     dropped = dropped_text(session)
-    summaries = {ARM_SUM: src["summary"][sid], ARM_SUM_MEM: src["summary"][sid]}
+    summaries = {arm: src["summary"][sid] for arm in a.arms_list if arm != ARM_NOTE_MEM}
     if ARM_NOTE_MEM in a.arms_list:
         summaries[ARM_NOTE_MEM] = src["note"][sid]
     n = 0
@@ -665,11 +946,17 @@ def run_session(ctx: Ctx, sid: str, session: dict, src: dict, ws_root: str, proj
             if rid in done:
                 continue
             try:
-                row, tr, sample = ask_one(ctx, sid, session, arm, q, ws, summaries, flags, project)
+                row, tr, sample = ask_one(ctx, sid, session, arm, q, kit, summaries, flags, project)
             except P.BudgetExceeded as e:
                 ctx.stop.set()
                 ctx.errors.append({"rid": rid, "error": f"BUDGET STOP: {e}"})
                 print(f"BUDGET STOP: {e}", flush=True)
+                return n
+            except CapViolation as e:
+                ctx.stop.set()
+                ctx.errors.append({"rid": rid, "sid": sid, "error": f"CAP VIOLATION: {e}"})
+                ctx.append("errors.jsonl", {"rid": rid, "error": f"CAP VIOLATION: {e}"})
+                print(f"!!! {rid}: CAP VIOLATION: {e}", file=sys.stderr, flush=True)
                 return n
             except Exception as e:  # noqa: BLE001
                 ctx.errors.append({"rid": rid, "error": f"{type(e).__name__}: {str(e)[:300]}"})
@@ -681,7 +968,7 @@ def run_session(ctx: Ctx, sid: str, session: dict, src: dict, ws_root: str, proj
             ctx.append("records.jsonl", row)
             n += 1
             print(f"  [{sid}] {rid}: {row['status']} steps={row['steps']} tok={row['tokens_total']} ${row['cost_usd']:.5f} "
-                  f"mem_calls={row['memory_calls_n']}", flush=True)
+                  f"retrieval_calls={row['retrieval_calls_n']} chars_max={row['retrieval_chars_max']}", flush=True)
     return n
 
 
@@ -694,44 +981,65 @@ EST = {"steps_mean": 8, "out_tokens_per_step": 150, "ws_result_tokens": 1200, "t
 
 
 def estimate(arms, summaries_tokens: dict, n_questions_by_sid: dict, prof, model: str, max_steps: int, memory_max_chars: int,
-             judge_unit_usd: float, n_sessions: int | None = None) -> dict:
+             judge_unit_usd: float, n_sessions: int | None = None, *, prefix_extra_tokens: dict | None = None,
+             steps_by_arm: dict | None = None, reused_arms: list | None = None) -> dict:
     """Steps x tokens model (stated, replaced by the observed numbers after the run): a question runs `steps_mean` steps; step k
     re-sends the whole history, input_k = P0 + (k-1) * (o + r) with P0 = system + tool schemas + memory + question, o = output per
-    step, r = tool-result tokens per step (workspace result, or the memory's max_chars/3.6 for the memory call). With prompt caching
-    step k reads input_{k-1} from the cache and pays only the increment (and the first question of a (session, arm) writes the
-    prefix); WITHOUT caching (prompt below the model's cache minimum, or a profile without caching) every input token is fresh."""
-    S, o = EST["steps_mean"], EST["out_tokens_per_step"]
+    step, r = tool-result tokens per step (workspace result, or the memory's max_chars/3.6 for a retrieval call: sum+mem, sum+bm25
+    and sum+grep all return at most that). With prompt caching step k reads input_{k-1} from the cache and pays only the increment
+    (and the first question of a (session, arm) writes the prefix); WITHOUT caching (prompt below the model's cache minimum, or a
+    profile without caching) every input token is fresh.
+
+    C.10 additions. `prefix_extra_tokens[(sid, arm)]` = tokens of a STABLE extra prefix in the system prompt (the oracle arm's whole
+    dropped transcript): it is written to the cache once per session and read at every step of every question. `steps_by_arm`
+    ({arm: observed mean steps}, e.g. from the reused C.9 run) adds a second, CALIBRATED figure per arm: the same model with the
+    observed mean steps (rounded, >= 1) instead of `steps_mean`; the headline `usd_with_cache` stays on the stated assumption (8 steps,
+    pessimistic: C.9 observed 2.6)."""
+    S0, o = EST["steps_mean"], EST["out_tokens_per_step"]
+    extra = prefix_extra_tokens or {}
     per_arm = {}
     for arm in arms:
-        tot_cached = tot_nocache = tot_tokens = 0.0
+        acc = {"cached": 0.0, "nocache": 0.0, "tokens": 0.0, "calib": 0.0}
         nq = 0
+        S_cal = max(1, int(round((steps_by_arm or {}).get(arm, S0))))
         for sid, nq_s in n_questions_by_sid.items():
             sm = summaries_tokens[(sid, arm)]
-            p0 = EST["system_tokens"] + EST["tool_schema_tokens"] + sm + EST["question_tokens"]
-            r = EST["ws_result_tokens"] if arm not in MEM_ARMS else (EST["ws_result_tokens"] * 0.6 + min(memory_max_chars * EST["mem_result_tokens_factor"], 1800) * 0.4)
-            inputs = [p0 + (k - 1) * (o + r) for k in range(1, S + 1)]
-            fresh = inputs[0] + sum(inputs[k] - inputs[k - 1] for k in range(1, S))
-            cr = sum(inputs[:-1])
-            c_cached = prof.cost_usd(model, int(fresh), int(S * o), cache_read=int(cr)) or 0.0
-            c_nocache = prof.cost_usd(model, int(sum(inputs)), int(S * o)) or 0.0
-            tot_cached += nq_s * c_cached
-            tot_nocache += nq_s * c_nocache
-            tot_tokens += nq_s * (sum(inputs) + S * o)
+            T = int(extra.get((sid, arm), 0))                        # stable cached prefix (oracle transcript)
+            p0 = EST["system_tokens"] + EST["tool_schema_tokens"] + sm + EST["question_tokens"] + T
+            r = (EST["ws_result_tokens"] if arm not in CAPPED_ARMS
+                 else (EST["ws_result_tokens"] * 0.6 + min(memory_max_chars * EST["mem_result_tokens_factor"], 1800) * 0.4))
+            for S, key in ((S0, "cached"), (S_cal, "calib")):
+                inputs = [p0 + (k - 1) * (o + r) for k in range(1, S + 1)]
+                fresh = inputs[0] + sum(inputs[k] - inputs[k - 1] for k in range(1, S))
+                cr = sum(inputs[:-1])
+                if T:                                                # T is read from the cache at every step, written once per session
+                    c_q = prof.cost_usd(model, int(fresh - T), int(S * o), cache_read=int(cr + T)) or 0.0
+                    c_w = (prof.cost_usd(model, 0, 0, cache_write=int(T)) or 0.0) / max(1, nq_s)
+                    acc[key] += nq_s * (c_q + c_w)
+                else:
+                    acc[key] += nq_s * (prof.cost_usd(model, int(fresh), int(S * o), cache_read=int(cr)) or 0.0)
+                if key == "cached":
+                    acc["nocache"] += nq_s * (prof.cost_usd(model, int(sum(inputs)), int(S * o)) or 0.0)
+                    acc["tokens"] += nq_s * (sum(inputs) + S * o)
             nq += nq_s
-        per_arm[arm] = {"questions": nq, "usd_with_cache": round(tot_cached, 4), "usd_without_cache": round(tot_nocache, 4),
-                        "tokens_per_question": round(tot_tokens / max(1, nq)), "steps_assumed": S}
+        per_arm[arm] = {"questions": nq, "usd_with_cache": round(acc["cached"], 4), "usd_without_cache": round(acc["nocache"], 4),
+                        "usd_calibrated": round(acc["calib"], 4), "steps_calibrated": S_cal,
+                        "tokens_per_question": round(acc["tokens"] / max(1, nq)), "steps_assumed": S0}
     # upper bound: every question runs max_steps steps with the same increments
-    cap_scale = max_steps / S
+    cap_scale = max_steps / S0
     n_q = sum(n_questions_by_sid.values())
     run_cached = sum(v["usd_with_cache"] for v in per_arm.values())
     run_nocache = sum(v["usd_without_cache"] for v in per_arm.values())
+    run_calib = sum(v["usd_calibrated"] for v in per_arm.values())
     judge_items = n_q * len(arms)
     mean_tok = statistics.mean(v["tokens_per_question"] for v in per_arm.values()) if per_arm else 0
     ncl = n_sessions or len(n_questions_by_sid)
     mde = 2.8 * EST["paired_sd_rel"] / math.sqrt(max(1, ncl))
-    return {"model": model, "arms": list(arms), "sessions": ncl, "questions": n_q, "assumptions": dict(EST), "max_steps": max_steps,
+    return {"model": model, "arms": list(arms), "reused_arms": list(reused_arms or []), "sessions": ncl, "questions": n_q,
+            "assumptions": dict(EST), "max_steps": max_steps,
             "per_arm": per_arm, "run_usd_expected_with_cache": round(run_cached, 3),
             "run_usd_expected_without_cache": round(run_nocache, 3),
+            "run_usd_expected_calibrated": round(run_calib, 3),
             "run_usd_upper_bound": round(run_nocache * cap_scale, 3),
             "judge_items": judge_items, "judge_usd": round(judge_items * judge_unit_usd, 3),
             "mean_tokens_per_question": round(mean_tok),
@@ -744,11 +1052,15 @@ def estimate(arms, summaries_tokens: dict, n_questions_by_sid: dict, prof, model
 # =============================================================================
 # judge export (judge_v2 --outcome input)
 # =============================================================================
-def export_judge(out_dir: str, sessions_dir: str, dest: str) -> int:
+def export_judge(out_dir: str, sessions_dir: str, dest: str, piece_chars: int = DEFAULT_PIECE_CHARS) -> int:
+    """judge_v2 --outcome input for the NEW rows of a run. Rows copied from an earlier run (`reused_from`) keep the verdict they
+    already have (home_run merges them), so they are not exported again. The oracle arm's visible context is the complete dropped
+    transcript (the judge verifies facts against what the agent could see)."""
     import export_longsession_judge as EJ  # noqa: PLC0415
     sess = {s["sid"]: s for s in L.load_sessions([sessions_dir])}
-    recs = [r for r in read_jsonl(os.path.join(out_dir, "records.jsonl")) if r.get("valid") is True]
+    recs = [r for r in read_jsonl(os.path.join(out_dir, "records.jsonl")) if r.get("valid") is True and not r.get("reused_from")]
     traces = {t["rid"]: t for t in read_jsonl(os.path.join(out_dir, "traces.jsonl"))}
+    oracle_cache: dict[str, str] = {}
     n = 0
     with open(dest, "w", encoding="utf-8") as f:
         for r in recs:
@@ -759,14 +1071,19 @@ def export_judge(out_dir: str, sessions_dir: str, dest: str) -> int:
             span_text, snippets = EJ.evidence_parts(s, q)
             if not span_text:
                 span_text = f"[{s['messages'][0]['role']}] {s['messages'][0]['text'][:EJ.MSG_CAP]}\n\n" if s["messages"] else ""
-            ctx = visible_context_of(r, (traces.get(r["rid"]) or {}).get("calls") or [])
-            o = {k: v for k, v in r.items() if k not in ("memory_text", "step_tokens", "memory_calls")}
+            otext = ""
+            if r.get("arm") == ARM_ORACLE:
+                if r["sid"] not in oracle_cache:
+                    oracle_cache[r["sid"]] = transcript_text(ingested_pieces(s, piece_chars))
+                otext = oracle_cache[r["sid"]]
+            ctx = visible_context_of(r, (traces.get(r["rid"]) or {}).get("calls") or [], oracle_text=otext)
+            o = {k: v for k, v in r.items() if k not in ("memory_text", "step_tokens", "memory_calls", "transcript_calls")}
             o.update({"question": q["question"], "span_text": span_text, "evidence": snippets, "rubric": q.get("rubric") or [],
                       "canonical_short_answer": q.get("answer"), "visible_context": ctx or None,
                       "visible_context_meta": {"has_memory": True, "has_tail": False, "truncated": len(ctx) >= JUDGE_VISIBLE_CAP}})
             f.write(json.dumps(o, ensure_ascii=False) + "\n")
             n += 1
-    print(f"exported {n}/{len(recs)} records to judge -> {dest}")
+    print(f"exported {n}/{len(recs)} records to judge -> {dest} ({sum(1 for r in read_jsonl(os.path.join(out_dir, 'records.jsonl')) if r.get('reused_from'))} reused row(s) not exported)")
     return 0 if n == len(recs) else 1
 
 
@@ -780,12 +1097,29 @@ def parse_args(argv=None):
     ap.add_argument("--workspaces", default="", help="dir written by oh-workspaces (<sid>/repo)")
     ap.add_argument("--projects-map", default="", help="JSON {sid: project id} (campaign.json c8_projects.pids)")
     ap.add_argument("--hars-run-id", default="", help="alternative to --projects-map: the C.8 run id (project = nc-<id>-<sid>)")
-    ap.add_argument("--arms", default=",".join(DEFAULT_ARMS), help=f"comma list of {','.join(ALL_ARMS)} (note+mem is optional, off by default)")
+    ap.add_argument("--arms", default=None, help=f"comma list of {','.join(ALL_ARMS)} (default sum,sum+mem; note+mem is optional, off by default)")
+    ap.add_argument("--controls", action="store_true",
+                    help=f"Amendment C.10 preset: --arms {','.join(CONTROL_ARMS)} (the capped HARS arm and its three controls); `sum` and the "
+                         f"C.9 sum+mem rows come from --reuse-agentic-run")
+    ap.add_argument("--reuse-agentic-run", default="", metavar="DIR",
+                    help="a finished run_agentic dir (C.9): its rows of --reuse-arms are copied (same questions, same summary sha256 "
+                         "required), marked `reused_from`; the C.9 sum+mem rows are relabelled `sum+mem@uncapped`")
+    ap.add_argument("--reuse-arms", default=",".join(REUSED_ARM_LABELS),
+                    help="arms of --reuse-agentic-run to copy (default sum,sum+mem)")
+    ap.add_argument("--piece-chars", type=int, default=DEFAULT_PIECE_CHARS,
+                    help="run_longsession --piece-chars of the ingest (the control arms' corpus is the same pieces)")
+    ap.add_argument("--bm25-passage-chars", type=int, default=DEFAULT_BM25_PASSAGE_CHARS,
+                    help="sum+bm25 retrieval unit: passages of ~N chars cut from the ingested pieces (0 = whole pieces)")
+    ap.add_argument("--allow-old-server", action="store_true",
+                    help="run the HARS arms although the server does not report `context_cap` (it predates the C.10 hard cap; the "
+                         "client-side guard still enforces the cap and the rows record the violation)")
     ap.add_argument("--mem-budget", type=int, default=1536)
     ap.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     ap.add_argument("--max-question-tokens", type=int, default=DEFAULT_QUESTION_TOKEN_CAP,
                     help="runaway guard: no new step starts once a question's cumulative tokens (all input incl. cache + output) reach it")
-    ap.add_argument("--memory-max-chars", type=int, default=DEFAULT_MEMORY_MAX_CHARS)
+    ap.add_argument("--retrieval-max-chars", "--memory-max-chars", dest="retrieval_max_chars", type=int, default=DEFAULT_RETRIEVAL_MAX_CHARS,
+                    help="ONE cap for every retrieval arm (sum+mem, note+mem, sum+bm25, sum+grep): sent to the server as max_chars AND "
+                         "enforced client-side as a guard; the rows record the realised chars")
     ap.add_argument("--tool-output-chars", type=int, default=DEFAULT_TOOL_OUT_CHARS)
     ap.add_argument("--agent-max-tokens", type=int, default=AGENT_MAX_TOKENS)
     ap.add_argument("--concurrency", type=int, default=2, help="sessions in parallel (questions of a session run sequentially)")
@@ -807,10 +1141,23 @@ def parse_args(argv=None):
     P.add_profile_args(ap, roles=("agent",))
     P.add_budget_arg(ap)
     a = ap.parse_args(argv)
+    a.memory_max_chars = a.retrieval_max_chars                      # legacy attribute name
+    if a.controls and a.arms:
+        ap.error("--controls and --arms are alternatives")
+    a.arms = ",".join(CONTROL_ARMS) if a.controls else (a.arms or ",".join(DEFAULT_ARMS))
     a.arms_list = [x.strip() for x in a.arms.split(",") if x.strip()]
     bad = [x for x in a.arms_list if x not in ALL_ARMS]
     if bad or not a.arms_list:
         ap.error(f"--arms: unknown {bad}; choose from {ALL_ARMS}")
+    a.reuse_arms_list = [x.strip() for x in a.reuse_arms.split(",") if x.strip()] if a.reuse_agentic_run else []
+    badr = [x for x in a.reuse_arms_list if x not in REUSED_ARM_LABELS]
+    if badr:
+        ap.error(f"--reuse-arms: unknown {badr}; choose from {list(REUSED_ARM_LABELS)}")
+    clash = [x for x in a.arms_list if x in [REUSED_ARM_LABELS[r] for r in a.reuse_arms_list]]
+    if clash:
+        ap.error(f"arm(s) {clash} are both run and reused: drop them from --arms or --reuse-arms")
+    if a.retrieval_max_chars < 200:
+        ap.error("--retrieval-max-chars must be >= 200")
     a.provider = a.profile or "anthropic"
     a.profile_obj = P.load_profile(a.provider, base_url=a.base_url, pi_provider=a.pi_provider, cache=P.cache_override(a))
     a.agent_model = a.model_agent or a.profile_obj.default_model("agent")
@@ -832,7 +1179,7 @@ def project_of(a, sid: str) -> str:
 
 
 class MockAgent:
-    """Scripted offline agent: grep for the longest word of the question, call memory_recall when offered, then answer."""
+    """Scripted offline agent: grep for the longest word of the question, call memory_recall / transcript_grep when offered, then answer."""
 
     def __init__(self):
         self.n = 0
@@ -848,6 +1195,8 @@ class MockAgent:
                  "cache_write_tokens": 0 if nsteps else 900, "reported_cost": None}
         if nsteps == 0:
             blocks = [{"type": "tool_use", "id": f"t{self.n}", "name": "grep", "input": {"pattern": word}}]
+        elif nsteps == 1 and "transcript_grep" in names:
+            blocks = [{"type": "tool_use", "id": f"t{self.n}", "name": "transcript_grep", "input": {"pattern": word}}]
         elif nsteps == 1 and "memory_recall" in names:
             blocks = [{"type": "tool_use", "id": f"t{self.n}", "name": "memory_recall",
                        "input": {"query": q.split("Question:")[-1].strip(), "ll_keywords": [word], "hl_keywords": ["session"]}}]
@@ -871,12 +1220,95 @@ def select_sids(a, src) -> list[str]:
     return sids
 
 
+def observed_steps_by_arm(old_records: list[dict]) -> dict:
+    """Mean steps per arm of an earlier run, mapped onto this run's arms for the CALIBRATED dry-run figure: a retrieval arm
+    (sum+mem, sum+bm25, sum+grep) is assumed to take as many steps as the C.9 sum+mem rows did; sum and oracle as many as sum."""
+    by: dict[str, list[int]] = {}
+    for r in old_records:
+        if r.get("valid") is True and r.get("steps"):
+            by.setdefault(r["arm"], []).append(int(r["steps"]))
+    mean = {k: sum(v) / len(v) for k, v in by.items()}
+    out = {}
+    if ARM_SUM in mean:
+        out[ARM_SUM] = out[ARM_ORACLE] = mean[ARM_SUM]
+    if ARM_SUM_MEM in mean:
+        for arm in (ARM_SUM_MEM, ARM_NOTE_MEM, ARM_SUM_BM25, ARM_SUM_GREP):
+            out[arm] = mean[ARM_SUM_MEM]
+    return out
+
+
+def estimate_for(sessions: dict, src: dict, sids: list[str], arms: list[str], prof, model: str, max_steps: int, cap: int,
+                 judge_unit_usd: float, piece_chars: int = DEFAULT_PIECE_CHARS, old_records: list[dict] | None = None,
+                 reused_arms: list[str] | None = None) -> dict:
+    """The dry-run estimate of a run (shared by `--dry-run` and home_run.py oh-agentic --dry-run). The oracle arm's prefix is
+    the real dropped-transcript token count of each session."""
+    extra = {}
+    if ARM_ORACLE in arms:
+        for sid in sids:
+            extra[(sid, ARM_ORACLE)] = L.count_tokens(transcript_text(ingested_pieces(sessions[sid], piece_chars)))
+    return estimate(arms, summaries_tokens_of(src, arms), {s: len(src["questions"][s]) for s in sids}, prof, model, max_steps, cap,
+                    judge_unit_usd, prefix_extra_tokens=extra, steps_by_arm=observed_steps_by_arm(old_records or []),
+                    reused_arms=reused_arms)
+
+
+def server_cap_probe(hars, project: str, cap: int) -> tuple[bool, str]:
+    """Does the server bound the context and say so (`context_cap` in the payload)? A server older than the C.10 fix does not."""
+    try:
+        pay = hars.recall_correct("", "cap probe", [], [], cap, project=project)
+    except Exception as e:  # noqa: BLE001
+        return False, f"probe call failed: {type(e).__name__}: {str(e)[:120]}"
+    if not isinstance(pay, dict):
+        return False, "non-dict payload"
+    if pay.get("ok") is False and "not found" in str(pay.get("error") or "").lower():
+        return False, f"project {project} not found on the server"
+    if not isinstance(pay.get("context_cap"), dict):
+        return False, ("the recall payload has no `context_cap` field: the server predates the C.10 hard cap on memory_recall "
+                       "max_chars (restart it from this checkout)")
+    return True, "context_cap reported"
+
+
+def copy_reused_rows(ctx: Ctx, a, sids: list[str], src: dict, ws_dest: str) -> dict:
+    """--reuse-agentic-run: copy the finished C.9 run's rows of --reuse-arms into this run's records.jsonl, marked `reused_from`.
+    Same question, same summary sha256 required; the old sum+mem rows get the arm label `sum+mem@uncapped` (their server ignored
+    max_chars). Nothing is re-run; the judge verdicts are merged by home_run. Returns counts."""
+    old_dir = os.path.abspath(a.reuse_agentic_run)
+    old = [r for r in read_jsonl(os.path.join(old_dir, "records.jsonl")) if r.get("valid") is True]
+    done = {r["rid"] for r in read_jsonl(os.path.join(ctx.out, "records.jsonl"))}
+    wanted = {sid: {q["qid"] for q in src["questions"][sid]} for sid in sids}
+    counts: dict[str, int] = {}
+    kinds: dict[str, str] = {}
+    for r in old:
+        arm = r.get("arm")
+        if arm not in a.reuse_arms_list or r.get("sid") not in wanted or r["qid"] not in wanted[r["sid"]]:
+            continue
+        label = REUSED_ARM_LABELS[arm]
+        rid = f"{r['qid']}::{label}"
+        if rid in done:
+            continue
+        want_sha = sha256_text(src["summary"][r["sid"]])
+        if r.get("summary_sha256") != want_sha:
+            raise SystemExit(f"--reuse-agentic-run: {r['rid']} was run with another summary (sha256 differs): refusing to reuse it")
+        row = dict(r)
+        if r["sid"] not in kinds:
+            kinds[r["sid"]] = (load_ws_meta(a, r["sid"]) or {}).get("workspace_kind")
+        mem_chars = [int(m.get("returned_chars") or 0) for m in (r.get("memory_calls") or [])]
+        row.update({"rid": rid, "arm": label, "arm_original": arm, "reused_from": old_dir, "reused_rid": r["rid"],
+                    "workspace_kind": r.get("workspace_kind") or kinds[r["sid"]], "eval_version": EVAL_VERSION_TAG,
+                    "retrieval_max_chars": None, "retrieval_chars_total": sum(mem_chars), "retrieval_chars_max": max(mem_chars, default=0),
+                    "retrieval_cap_ok": None, "retrieval_calls_n": r.get("memory_calls_n", 0),
+                    "retrieval_note": ("C.9 sum+mem: the server did not bound entity / relation sections, max_chars=6000 was NOT a total cap"
+                                       if arm == ARM_SUM_MEM else "C.9 sum: no retrieval tool")})
+        ctx.append("records.jsonl", row)
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
 def main(argv=None) -> int:
     a = parse_args(argv)
     if a.export_judge:
         if not (a.out and a.sessions_dir):
             raise SystemExit("--export-judge needs --out (the run dir) and --sessions")
-        return export_judge(a.out, a.sessions_dir, os.path.join(a.out, "judge-input.jsonl"))
+        return export_judge(a.out, a.sessions_dir, os.path.join(a.out, "judge-input.jsonl"), a.piece_chars)
     if not (a.sessions_dir and a.reuse_run):
         raise SystemExit("--sessions and --reuse-run are required")
     sessions = load_sessions_map(a.sessions_dir)
@@ -885,17 +1317,23 @@ def main(argv=None) -> int:
     if a.limit_questions:
         for s in sids:
             src["questions"][s] = src["questions"][s][:a.limit_questions]
+    reused_labels = [REUSED_ARM_LABELS[x] for x in a.reuse_arms_list]
     if a.dry_run:
         prof = a.profile_obj
         jm = P.resolve_models(prof, {})["judge"]
         ju = prof.cost_usd(jm, 1500, 120) or 0.0
-        est = estimate(a.arms_list, summaries_tokens_of(src, a.arms_list), {s: len(src["questions"][s]) for s in sids}, prof,
-                       a.agent_model, a.max_steps, a.memory_max_chars, ju)
+        old_rows = read_jsonl(os.path.join(a.reuse_agentic_run, "records.jsonl")) if a.reuse_agentic_run else []
+        est = estimate_for(sessions, src, sids, a.arms_list, prof, a.agent_model, a.max_steps, a.retrieval_max_chars, ju,
+                           a.piece_chars, old_rows, reused_labels)
         if a.json:
             print(json.dumps(est, indent=1))
         else:
             print(f"estimate: run ${est['run_usd_expected_with_cache']} (cache) / ${est['run_usd_expected_without_cache']} (no cache) / "
-                  f"upper ${est['run_usd_upper_bound']}; judge ${est['judge_usd']}; {est['questions']} questions x {len(a.arms_list)} arms")
+                  f"calibrated ${est['run_usd_expected_calibrated']} / upper ${est['run_usd_upper_bound']}; judge ${est['judge_usd']}; "
+                  f"{est['questions']} questions x {len(a.arms_list)} arms {a.arms_list}; reused {reused_labels}")
+            for arm, v in est["per_arm"].items():
+                print(f"  {arm:10s} ${v['usd_with_cache']:.3f} (8 steps) | ${v['usd_calibrated']:.3f} ({v['steps_calibrated']} steps) | "
+                      f"~{v['tokens_per_question']} tok/q")
         return 0
     if not a.workspaces:
         raise SystemExit("--workspaces is required (home_run.py oh-workspaces)")
@@ -912,27 +1350,45 @@ def main(argv=None) -> int:
     os.makedirs(out, exist_ok=True)
     cfg_path = os.path.join(out, "config.json")
     run_id = json.load(open(cfg_path))["run_id"] if os.path.exists(cfg_path) else f"ag{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}"
-    json.dump({"run_id": run_id, "argv": sys.argv[1:]}, open(cfg_path, "w"))
-    if a.fake_hars:
-        import run_longsession as RL  # noqa: PLC0415
-        hars = RL.FakeHars()
-    else:
-        import run_longsession as RL  # noqa: PLC0415
-        hars = RL.Hars(a.mcp, threading.Semaphore(1), threading.Semaphore(4))
+    json.dump({"run_id": run_id, "argv": sys.argv[1:] if argv is None else list(argv)}, open(cfg_path, "w"))
+    import run_longsession as RL  # noqa: PLC0415
+    hars = RL.FakeHars() if a.fake_hars else RL.Hars(a.mcp, threading.Semaphore(1), threading.Semaphore(4))
     llm = MockAgent() if mock else AgentLLM(a.profile_obj, a.agent_model, budget, a.key_env, a.agent_max_tokens, 0,
                                            cache=None)
     ctx = Ctx(a, out, llm, hars, budget, run_id)
     sys.stdout = Tee(sys.stdout, os.path.join(out, "run.log"))
     sys.stderr = Tee(sys.stderr, os.path.join(out, "run.log"))
+    return _run(a, ctx, sessions, src, sids, run_id, out, hars, budget, reused_labels)
+
+
+def _run(a, ctx: Ctx, sessions, src, sids, run_id, out, hars, budget, reused_labels) -> int:
+    uses_hars = any(x in MEM_ARMS for x in a.arms_list)
+    if uses_hars:
+        ok, why = server_cap_probe(hars, project_of(a, sids[0]), a.retrieval_max_chars)
+        if not ok:
+            msg = f"HARS cap probe: {why}"
+            if a.allow_old_server:
+                print(f"[warn] {msg} (--allow-old-server: the client-side guard enforces the cap; rows record the violations)", flush=True)
+            else:
+                print(f"!!! {msg}. Nothing was spent. Restart the server from this checkout (git pull; HOME-RUNBOOK) or pass "
+                      "--allow-old-server.", file=sys.stderr, flush=True)
+                return 4
+        else:
+            print(f"[hars] cap probe OK ({why})", flush=True)
     write_inputs_and_scripts(ctx, a, sessions, src, sids)
+    reused_counts = copy_reused_rows(ctx, a, sids, src, a.workspaces) if a.reuse_agentic_run else {}
+    if reused_counts:
+        print(f"[reuse] copied {reused_counts} row(s) from {os.path.abspath(a.reuse_agentic_run)} (reused_from set; "
+              f"{ARM_SUM_MEM} of that run is labelled {ARM_SUM_MEM_UNCAPPED})", flush=True)
     done = {r["rid"] for r in read_jsonl(os.path.join(out, "records.jsonl")) if r.get("valid") is True}
     t0 = time.time()
     t_start = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"run_agentic: {len(sids)} session(s), arms {a.arms_list}, max_steps {a.max_steps}, out {out}", flush=True)
+    print(f"run_agentic: {len(sids)} session(s), arms {a.arms_list}, max_steps {a.max_steps}, retrieval cap {a.retrieval_max_chars} chars, "
+          f"out {out}", flush=True)
     n_new = 0
     with cf.ThreadPoolExecutor(max_workers=max(1, a.concurrency)) as ex:
         futs = {ex.submit(run_session, ctx, sid, sessions[sid], src, os.path.join(a.workspaces, sid, "repo"),
-                          project_of(a, sid) if any(x in MEM_ARMS for x in a.arms_list) else None, done): sid for sid in sids}
+                          project_of(a, sid) if uses_hars else None, done): sid for sid in sids}
         for f in cf.as_completed(futs):
             try:
                 n_new += f.result()
@@ -941,21 +1397,36 @@ def main(argv=None) -> int:
                 ctx.errors.append({"sid": futs[f], "error": str(e)})
                 print(f"!!! {futs[f]}: {e}", file=sys.stderr, flush=True)
     rows = read_jsonl(os.path.join(out, "records.jsonl"))
+    own = [r for r in rows if not r.get("reused_from")]                     # this run's own spend: reused rows were paid for by the old run
     expected = {f"{q['qid']}::{arm}" for s in sids for q in src["questions"][s] for arm in a.arms_list}
     have = {r["rid"] for r in rows if r.get("valid") is True}
-    summary = {"run_id": run_id, "rows": len(rows), "expected": len(expected), "missing": sorted(expected - have)[:20],
+    capped = [r for r in own if r["arm"] in CAPPED_ARMS]
+    summary = {"run_id": run_id, "rows": len(rows), "rows_own": len(own), "rows_reused": len(rows) - len(own), "reused": reused_counts,
+               "expected": len(expected), "missing": sorted(expected - have)[:20],
                "n_missing": len(expected - have), "new_this_invocation": n_new, "errors": ctx.errors[:20],
-               "cost_usd": round(sum(float(r.get("cost_usd") or 0.0) for r in rows), 6),
+               "cost_usd": round(sum(float(r.get("cost_usd") or 0.0) for r in own), 6),
                "tokens_total_by_arm": {arm: sum(r["tokens_total"] for r in rows if r["arm"] == arm) for arm in a.arms_list},
+               "retrieval_max_chars": a.retrieval_max_chars, "piece_chars": a.piece_chars, "bm25_passage_chars": a.bm25_passage_chars,
+               "retrieval_cap": {"rows": len(capped), "rows_cap_ok": sum(1 for r in capped if r.get("retrieval_cap_ok")),
+                                 "server_violations": sum(int(r.get("retrieval_cap_server_violations") or 0) for r in capped),
+                                 "client_cuts": sum(int(r.get("retrieval_client_cuts") or 0) for r in capped),
+                                 "realised_chars_max": max((r.get("retrieval_chars_max") or 0 for r in capped), default=0)},
+               "oracle": {"rows": sum(1 for r in own if r["arm"] == ARM_ORACLE),
+                          "context_chars": {r["sid"]: r.get("oracle_context_chars") for r in own if r["arm"] == ARM_ORACLE},
+                          "context_tokens": {r["sid"]: r.get("oracle_context_tokens") for r in own if r["arm"] == ARM_ORACLE}},
+               "workspace_kinds": {sid: (load_ws_meta(a, sid) or {}).get("workspace_kind") for sid in sids},
                "budget_spent_this_invocation": round(budget.spent, 6) if budget else 0.0}
     json.dump(summary, open(os.path.join(out, "summary.json"), "w"), indent=1)
     json.dump({"machine": {"python": sys.version.split()[0], "platform": sys.platform}, "run_id": run_id, "agent_model": a.agent_model,
-               "profile": a.provider, "arms": a.arms_list, "max_steps": a.max_steps, "question_token_cap": a.max_question_tokens,
-               "memory_max_chars": a.memory_max_chars, "started": t_start, "ended": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "profile": a.provider, "arms": a.arms_list, "reused_arms": reused_labels, "max_steps": a.max_steps,
+               "question_token_cap": a.max_question_tokens, "retrieval_max_chars": a.retrieval_max_chars,
+               "memory_max_chars": a.retrieval_max_chars, "eval_version": EVAL_VERSION_TAG,
+               "started": t_start, "ended": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "wall_s": round(time.time() - t0, 1), "cost_usd": summary["cost_usd"],
                "budget_spent_all_invocations": summary["cost_usd"], "failed_sessions": [e.get("sid") for e in ctx.errors if e.get("sid")]},
               open(os.path.join(out, "MANIFEST.json"), "w"), indent=1)
-    print(f"done: {len(have)}/{len(expected)} rows valid, ${summary['cost_usd']:.4f}", flush=True)
+    print(f"done: {len(have)}/{len(expected)} rows valid, ${summary['cost_usd']:.4f}"
+          f"{'' if not summary['retrieval_cap']['rows'] else ' | retrieval cap: ' + json.dumps(summary['retrieval_cap'])}", flush=True)
     return 0 if not summary["n_missing"] else 3
 
 
@@ -966,11 +1437,16 @@ def write_inputs_and_scripts(ctx: Ctx, a, sessions, src, sids) -> None:
             "records_sha256": hashlib.sha256(open(os.path.join(a.reuse_run, "records.jsonl"), "rb").read()).hexdigest(),
             "summary_sha256": {s: sha256_text(src["summary"][s]) for s in sids},
             "note_sha256": {s: sha256_text(src["note"][s]) for s in sids if s in src["note"]},
-            "questions": {s: [q["qid"] for q in src["questions"][s]] for s in sids}}
+            "questions": {s: [q["qid"] for q in src["questions"][s]] for s in sids},
+            "arms": a.arms_list, "reuse_agentic_run": os.path.abspath(a.reuse_agentic_run) if a.reuse_agentic_run else None,
+            "reuse_arms": a.reuse_arms_list, "retrieval_max_chars": a.retrieval_max_chars, "piece_chars": a.piece_chars,
+            "bm25_passage_chars": a.bm25_passage_chars, "eval_version": EVAL_VERSION_TAG,
+            "workspace_meta": {s: load_ws_meta(a, s) for s in sids}}
     json.dump(meta, open(os.path.join(d, "inputs.json"), "w"), indent=1)
     sd = ctx.path("scripts")
     os.makedirs(sd, exist_ok=True)
-    for fn in ("run_agentic.py", "providers.py", "anchors.py", "longsession.py", "oh_workspaces.py", "metrics_agentic.py"):
+    for fn in ("run_agentic.py", "providers.py", "anchors.py", "longsession.py", "oh_workspaces.py", "metrics_agentic.py",
+               "funnel_chains.py", "judge_v2.py"):
         if os.path.isfile(os.path.join(BASE, fn)):
             shutil.copy2(os.path.join(BASE, fn), os.path.join(sd, fn))
     with open(os.path.join(sd, "cmdline.txt"), "a") as f:

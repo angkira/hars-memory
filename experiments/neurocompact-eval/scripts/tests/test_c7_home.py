@@ -308,9 +308,9 @@ class Enrich(Base):
 class FreshOhDefaults(unittest.TestCase):
     def test_default_oh_arms_are_the_c7_set_and_the_version_is_bumped(self):
         self.assertEqual(H.OH_ARMS, "baseline,nc-enriched,nc-note-only")
-        self.assertEqual(H.HOME_RUN_VERSION, "2026-10-28.c9")
+        self.assertEqual(H.HOME_RUN_VERSION, "2026-10-28.c10")
         self.assertEqual(open(os.path.join(os.path.dirname(H.BASE), "EVAL-VERSION")).read().strip(), H.HOME_RUN_VERSION)
-        self.assertEqual(H.REUSE_COMPATIBLE_FROM, ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8"))
+        self.assertEqual(H.REUSE_COMPATIBLE_FROM, ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8", "2026-10-28.c9"))
 
 
 if __name__ == "__main__":

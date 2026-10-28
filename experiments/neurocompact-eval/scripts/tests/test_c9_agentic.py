@@ -893,7 +893,7 @@ class Home(T7.Base):
         self.assertIn("oh.workspaces", self.steps())
 
     def test_guard_accepts_c6_c7_c8_and_refuses_older(self):
-        for v in ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8"):
+        for v in ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8", "2026-10-28.c9"):
             self.stamp(v)
             rc, so, se = self.go(AgenticRunner(), "oh-agentic", "--dry-run")
             self.assertEqual(rc, 0, (v, so, se))
@@ -903,9 +903,9 @@ class Home(T7.Base):
         self.assertIn("EVAL-VERSION", se)
         rc, so, se = self.go(AgenticRunner(), "oh-workspaces", "--dry-run", "--cache-dir", self.cache)
         self.assertEqual(rc, 0, so + se)                                            # no spend: no version guard needed
-        self.assertEqual(H.REUSE_COMPATIBLE_FROM, ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8"))
-        self.assertEqual(H.HOME_RUN_VERSION, "2026-10-28.c9")
-        self.assertEqual(open(os.path.join(os.path.dirname(H.BASE), "EVAL-VERSION")).read().strip(), "2026-10-28.c9")
+        self.assertEqual(H.REUSE_COMPATIBLE_FROM, ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8", "2026-10-28.c9"))
+        self.assertEqual(H.HOME_RUN_VERSION, "2026-10-28.c10")
+        self.assertEqual(open(os.path.join(os.path.dirname(H.BASE), "EVAL-VERSION")).read().strip(), "2026-10-28.c10")
 
     def test_needs_an_explicit_campaign_ingest_and_workspaces(self):
         rc, so, se = self.go(AgenticRunner(), "oh-agentic", resume=False)

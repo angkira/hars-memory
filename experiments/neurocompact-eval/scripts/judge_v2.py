@@ -124,8 +124,15 @@ ARM_LEAK_RE = re.compile(
     r"|\brecalled\s+(?:session\s+)?memor(?:y|ies)\b"
     r"|\b(?:injected|retrieved)\s+(?:session\s+)?memor(?:y|ies)\b"
     r"|\bmemory[\s_]+recall\b"
+    r"|\btranscript[\s_]+grep\b|\bbm25\b"                    # Amendment C.10 control arms' tool names
     r"|\bHARS\b", re.I)
 MASK = "[masked]"
+# Amendment C.10: an unparseable reply is re-asked ONCE with this reminder; if it still fails the row is `judge_unparsed`
+# (excluded from accuracy by metrics_agentic, counted and reported) instead of being scored wrong.
+STRICT_REMINDER = ("\n\nYour previous reply could not be parsed. Reply again with ONLY one JSON object on a single line: no prose, "
+                   "no markdown fence, exactly the keys and value types requested above.")
+SPEND_SIDECAR = ".spend.json"        # <out>.spend.json: usd / calls / status, rewritten while judging (also after an abort)
+PARTIAL_SUFFIX = ".partial"          # <out>.partial: the verdicts of an aborted run (resume with --resume-partial)
 
 
 def mask_arm_leaks(text: str) -> tuple[str, list[str]]:
@@ -539,6 +546,8 @@ def main() -> int:
     ap.add_argument("--outcome", action="store_true",
                     help="Amendment C.9: also ask for ONE mutually exclusive outcome (correct / partial / wrong / abstained, "
                          "explicit precedence) and write it as `outcome`; the other fields are unchanged")
+    ap.add_argument("--resume-partial", default="", metavar="FILE",
+                    help="verdicts of an aborted run (<out>.partial): rows with the same present_id and rid are kept, not re-judged")
     ap.add_argument("--calibration", "--calibrate", dest="calibration",
                     action="store_true",
                     help="grade every item twice with independent shuffles "
@@ -651,60 +660,117 @@ def main() -> int:
 
     spend = {"usd": 0.0, "calls": 0}
     judged, parse_fail, arm_in_prompt = [], 0, []
+    reasked_n = recovered_n = 0
     masked_rids = set()
-    for n, (pid, rec, pass_no) in enumerate(presentations, 1):
-        excerpt, how, src_chain = excerpts[rid_of(rec)]
-        prompt = build_prompt(rec, excerpt)
-        _, leaks = mask_arm_leaks(sanitize_answer(rec.get("answer", "")))
-        if leaks:
-            mapping["map"][pid]["answer_masked"] = [x[:80] for x in leaks]
-            masked_rids.add(rid_of(rec))
-        if rec.get("arm") and re.search(r"(?<![\w-])" + re.escape(str(rec["arm"]))
-                                        + r"(?![\w-])", prompt, re.I):
-            arm_in_prompt.append(rid_of(rec))
-        if args.show_prompt and n == 1:
-            print("---- prompt of presentation 1 (arm must not appear) ----")
-            print(prompt)
-            print("---- end prompt ----", flush=True)
+    resumed = {}
+    if args.resume_partial and os.path.isfile(args.resume_partial):
+        for ln in open(args.resume_partial, encoding="utf-8"):
+            if ln.strip():
+                row = json.loads(ln)
+                resumed[(row.get("present_id"), row.get("rid"))] = row
+    side = out + SPEND_SIDECAR
+
+    def write_spend(status: str) -> None:
+        """The spend of THIS invocation, on disk at all times (an aborted or killed run still leaves its cost)."""
         if args.dry_run:
-            raw = rec.get(f"judge_pass{pass_no}") or rec.get("judge_pass0") or ""
-            latency = 0.0
-        else:
-            try:
+            return
+        try:
+            json.dump({"usd": round(spend["usd"], 6), "calls": spend["calls"], "status": status, "judged": len(judged),
+                       "total": len(presentations), "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                       "resumed_rows": len(resumed)}, open(side, "w"))
+        except OSError:
+            pass
+
+    def abort(reason: str) -> None:
+        with open(out + PARTIAL_SUFFIX, "w") as w:
+            for j in judged:
+                w.write(json.dumps(j, ensure_ascii=False) + "\n")
+        write_spend("aborted")
+        # the SAME line as a normal end, so any consumer that parses "judge spend: $X over N calls" books the aborted run too
+        print(f"judge spend: ${spend['usd']:.5f} over {spend['calls']} calls (ABORTED after {len(judged)}/{len(presentations)} "
+              f"presentations: {reason}; partial verdicts: {out + PARTIAL_SUFFIX})", flush=True)
+        raise SystemExit(f"judge aborted after {spend['calls']} calls (${spend['usd']:.4f}): {reason}; "
+                         f"partial verdicts in {out + PARTIAL_SUFFIX} (re-run with --resume-partial)")
+
+    try:
+        for n, (pid, rec, pass_no) in enumerate(presentations, 1):
+            excerpt, how, src_chain = excerpts[rid_of(rec)]
+            prompt = build_prompt(rec, excerpt)
+            _, leaks = mask_arm_leaks(sanitize_answer(rec.get("answer", "")))
+            if leaks:
+                mapping["map"][pid]["answer_masked"] = [x[:80] for x in leaks]
+                masked_rids.add(rid_of(rec))
+            if rec.get("arm") and re.search(r"(?<![\w-])" + re.escape(str(rec["arm"]))
+                                            + r"(?![\w-])", prompt, re.I):
+                arm_in_prompt.append(rid_of(rec))
+            if args.show_prompt and n == 1:
+                print("---- prompt of presentation 1 (arm must not appear) ----")
+                print(prompt)
+                print("---- end prompt ----", flush=True)
+            if (pid, rid_of(rec)) in resumed:
+                judged.append(resumed[(pid, rid_of(rec))])
+                continue
+            spent0 = spend["usd"]
+            reasked = reask_ok = False
+            if args.dry_run:
+                raw = rec.get(f"judge_pass{pass_no}") or rec.get("judge_pass0") or ""
+                latency = 0.0
+            else:
                 ctx["budget"].check()
                 raw, latency = call_judge(prompt, ctx, spend)
-            except providers.BudgetExceeded as e:
-                raise SystemExit(f"judge budget exhausted after {spend['calls']} calls: {e}")
-        verdict, ok = parse_verdict(raw)
-        parse_fail += not ok
-        post = post_pass(rec, verdict)
-        judged.append({
-            "present_id": pid, "rid": rid_of(rec), "qid": rec.get("qid"),
-            "chain_id": rec.get("chain_id"), "session_id": rec.get("session_id"),
-            "span_idx": rec.get("span_idx"), "lag": rec.get("lag"),
-            "slice": rec.get("slice"), "answerable": rec.get("answerable", True),
-            "pass": pass_no if args.calibration else None,
-            "score": verdict["score"], "unsupported_claim": verdict["unsupported_claim"],
-            "judge_abstained": verdict["abstained"], "abstained": post["abstained"],
-            "abstained_source": post["abstained_source"],
-            "reason": verdict["reason"],
-            "anchor_hit": post["anchor_hit"],
-            "hallucination": post["hallucination"],
-            "hallucination_rule": post["hallucination_rule"],
-            "facts_verified_in_transcript": post["facts_verified_in_transcript"],
-            "fact_tokens_missing": post["fact_tokens_missing"],
-            "verification": post["verification"],
-            "concrete_tokens": post["concrete_tokens"],
-            "excerpt_status": how, "excerpt_chars": len(excerpt),
-            "excerpt_source_chain": src_chain,
-            "judge_parse_ok": ok, "judge_model": model,
-            "judge_same_family": fam["judge_same_family"],
-            "judge_latency_s": round(latency, 3),
-            **({"outcome": verdict.get("outcome"), "outcome_mode": True} if OUTCOME_MODE else {}),
-        })
-        if n % 10 == 0 or n == len(presentations):
-            print(f"  judged {n}/{len(presentations)}"
-                  + (f" (${spend['usd']:.4f})" if not args.dry_run else ""), flush=True)
+            verdict, ok = parse_verdict(raw)
+            if not ok:                                                  # C.10: ONE strict-format re-ask, then give up (not "wrong")
+                reasked = True
+                reasked_n += 1
+                if args.dry_run:
+                    raw2 = rec.get(f"judge_reask{pass_no}") or rec.get("judge_reask") or ""
+                else:
+                    ctx["budget"].check()
+                    raw2, lat2 = call_judge(prompt + STRICT_REMINDER, ctx, spend)
+                    latency += lat2
+                verdict2, ok2 = parse_verdict(raw2)
+                reask_ok = ok2
+                if ok2:
+                    verdict, ok = verdict2, True
+                    recovered_n += 1
+            parse_fail += not ok
+            post = post_pass(rec, verdict)
+            judged.append({
+                "present_id": pid, "rid": rid_of(rec), "qid": rec.get("qid"),
+                "chain_id": rec.get("chain_id"), "session_id": rec.get("session_id"),
+                "span_idx": rec.get("span_idx"), "lag": rec.get("lag"),
+                "slice": rec.get("slice"), "answerable": rec.get("answerable", True),
+                "pass": pass_no if args.calibration else None,
+                "score": verdict["score"], "unsupported_claim": verdict["unsupported_claim"],
+                "judge_abstained": verdict["abstained"], "abstained": post["abstained"],
+                "abstained_source": post["abstained_source"],
+                "reason": verdict["reason"],
+                "anchor_hit": post["anchor_hit"],
+                "hallucination": post["hallucination"],
+                "hallucination_rule": post["hallucination_rule"],
+                "facts_verified_in_transcript": post["facts_verified_in_transcript"],
+                "fact_tokens_missing": post["fact_tokens_missing"],
+                "verification": post["verification"],
+                "concrete_tokens": post["concrete_tokens"],
+                "excerpt_status": how, "excerpt_chars": len(excerpt),
+                "excerpt_source_chain": src_chain,
+                "judge_parse_ok": ok, "judge_model": model,
+                "judge_reasked": reasked, "judge_reask_ok": reask_ok if reasked else None, "judge_unparsed": not ok,
+                "judge_cost_usd": round(spend["usd"] - spent0, 8) if not args.dry_run else 0.0,
+                "judge_same_family": fam["judge_same_family"],
+                "judge_latency_s": round(latency, 3),
+                **({"outcome": verdict.get("outcome"), "outcome_mode": True} if OUTCOME_MODE else {}),
+            })
+            if n % 10 == 0 or n == len(presentations):
+                write_spend("running")
+                print(f"  judged {n}/{len(presentations)}"
+                      + (f" (${spend['usd']:.4f})" if not args.dry_run else ""), flush=True)
+    except providers.BudgetExceeded as e:
+        abort(f"budget exhausted: {e}")
+    except KeyboardInterrupt:
+        abort("interrupted")
+    except Exception as e:  # noqa: BLE001
+        abort(f"{type(e).__name__}: {str(e)[:200]}")
 
     with open(out, "w") as w:
         for j in judged:
@@ -716,7 +782,8 @@ def main() -> int:
 
     # ---- report
     print(f"\njudged {len(judged)} presentations over {len(records)} records "
-          f"({parse_fail} unparseable judge replies)")
+          f"({parse_fail} unparseable judge replies after the re-ask; {reasked_n} re-asked, {recovered_n} recovered; "
+          f"unparsed rows are marked judge_unparsed and excluded from accuracy)")
     print(f"out: {out}\nmapping (arm labels, kept separate): {mapping_path}")
     print(f"blindness: arm name present in a prompt for {len(arm_in_prompt)} record(s)" +
           (f" -> {arm_in_prompt[:3]}" if arm_in_prompt else " (clean)"))
@@ -751,6 +818,7 @@ def main() -> int:
         json.dump(cal, open(os.path.join(os.path.dirname(out) or ".",
                                          "judge-calibration.json"), "w"), indent=1)
     if not args.dry_run:
+        write_spend("complete")
         print(f"judge spend: ${spend['usd']:.5f} over {spend['calls']} calls "
               f"(cap ${args.budget_usd:.2f}; profile {prof_name}, model {args.model})")
     else:

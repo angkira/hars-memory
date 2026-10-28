@@ -724,9 +724,11 @@ class BundleTests(unittest.TestCase):
         rc, so, se = quiet(H.main, ["--root", self.root, "bundle", "--resume", self.camp.path, *extra])
         self.assertEqual(rc, 0, so + se)
         path = re.search(r"BUNDLE: (\S+)", so).group(1)
+        import gzip
         with tarfile.open(path) as tf:
             names = tf.getnames()
-            data = {n: tf.extractfile(n).read().decode() for n in names if tf.getmember(n).isfile()}
+            data = {n: (gzip.decompress(tf.extractfile(n).read()) if n.endswith(".gz") else tf.extractfile(n).read()).decode()
+                    for n in names if tf.getmember(n).isfile()}
         return so, path, names, data
 
     def test_default_bundle_excludes_raw_and_redacts(self):
@@ -736,6 +738,8 @@ class BundleTests(unittest.TestCase):
                      "oh/inputs/chains-manifest.json", "beam/run/records.jsonl", "cc/run/records.jsonl", "logs/oh.merge.log",
                      "ledger.json", "MANIFEST.json", "bundle-manifest.json", "bundle-redaction-report.json"):
             self.assertIn(want, rel)
+        # C.10: the recall / probe sidecars of the OH track are packed by default, gzip-compressed (size-guarded)
+        self.assertIn("oh/runs/b1536-00/recall/x.json.gz", rel)
         for banned in ("oh/merged/judge-input.jsonl", "oh/merged/sessions/chain_a__b1536/graph.graphml",
                        "oh/runs/b1536-00/logs/chain_a__b1536/pi.err", "oh/runs/b1536-00/recall/x.json",
                        "oh/inputs/chains.jsonl", "beam/data/beam-1M-1.json", "cc/data-qa/qa-raw.jsonl",
