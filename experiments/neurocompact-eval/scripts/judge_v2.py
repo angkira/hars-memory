@@ -62,6 +62,8 @@ import providers  # noqa: E402  (profiles, prices, family check, hard budget)
 
 JUDGE_MODEL_DEFAULT = "claude-sonnet-5-5"     # default (no --profile = the anthropic profile)
 TRANSPORT = None                               # tests inject a fake HTTP transport
+OUTCOME_MODE = False                           # --outcome (Amendment C.9): the verdict carries ONE mutually exclusive outcome
+OUTCOMES = ("correct", "partial", "wrong", "abstained")
 FIXTURES = os.path.join(BASE, "judge_v2_fixtures.json")
 WINDOW = 500                     # chars either side of the evidence
 UNSUPPORTED_AND_FULL_CREDIT_MAX = 0.05   # calibration gate
@@ -265,8 +267,24 @@ def rubric_text(rec: dict) -> str:
     return "\n".join(f"- {x}" for x in items)
 
 
+OUTCOME_BLOCK = """
+outcome = exactly ONE of correct | partial | wrong | abstained, decided by this precedence (first rule that applies):
+  1. correct   - the answer states the recorded fact (hedges such as "I think" / "probably" do not change this).
+  2. partial   - it states only part of the fact, or only the right direction, and asserts NO false or fabricated specific.
+  3. wrong     - it asserts a specific that is false, contradicted, fabricated or different from the recorded fact
+                 (a hallucination), even if it also hedges.
+  4. abstained - it declines / says it does not know / cannot find it, and asserts no relevant specific.
+Items with no recorded fact: a clear "not recorded / I do not know" is abstained; any concrete asserted fact is wrong.
+A hedged answer that states the recorded fact is correct (or partial), never abstained.
+"""
+
+
 def build_prompt(rec: dict, excerpt: str) -> str:
     base = _build_prompt(rec, excerpt)
+    if OUTCOME_MODE:
+        base = base.replace("reason: <= 25 words.", "reason: <= 25 words." + OUTCOME_BLOCK, 1)
+        base = base.replace('"abstained":true|false,"reason":"..."}',
+                            '"abstained":true|false,"outcome":"correct|partial|wrong|abstained","reason":"..."}', 1)
     rt = rubric_text(rec)
     if not rt:
         return base
@@ -304,10 +322,14 @@ def parse_verdict(raw: str) -> tuple[dict, bool]:
         if score not in (0, 1, 2):
             return {"score": None, "unsupported_claim": None, "abstained": None,
                     "reason": f"bad_score:{score}"}, False
-        return {"score": score,
-                "unsupported_claim": bool(j.get("unsupported_claim")),
-                "abstained": bool(j.get("abstained")),
-                "reason": str(j.get("reason", ""))[:200]}, True
+        v = {"score": score,
+             "unsupported_claim": bool(j.get("unsupported_claim")),
+             "abstained": bool(j.get("abstained")),
+             "reason": str(j.get("reason", ""))[:200]}
+        oc = str(j.get("outcome") or "").strip().lower()
+        if oc in OUTCOMES:
+            v["outcome"] = oc
+        return v, True
     return {"score": None, "unsupported_claim": None, "abstained": None,
             "reason": "unparseable"}, False
 
@@ -514,6 +536,9 @@ def main() -> int:
                          "MODEL differs from every agent-side model; loud warning, recorded as "
                          "judge_same_family=true + reason in the mapping and the judged rows")
     ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--outcome", action="store_true",
+                    help="Amendment C.9: also ask for ONE mutually exclusive outcome (correct / partial / wrong / abstained, "
+                         "explicit precedence) and write it as `outcome`; the other fields are unchanged")
     ap.add_argument("--calibration", "--calibrate", dest="calibration",
                     action="store_true",
                     help="grade every item twice with independent shuffles "
@@ -524,6 +549,8 @@ def main() -> int:
     ap.add_argument("--show-prompt", action="store_true",
                     help="print the first prompt verbatim (blindness check)")
     args = ap.parse_args()
+    global OUTCOME_MODE
+    OUTCOME_MODE = bool(args.outcome)
     prof_name = args.profile or "anthropic"      # no --profile = the anthropic profile (2026-10-26)
     try:
         prof = providers.load_profile(prof_name, base_url=args.base_url, pi_provider=args.pi_provider)
@@ -673,6 +700,7 @@ def main() -> int:
             "judge_parse_ok": ok, "judge_model": model,
             "judge_same_family": fam["judge_same_family"],
             "judge_latency_s": round(latency, 3),
+            **({"outcome": verdict.get("outcome"), "outcome_mode": True} if OUTCOME_MODE else {}),
         })
         if n % 10 == 0 or n == len(presentations):
             print(f"  judged {n}/{len(presentations)}"

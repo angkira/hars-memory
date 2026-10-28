@@ -93,14 +93,16 @@ PHASES = ("gen", "run", "judge")
 CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
 PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
 PLACEHOLDER_CAP = 0.0
-HOME_RUN_VERSION = "2026-10-28.c8"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+HOME_RUN_VERSION = "2026-10-28.c9"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
 # Amendment C.7: `oh-probe` / `oh-enrich` may spend on a campaign made under one of these versions (only those,
 # only for those two commands). Why that is valid is written in REPORT-PROTOCOL.md Amendment C.7: the reused HARS
 # sessions, notes, baseline / nc-note-only rows and judge verdicts are artifacts of code that C.7 did not change.
 # Amendment C.8: the same exception covers a campaign stamped c7 and the two new commands (provision / ingest) of the
 # project layout; nothing older, no other command.
-REUSE_COMPATIBLE_FROM = ("2026-10-27.c6", "2026-10-28.c7")
-REUSE_CMDS = ("oh-provision", "oh-ingest", "oh-probe", "oh-enrich")
+# Amendment C.9: oh-workspaces / oh-agentic accept the same campaigns (C.6 / C.7 / C.8 stamped); the agentic track reuses the
+# finished C.6 baseline / note rows, the C.8 projects and judge model, and changes no part of them.
+REUSE_COMPATIBLE_FROM = ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8")
+REUSE_CMDS = ("oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic")
 DEFAULT_PROJECTS_DIR = "~/.local/share/hars-longterm-memory/projects"    # hars_memory/projects/registry.py default
 EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
 HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
@@ -380,7 +382,8 @@ class Campaign:
         for fn in ("home_run.py", "providers.py", "run_chainreplay.py", "run_longsession.py", "longsession.py",
                    "metrics_v2.py", "judge_v2.py", "merge_runs.py", "funnel_chains.py", "export_judge_input.py",
                    "export_longsession_judge.py", "import_beam.py", "import_claude_code.py",
-                   "gen_longsession_qa.py", "ls_redact.py", "qtypes.py", "chains_to_longsession.py", "tokcount.py"):
+                   "gen_longsession_qa.py", "ls_redact.py", "qtypes.py", "chains_to_longsession.py", "tokcount.py",
+                   "run_agentic.py", "metrics_agentic.py", "anchors.py", "oh_workspaces.py"):
             src = os.path.join(BASE, fn)
             dst = self.p("scripts", fn)
             if os.path.isfile(src) and not os.path.exists(dst):
@@ -516,7 +519,7 @@ class Campaign:
 # ---------------------------------------------------------------------------
 # campaign selection (owner bug 2): NEVER an implicit resume
 # ---------------------------------------------------------------------------
-READ_ONLY_CMDS = ("bundle", "status", "oh-provision", "oh-ingest", "oh-probe", "oh-enrich")   # need an explicit target (--resume [ID|PATH])
+READ_ONLY_CMDS = ("bundle", "status", "oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic")   # need an explicit target (--resume [ID|PATH])
 NOT_RESUMABLE_KINDS = ("smoke", "dry-run")      # `--resume` (newest) skips these throw-away campaigns
 _STAMP_RE = re.compile(r"^(\d{8}T\d{6}Z)-homerun-")
 
@@ -650,8 +653,8 @@ def open_campaign(cfg: dict, args, kind: str, runner=None, echo: bool = True) ->
 # ---------------------------------------------------------------------------
 # paid-step guard (owner bug 5): a campaign made under another EVAL-VERSION, or with a void calibration/caps, never spends
 # ---------------------------------------------------------------------------
-PAID_SCRIPTS = ("run_longsession.py", "run_chainreplay.py", "judge_v2.py", "gen_longsession_qa.py")
-HARS_WRITER_SCRIPTS = ("run_longsession.py", "run_chainreplay.py")
+PAID_SCRIPTS = ("run_longsession.py", "run_chainreplay.py", "judge_v2.py", "gen_longsession_qa.py", "run_agentic.py")
+HARS_WRITER_SCRIPTS = ("run_longsession.py", "run_chainreplay.py", "run_agentic.py")   # run_agentic only READS HARS; it takes the same per-endpoint lock / lease
 
 
 def campaign_eval_version(camp_path: str) -> str | None:
@@ -1783,7 +1786,8 @@ def judge_spend_from_text(text: str) -> float | None:
 # judge / metrics steps shared by the tracks
 # =============================================================================
 def judge_step(camp: Campaign, track: str, tag: str, judge_in: str, judged: str, mapping: str,
-               accept_partial: bool = False, cap_override: float | None = None, step: str | None = None) -> dict:
+               accept_partial: bool = False, cap_override: float | None = None, step: str | None = None,
+               extra_args: list[str] | None = None) -> dict:
     n = sum(1 for _ in open(judge_in)) if os.path.isfile(judge_in) else 0
     unit = judge_unit_usd(camp.cfg)
     est = n * unit
@@ -1795,7 +1799,7 @@ def judge_step(camp: Campaign, track: str, tag: str, judge_in: str, judged: str,
     if os.path.isfile(judged):
         camp.quarantine(judged)
     argv = [camp.script("judge_v2.py"), "--in", judge_in, "--out", judged, "--mapping", mapping,
-            *profile_args(camp.cfg), "--allow-same-family-judge", "--budget-usd", str(rem)]
+            *profile_args(camp.cfg), "--allow-same-family-judge", "--budget-usd", str(rem)] + list(extra_args or [])
     step = step or f"{track}.judge"
     rc, text = camp.run(step, argv, check=False)
     spent = judge_spend_from_text(text)
@@ -2697,7 +2701,8 @@ def mark_reuse(camp: Campaign, old: str, what: str) -> None:
     dst = camp.p("scripts", "c7")
     os.makedirs(dst, exist_ok=True)
     for fn in ("home_run.py", "run_longsession.py", "run_chainreplay.py", "longsession.py", "metrics_v2.py",
-               "judge_v2.py", "export_longsession_judge.py", "funnel_chains.py", "tokcount.py", "providers.py"):
+               "judge_v2.py", "export_longsession_judge.py", "funnel_chains.py", "tokcount.py", "providers.py",
+               "run_agentic.py", "metrics_agentic.py", "anchors.py", "oh_workspaces.py"):
         src = os.path.join(BASE, fn)
         if os.path.isfile(src) and not os.path.exists(os.path.join(dst, fn)):
             shutil.copy2(src, os.path.join(dst, fn))
@@ -2972,6 +2977,183 @@ def cmd_oh_enrich(camp: Campaign, args) -> int:
     camp.step(f"oh.enrich{S}.funnel", do_funnel)
     summarize_track(camp, "oh", run_dir)
     print(f"\n[oh-enrich] report: {os.path.join(run_dir, 'REPORT-oh-enrich.md')}; next: home_run.py bundle --resume {os.path.basename(camp.path)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Amendment C.9: the agentic track (PRIMARY question) - workspaces, then agents with / without memory
+# ---------------------------------------------------------------------------
+AGENTIC_ARMS = "sum,sum+mem"
+DEFAULT_WORKSPACE_CACHE = "~/.cache/nc-eval/workspaces"
+
+
+def workspace_cache_of(cfg: dict, args=None) -> str:
+    raw = getattr(args, "cache_dir", None) or cfg["oh"].get("workspace_cache") or DEFAULT_WORKSPACE_CACHE
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def oh_source_dir(camp: Campaign) -> str:
+    d = camp.cfg["oh"].get("artifact_dir")
+    if d and os.path.isdir(d):
+        return d
+    return (read_json(camp.p("inputs", "oh_inputs.json"), {}) or {}).get("source_dir") or ""
+
+
+def cmd_oh_workspaces(camp: Campaign, args) -> int:
+    """Provision one read-only workspace per eval session (cache dir at home, network needed): the SWE-bench repo at
+    base_commit (+ the session's final patch ONLY when --instances supplies model_patch; the OH import keeps neither
+    base_commit nor the patch). Never the transcript, never git history. Spends nothing."""
+    import oh_workspaces as OW  # noqa: PLC0415
+    camp.reuse_ok = True
+    cfg = camp.cfg
+    chains = read_jsonl(oh_inputs(camp))
+    cache = workspace_cache_of(cfg, args)
+    dest = os.path.join(cache, "ws", os.path.basename(camp.path))
+    instances = OW.load_instances(getattr(args, "instances", None))
+    oh_dir = oh_source_dir(camp)
+    infos = OW.session_infos(oh_dir, chains)
+    print(f"[oh-workspaces] {len(chains)} session(s); cache {cache}; workspaces -> {dest}")
+    for cid, info in infos.items():
+        row = instances.get(info.get("instance_id") or "", {})
+        print(f"  {cid}: instance {info.get('instance_id') or row.get('instance_id') or '?'} repo {info.get('repo') or row.get('repo') or '?'}"
+              f"  base_commit {'given' if row.get('base_commit') else 'from the SWE-bench Verified dataset'}"
+              f"  final patch {'given' if row.get('model_patch') else 'NOT available'}")
+    if args.dry_run:
+        return 0
+    summ = OW.provision(chains, oh_dir, cache, dest, instances, getattr(args, "clone_url", None) or OW.CLONE_URL)
+    if summ["errors"]:
+        raise HomeRunError(f"{len(summ['errors'])} workspace(s) could not be built: {summ['errors']}")
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj["c9_workspaces"] = {"ts": utc_iso(), "dest": dest, "cache": cache, "kinds": summ["kinds"], "eval_version": HOME_RUN_VERSION}
+    write_json(camp.p("campaign.json"), cj)
+    camp.step("oh.workspaces", lambda: {"dest": dest, "kinds": summ["kinds"], "sessions": len(summ["workspaces"])})
+    kinds = summ["kinds"]
+    print(f"\n[oh-workspaces] {len(summ['workspaces'])} workspace(s): {kinds}")
+    if "base_commit+final_patch" not in kinds or kinds.get("base_commit"):
+        print("  NOTE: workspace = base_commit WITHOUT the session's final patch for "
+              f"{kinds.get('base_commit', 0)} session(s) (the OH data does not hold it; pass --instances with model_patch). "
+              "The agent then cannot find the session's edits in the workspace; REPORT-PROTOCOL.md C.9 states this limit.")
+    print(f"  next: home_run.py oh-agentic --dry-run --resume {os.path.basename(camp.path)}")
+    return 0
+
+
+def agentic_sources(camp: Campaign, args, old: str):
+    import longsession as LS  # noqa: PLC0415
+    import run_agentic as RA  # noqa: PLC0415
+    data = oh_convert(camp)
+    sessions = {s["sid"]: s for s in LS.load_sessions([data])}
+    arms = [x.strip() for x in (args.arms or AGENTIC_ARMS).split(",") if x.strip()]
+    bad = [x for x in arms if x not in RA.ALL_ARMS]
+    if bad:
+        raise HomeRunError(f"--arms: unknown {bad}; choose from {RA.ALL_ARMS}")
+    mb = int((getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])[0])
+    try:
+        src = RA.load_sources(old, sessions, arms, mb)
+    except RA.SourceError as e:
+        raise HomeRunError(f"oh-agentic: {e}")
+    return data, sessions, arms, src
+
+
+def estimate_oh_agentic(camp: Campaign, args, old: str) -> dict:
+    import run_agentic as RA  # noqa: PLC0415
+    data, sessions, arms, src = agentic_sources(camp, args, old)
+    prof = P.load_profile(camp.cfg["general"]["profile"])
+    model = P.resolve_models(prof, {})["agent"]
+    est = RA.estimate(arms, RA.summaries_tokens_of(src, arms), {s: len(q) for s, q in src["questions"].items()}, prof, model,
+                      args.max_steps, args.memory_max_chars, judge_unit_usd(camp.cfg))
+    est["run_usd"] = est["run_usd_expected_without_cache"]            # the cap check uses the no-cache expectation (conservative)
+    est["judge_usd_total"] = est["judge_usd"]
+    return est
+
+
+def print_agentic_estimate(camp: Campaign, est: dict) -> None:
+    caps = {ph: cap_for(camp.cfg, "oh", ph) for ph in ("run", "judge")}
+    print(f"\n[oh-agentic] estimate (zero spend), model: steps x tokens (assumptions below), cache reads priced separately:\n"
+          f"  {est['questions']} questions x {len(est['arms'])} arm(s) {est['arms']} = {est['judge_items']} agent runs, {est['sessions']} sessions\n"
+          f"  run: expected {fmt_usd(est['run_usd_expected_with_cache'])} with cache / {fmt_usd(est['run_usd_expected_without_cache'])} without; "
+          f"upper bound (every question runs {est['max_steps']} steps) {fmt_usd(est['run_usd_upper_bound'])}\n"
+          f"  judge: {est['judge_items']} items = {fmt_usd(est['judge_usd'])} | caps run {caps['run']:.2f} / judge {caps['judge']:.2f}\n"
+          f"  mean tokens per question (all input incl. cache reads + output) ~{est['mean_tokens_per_question']}\n"
+          f"  power (pre-run guess): {est['mde_prior']['rule']} -> MDE ~{est['mde_prior']['mde_relative_to_mean_tokens']:.0%} of the mean "
+          f"(~{est['mde_prior']['mde_tokens']} tokens)\n"
+          f"  assumptions: {est['assumptions']}")
+    write_json(camp.p("oh-agentic-estimate.json"), {"ts": utc_iso(), **est})
+
+
+def cmd_oh_agentic(camp: Campaign, args) -> int:
+    """Amendment C.9 (PRIMARY): agents with workspace tools, with / without memory_recall, per question; judge --outcome; metrics_agentic."""
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-agentic")
+    cfg = camp.cfg
+    old = oh_old_run(camp, args, need_judged=True)
+    est = estimate_oh_agentic(camp, args, old)
+    if args.dry_run:
+        print_agentic_estimate(camp, est)
+        return 0
+    arms = est["arms"]
+    if any(a in ("sum+mem", "note+mem") for a in arms) and not camp.is_done("oh.ingest"):
+        raise HomeRunError("oh-agentic needs the C.8 project layout ingested: run `home_run.py oh-provision`, restart the server, "
+                           f"`oh-ingest --resume {os.path.basename(camp.path)}` first")
+    if not camp.is_done("oh.workspaces"):
+        raise HomeRunError(f"run `home_run.py oh-workspaces --resume {os.path.basename(camp.path)}` first (workspaces are provisioned at home)")
+    if "note+mem" in arms and not camp.is_done("oh.agentic.run"):
+        print("[oh-agentic] note+mem is the OPTIONAL arm: the protocol runs it only if sum+mem showed a gain")
+    prof = P.load_profile(cfg["general"]["profile"])
+    jm = P.resolve_models(prof, {})["judge"]
+    old_map = read_json(os.path.join(old, "judge-mapping.json"), {}) or {}
+    old_jm = old_map.get("judge_model") or old_map.get("model")
+    if old_jm and old_jm != jm:
+        raise HomeRunError(f"the C.6 campaign was judged by {old_jm!r}, this profile judges with {jm!r}: refusing (same judge required)")
+    mark_reuse(camp, old, "oh-agentic")
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    print_agentic_estimate(camp, est)
+    data = oh_convert(camp)
+    pj = oh_projects(camp) if any(a in ("sum+mem", "note+mem") for a in arms) else {"pids": {}}
+    pmap = camp.p("oh", "agentic-projects.json")
+    write_json(pmap, pj["pids"])
+    ws_dest = (read_json(camp.p("campaign.json"), {}) or {}).get("c9_workspaces", {}).get("dest") or ""
+    run_dir = camp.p("oh", "agentic-run")
+    mb = int((getattr(args, "budgets", None) or cfg["oh"]["budgets"])[0])
+
+    def go():
+        rem = camp.remaining("oh", "run")
+        argv = [camp.script("run_agentic.py"), "--sessions", data, "--reuse-run", old, "--workspaces", ws_dest, "--projects-map", pmap,
+                "--arms", ",".join(arms), "--mem-budget", str(mb), "--max-steps", str(args.max_steps),
+                "--max-question-tokens", str(args.max_question_tokens), "--memory-max-chars", str(args.memory_max_chars),
+                "--concurrency", str(args.concurrency), "--mcp", cfg["general"]["mcp"], "--budget-usd", str(rem)]
+        argv += profile_args(cfg) if not cfg["general"].get("_offline") else ["--mock-llm", "--fake-hars"]
+        if os.path.isfile(os.path.join(run_dir, "config.json")):
+            argv += ["--resume", run_dir]
+        else:
+            if os.path.isdir(run_dir) and os.listdir(run_dir):
+                camp.quarantine(run_dir)
+            argv += ["--out", run_dir, "--name", "oh"]
+        rc, _ = camp.run("oh.agentic.run", argv, check=False)
+        spent, src_ = longsession_spend(run_dir)
+        camp.charge("oh", "run", "oh.agentic.run", spent, source=run_dir, note=src_)
+        summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
+        if rc != 0 or summ.get("n_missing"):
+            raise HomeRunError(f"oh.agentic.run incomplete (exit {rc}, {summ.get('n_missing')} of {summ.get('expected')} rows missing); "
+                               f"log logs/oh.agentic.run.log. Re-run the same command to RESUME (finished rows are kept).")
+        return {"out": run_dir, "rows": summ.get("rows"), "spent_usd": spent}
+    camp.step("oh.agentic.run", go)
+    rec, ji = os.path.join(run_dir, "records.jsonl"), os.path.join(run_dir, "judge-input.jsonl")
+    camp.step("oh.agentic.export", lambda: (camp.run("oh.agentic.export", [camp.script("run_agentic.py"), "--export-judge", "--out", run_dir,
+                                                                          "--sessions", data]), {"out": ji})[1])
+    if args.skip_judge:
+        print("[oh-agentic] --skip-judge: stopping before the judge")
+        return 0
+    judged, mp = os.path.join(run_dir, "judged.jsonl"), os.path.join(run_dir, "judge-mapping.json")
+    camp.step("oh.agentic.judge", lambda: judge_step(camp, "oh", "oh-agentic", ji, judged, mp, args.accept_partial,
+                                                    step="oh.agentic.judge", extra_args=["--outcome"]))
+    report, mj = os.path.join(run_dir, "REPORT-oh-agentic.md"), os.path.join(run_dir, "metrics-agentic.json")
+
+    def do_metrics():
+        camp.run("oh.agentic.metrics", [camp.script("metrics_agentic.py"), "--records", rec, "--judged", judged, "--out", report, "--json", mj])
+        return {"report": report, "json": mj}
+    camp.step("oh.agentic.metrics", do_metrics)
+    summarize_track(camp, "oh", run_dir)
+    print(f"\n[oh-agentic] report: {report}; next: home_run.py bundle --resume {os.path.basename(camp.path)}")
     return 0
 
 
@@ -3376,7 +3558,7 @@ BUNDLE_EXT = (".json", ".jsonl", ".md", ".txt", ".log", ".toml", ".py", ".sh")
 RAW_DIRS = {"sessions", "recall", "partial", "memory", "data", "data-qa", "dry-data", "dry-gen", "answers",
             "batches", "files", "oh-src", "ls-data"}
 NEVER_DIRS = {"bundle", "accepted", "__pycache__", "scripts-copy"}
-RAW_FILE_RES = (re.compile(r"^chains.*\.jsonl$"), re.compile(r"^judge-input.*\.jsonl$"),
+RAW_FILE_RES = (re.compile(r"^chains.*\.jsonl$"), re.compile(r"^judge-input.*\.jsonl$"), re.compile(r"^traces.*\.jsonl$"),
                 re.compile(r"^qa-raw.*\.jsonl$"), re.compile(r"^all\.jsonl$"))
 CC_TEXT_FIELDS = ("memory_text", "injected")
 SECRET_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD)", re.I)
@@ -3683,6 +3865,29 @@ def build_parser() -> argparse.ArgumentParser:
             t.add_argument("--skip-judge", action="store_true", help="stop after export (no judge spend)")
             t.add_argument("--accept-parity-fail", action="store_true",
                            help="judge although the realized memory is outside the parity window (recorded)")
+    t = sub.add_parser("oh-workspaces", parents=[common],
+                       help="Amendment C.9: provision one read-only workspace per eval session (repo at base_commit [+ the session's "
+                            "final patch when supplied]; never the transcript) into a cache dir; needs network, spends nothing")
+    t.add_argument("--dry-run", action="store_true", help="print the plan and stop")
+    t.add_argument("--cache-dir", default=None, metavar="DIR", help=f"clone cache + workspaces (default [oh] workspace_cache or {DEFAULT_WORKSPACE_CACHE})")
+    t.add_argument("--instances", default=None, metavar="FILE",
+                   help="jsonl/json rows {instance_id, base_commit[, model_patch]} (the OH data holds neither; without it base_commit "
+                        "comes from the SWE-bench Verified dataset and NO final patch is applied)")
+    t.add_argument("--clone-url", default=None, metavar="TEMPLATE", help="git URL template with {repo} (default https://github.com/{repo}.git)")
+    t.add_argument("--reuse-dir", default=None, help=argparse.SUPPRESS)
+    t = sub.add_parser("oh-agentic", parents=[common],
+                       help="Amendment C.9 (PRIMARY): agents with workspace tools, with / without memory_recall, per question of the "
+                            "finished campaign; judge (outcome schema), metrics_agentic, bundle")
+    t.add_argument("--dry-run", action="store_true", help="print the steps x tokens cost estimate and the pre-run power guess; spend nothing")
+    t.add_argument("--arms", default=AGENTIC_ARMS, help="comma list of sum, sum+mem, note+mem (note+mem is OPTIONAL: run it only if sum+mem showed a gain)")
+    t.add_argument("--max-steps", type=int, default=12)
+    t.add_argument("--max-question-tokens", type=int, default=400000)
+    t.add_argument("--memory-max-chars", type=int, default=6000)
+    t.add_argument("--concurrency", type=int, default=2, help="sessions in parallel")
+    t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+    t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir (default <campaign>/oh/run)")
+    t.add_argument("--accept-partial", action="store_true")
+    t.add_argument("--skip-judge", action="store_true")
     sub.add_parser("status", parents=[common], help="read-only: campaigns under the artifact root, or (with --resume) one "
                                                     "campaign's steps / spend / calibration / validity")
     b = sub.add_parser("bundle", parents=[common], help="tar.gz of what the analyst needs (redaction-scanned)")
@@ -3860,7 +4065,7 @@ def _main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
         if args.cmd in REUSE_CMDS:
             camp.reuse_ok = True
             return {"oh-provision": cmd_oh_provision, "oh-ingest": cmd_oh_ingest, "oh-probe": cmd_oh_probe,
-                    "oh-enrich": cmd_oh_enrich}[args.cmd](camp, args)
+                    "oh-enrich": cmd_oh_enrich, "oh-workspaces": cmd_oh_workspaces, "oh-agentic": cmd_oh_agentic}[args.cmd](camp, args)
         if args.cmd == "calibrate":
             return cmd_calibrate(camp, args)
         if args.cmd == "oh":

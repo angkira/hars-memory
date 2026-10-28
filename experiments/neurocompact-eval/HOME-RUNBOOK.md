@@ -36,7 +36,8 @@
    uv run python home_run.py bundle                 # send the ONE .tar.gz back
    ```
    **You already have a finished `oh` campaign (question-time arms)?** Do NOT re-run it. Read section 6.0c (Amendment C.8): `oh-provision`,
-   restart your server once, `doctor`, `oh-ingest`, `oh-probe`, `oh-enrich` (nc-enriched against the session's own project). The split-session
+   restart your server once, `doctor`, `oh-ingest`, `oh-probe`, `oh-enrich` (nc-enriched against the session's own project). **Amendment C.9
+   makes the agentic runs the PRIMARY question: after `oh-ingest`, read section 6.0d (`oh-workspaces`, `oh-agentic`).** The split-session
    HARS data of that campaign measured a server side channel, not the memory (6.0b is kept for the record).
 
 ---
@@ -192,6 +193,8 @@ HR oh-enrich --resume CAMP       # Amendment C.7: ONLY nc-enriched against that 
                                  #   nc-note-only), judges the new rows only, merges, metrics. Run oh-probe first; --dry-run on both
 HR oh-provision / oh-ingest --resume CAMP   # Amendment C.8 (section 6.0c): the session's own project on your existing server, then ingest
                                  #   (oh-probe / oh-enrich default to this project layout; `--layout split-session` = DIAGNOSTIC ONLY)
+HR oh-workspaces / oh-agentic --resume CAMP   # Amendment C.9 (section 6.0d, PRIMARY): per-session workspaces (network, no spend), then agents with / without
+                                 #   memory_recall per question of the finished campaign -> judge (--outcome) -> metrics_agentic -> bundle
 HR bundle                        # step 9
 ```
 Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export, judge later), `--retries N` (legacy replay only),
@@ -239,6 +242,40 @@ campaign may still spend.
 Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~2.3 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
 
+### 6.0d Amendment C.9 - the agentic runs (PRIMARY question; read after `oh-ingest`)
+
+The owner's question: does the agent spend MORE tokens finding a fact WITHOUT memory than when it fetches it from memory? `oh-agentic` runs, for each of the 140
+questions, an agent with workspace tools (ls / read_file / grep over the session's repo at `base_commit`) and the baseline summary (`sum`), and the same plus a
+`memory_recall` tool against the session's C.8 project (`sum+mem`). Neither arm sees the transcript. Everything else (the C.6 summary, the C.8 ingest, the judge model)
+is reused. The C.7/C.8 fixed-budget arms are now secondary (protocol 4a.9).
+
+Exact sequence after `oh-ingest` (the server from 6.0c keeps running; `CAMP` = the finished oh campaign):
+
+```bash
+cd experiments/neurocompact-eval/scripts
+CAMP=<the finished oh campaign>
+# 1) workspaces (NETWORK; spends nothing): clones github.com/<repo> into a cache, checks out base_commit, deletes .git. The OH data has neither
+#    base_commit nor the final patch: base_commit comes from the SWE-bench Verified dataset; to apply each session's FINAL patch pass --instances FILE
+#    (jsonl/json rows {instance_id, base_commit[, model_patch]}). Without it the workspace is base_commit only and the command says so.
+uv run python home_run.py oh-workspaces --resume $CAMP --dry-run                 # the plan: instance, repo, base_commit source, patch yes/no
+uv run python home_run.py oh-workspaces --resume $CAMP [--instances FILE] [--cache-dir DIR]   # default cache ~/.cache/nc-eval/workspaces
+# 2) the cost estimate (zero spend): the steps x tokens model with its assumptions, the cache / no-cache run cost, the judge, the pre-run power guess
+uv run python home_run.py oh-agentic --resume $CAMP --dry-run
+# 3) the run (PAID): sum + sum+mem per question -> judge (--outcome schema, same judge model as C.6) -> metrics_agentic -> report
+uv run python home_run.py oh-agentic --resume $CAMP [--max-steps 12] [--max-question-tokens 400000] [--memory-max-chars 6000] [--concurrency 2]
+uv run python home_run.py bundle --resume $CAMP                                   # send the .tar.gz back
+# 4) ONLY if sum+mem showed a gain over sum (the report says): the optional note+mem arm
+uv run python home_run.py oh-agentic --resume $CAMP --arms note+mem
+```
+- Requirements (enforced): `oh-ingest` done (the C.8 projects hold the data; your HARS server running, the same one), the workspaces step done, the same judge model as
+  the C.6 campaign, the caps (`[caps] run / judge / total`), the per-HARS lock. A campaign stamped `2026-10-27.c6`, `2026-10-28.c7` or `2026-10-28.c8` is accepted (code `2026-10-28.c9`).
+- It is resumable: re-running the same command keeps finished (question, arm) rows (`oh/agentic-run/records.jsonl`) and finished steps. Outputs in `oh/agentic-run/`:
+  `records.jsonl` (per step tokens, totals, USD, tool and memory calls, answer, anchor-in-tool-result flags), `traces.jsonl` (full traces, raw: not in the default bundle),
+  `samples.jsonl`, `judge-input.jsonl`, `judged.jsonl`, `REPORT-oh-agentic.md`, `metrics-agentic.json`, `summary.json`, `MANIFEST.json`, `scripts/`, `inputs/`.
+- Reading the report: the PRIMARY block (subset b = anchor in the dropped context and not in the summary): `sum+mem - sum` total tokens per question and accuracy, an estimate with
+  a 95% CI over sessions and the MDE from the observed SD. Hallucination is a guard (over all and given answered); `unsupported_no_anchor` is listed apart. No WIN / FAIL.
+- Keys: the run uses `ANTHROPIC_API_KEY` (or the profile's key env), never printed. Nothing here edits your global KB (`default` is only read through the project, never written).
+
 ### 6.0c Amendment C.8 - the memory is the session's own PROJECT (read before `oh-ingest` / `oh-enrich`)
 
 The split-session runs (C.6 arms, C.7 as first shipped) measured the server's session side channel, not the memory (protocol 4a.8). The
@@ -268,7 +305,7 @@ uv run python home_run.py bundle    --resume $CAMP        # 7) send the .tar.gz 
   ingest). Outputs: `oh/ingest-run/`, `oh/probe-run/`, `oh/enrich-run/`; the split path writes `oh/probe-run-split/`, `oh/enrich-run-split/`.
 - The estimate of `oh-ingest` / `oh-enrich --dry-run` includes the ingest wall-clock (pieces x `extract_s_per_piece`, a guess printed with its
   value) and the server-side extraction (extract chunks x the extractor model's price, charged to the run cap as a flagged estimate).
-- Guard: a campaign stamped `2026-10-27.c6` or `2026-10-28.c7` is accepted by these four commands only (code is `2026-10-28.c8`).
+- Guard: a campaign stamped `2026-10-27.c6` or `2026-10-28.c7` is accepted by these four commands (and, with C.9, `2026-10-28.c8` plus `oh-workspaces` / `oh-agentic`); the code is `2026-10-28.c9`.
 
 ### 6.0b Amendment C.7 - the OH result, the mis-specified recall, and the ONE paid command that follows (read before `oh-enrich`)
 
@@ -305,7 +342,7 @@ uv run python home_run.py bundle    --resume $CAMP               # send the .tar
   Parity (realized `nc-enriched / baseline` ask-time memory in [0.80, 1.05]) is checked BEFORE the judge is paid; `--accept-parity-fail`
   overrides (recorded). Flags: `--enrich-queries K` (default 8), `--packer server|legacy` (legacy = packing v2, comparison only),
   `--skip-judge`, `--accept-partial`, `--budgets`.
-- **Guard rules.** The campaign was made under EVAL-VERSION `2026-10-27.c6`; the code is `2026-10-28.c8`. Every paid command still refuses
+- **Guard rules.** The campaign was made under EVAL-VERSION `2026-10-27.c6`; the code is `2026-10-28.c9`. Every paid command still refuses
   such a campaign EXCEPT `oh-probe` / `oh-enrich` (why that is valid: protocol 4a.7, "Reuse rule"). Caps (`[caps]` run / judge / total), the
   per-HARS lock / lease, the dry-run estimate check and the ledger apply as everywhere; the estimate contains NO ingest and NO baseline / note
   summaries. Typical size for 14 sessions / 140 questions: run well under USD 0.1, judge about 140 x USD 0.0034 = USD 0.48.

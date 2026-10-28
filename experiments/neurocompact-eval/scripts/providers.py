@@ -664,6 +664,232 @@ def _chat_send(role, messages, profile, mid, max_tokens, temperature, top_p, bud
                       finish_reason=finish, cost_nocache_usd=nocache, cached=use_cache)
 
 
+# ------------------------------------------------------------ tool-use API (Amendment C.9)
+#
+# One agent STEP = one model call with tools. The history is kept in ONE vendor-neutral shape (the Anthropic
+# content-block shape) and translated per wire:
+#   message   {"role": "user"|"assistant", "content": str | [block, ...]}
+#   block     {"type":"text","text"} | {"type":"tool_use","id","name","input"} |
+#             {"type":"tool_result","tool_use_id","content": str, "is_error"?: bool}
+#   tool      {"name", "description", "input_schema": <JSON schema>}
+# wire "anthropic" = native /v1/messages (profiles whose cache.api is anthropic_messages; prompt caching on the
+# system prompt and on a moving breakpoint at the end of the history), wire "openai" = chat/completions with
+# `tools` (openrouter / custom / gemini-compat). Usage is the provider's NATIVE count in both.
+
+@dataclasses.dataclass
+class ToolChatResult:
+    text: str                       # concatenated text blocks of the assistant turn
+    tool_calls: list                # [{"id", "name", "input"}] in order
+    content: list                   # the assistant turn as canonical blocks (append it to the history as-is)
+    stop_reason: str                # tool_use | end_turn | max_tokens | other
+    usage: dict                     # parse_usage(): prompt_tokens (whole), completion_tokens, cached_tokens, cache_write_tokens
+    cost_usd: float | None
+    cost_source: str
+    model: str
+    profile: str
+    latency_s: float
+    wire: str = "anthropic"
+    cached: bool = False
+    sent_temperature: bool = False
+
+
+def tools_wire(profile: Profile) -> str:
+    return "anthropic" if profile.cache_cfg.get("api") == "anthropic_messages" else "openai"
+
+
+def _with_breakpoint(messages: list, cc: dict) -> list:
+    """Copy of the history with cache_control on the LAST block of the last message (moving breakpoint)."""
+    out = [dict(m) for m in messages]
+    if not out:
+        return out
+    last = out[-1]
+    c = last.get("content")
+    blocks = [{"type": "text", "text": c}] if isinstance(c, str) else [dict(b) for b in (c or [])]
+    if blocks:
+        blocks[-1]["cache_control"] = cc
+    last["content"] = blocks
+    return out
+
+
+def build_tools_request_anthropic(profile: Profile, model: str, system: str, messages: list, tools: list, *,
+                                  max_tokens: int, key: str, temperature=None, tool_choice: dict | None = None,
+                                  cache: bool = True) -> tuple[str, dict, dict]:
+    if not profile.base_url:
+        raise ProviderError(f"profile {profile.name}: no base_url (pass --base-url)")
+    url = profile.base_url.rstrip("/") + "/messages"
+    headers = {"Content-Type": "application/json", "User-Agent": "neurocompact-eval/3.0", "x-api-key": key,
+               "anthropic-version": profile.cache_cfg.get("anthropic_version") or ANTHROPIC_VERSION}
+    cc = profile.cache_control()
+    body: dict = {"model": model, "max_tokens": int(max_tokens),
+                  "messages": _with_breakpoint(messages, cc) if cache else [dict(m) for m in messages],
+                  "tools": [{"name": t["name"], "description": t.get("description", ""),
+                             "input_schema": t["input_schema"]} for t in tools]}
+    if system:
+        blk = {"type": "text", "text": system}
+        if cache:
+            blk["cache_control"] = cc
+        body["system"] = [blk]
+    body.update(profile.sampling_kwargs(model, temperature=temperature))
+    if tool_choice:
+        body["tool_choice"] = tool_choice
+    return url, headers, body
+
+
+def to_openai_messages(system: str, messages: list) -> list:
+    out: list = [{"role": "system", "content": system}] if system else []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append({"role": m["role"], "content": c})
+            continue
+        if m["role"] == "assistant":
+            text = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+            calls = [{"id": b["id"], "type": "function",
+                      "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {})}}
+                     for b in c if b.get("type") == "tool_use"]
+            msg: dict = {"role": "assistant", "content": text or None}
+            if calls:
+                msg["tool_calls"] = calls
+            out.append(msg)
+        else:
+            for b in c:
+                if b.get("type") == "tool_result":
+                    out.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": str(b.get("content", ""))})
+            rest = "".join(b.get("text", "") for b in c if b.get("type") == "text")
+            if rest:
+                out.append({"role": "user", "content": rest})
+    return out
+
+
+def build_tools_request_openai(profile: Profile, model: str, system: str, messages: list, tools: list, *,
+                               max_tokens: int, key: str, temperature=None, tool_choice: dict | None = None
+                               ) -> tuple[str, dict, dict]:
+    url, headers, body = build_request(profile, model, to_openai_messages(system, messages), max_tokens=max_tokens,
+                                       temperature=temperature, key=key)
+    body["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
+                                                        "parameters": t["input_schema"]}} for t in tools]
+    if tool_choice:
+        if tool_choice.get("type") == "tool":
+            body["tool_choice"] = {"type": "function", "function": {"name": tool_choice["name"]}}
+        else:
+            body["tool_choice"] = "auto"
+    return url, headers, body
+
+
+def _parse_tool_args(raw) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        v = json.loads(raw or "{}")
+        return v if isinstance(v, dict) else {"_value": v}
+    except Exception:  # noqa: BLE001
+        return {"_unparsed_arguments": str(raw)[:2000]}
+
+
+def parse_tools_response(raw: dict, wire: str) -> tuple[str, list, list, str]:
+    """(text, tool_calls, canonical content blocks, stop_reason) of one response."""
+    if wire == "anthropic":
+        blocks, calls, texts = [], [], []
+        for b in raw.get("content") or []:
+            if b.get("type") == "text":
+                texts.append(str(b.get("text") or ""))
+                blocks.append({"type": "text", "text": str(b.get("text") or "")})
+            elif b.get("type") == "tool_use":
+                inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                calls.append({"id": b["id"], "name": b["name"], "input": inp})
+                blocks.append({"type": "tool_use", "id": b["id"], "name": b["name"], "input": inp})
+        sr = raw.get("stop_reason")
+        return "".join(texts), calls, blocks, {"tool_use": "tool_use", "end_turn": "end_turn", "stop_sequence": "end_turn",
+                                                "max_tokens": "max_tokens"}.get(sr, "other")
+    ch = (raw.get("choices") or [{}])[0]
+    msg = ch.get("message") or {}
+    text = msg.get("content") or ""
+    blocks = [{"type": "text", "text": text}] if text else []
+    calls = []
+    for i, tc in enumerate(msg.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        c = {"id": tc.get("id") or f"call_{i}", "name": fn.get("name") or "", "input": _parse_tool_args(fn.get("arguments"))}
+        calls.append(c)
+        blocks.append({"type": "tool_use", **c})
+    fr = ch.get("finish_reason")
+    sr = "tool_use" if calls else {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}.get(fr, "other")
+    return text, calls, blocks, sr
+
+
+def chat_tools(role: str, system: str, messages: list, tools: list, *, profile: Profile, models: dict | None = None,
+               model: str | None = None, max_tokens: int = 1024, temperature=None, tool_choice: dict | None = None,
+               budget: Budget | None = None, key_env: str | None = None, environ=None, timeout: float = 180,
+               retries: int = 3, transport=None, sleep=time.sleep, cache: bool | None = None) -> ToolChatResult:
+    """One tool-use step for `role` (see the block comment above). Retries 429/5xx/network, budget-checked before the
+    request (worst case) and charged with the actual cost, cache reads / writes priced separately (Anthropic wire).
+    `temperature` goes on the wire only when the profile's sampling policy allows it (Anthropic 5.x: never)."""
+    if role not in ROLES:
+        raise ProviderError(f"unknown role {role!r}")
+    mid = model or (models or {}).get(role) or profile.default_model(role)
+    if not mid:
+        raise ProviderError(f"no model for role {role!r} in profile {profile.name}")
+    key = resolve_key(profile, key_env, environ)
+    wire = tools_wire(profile)
+    use_cache = wire == "anthropic" and (profile.cache_enabled if cache is None else (bool(cache) and profile.cache_enabled))
+    if wire == "anthropic":
+        url, headers, body = build_tools_request_anthropic(profile, mid, system, messages, tools, max_tokens=max_tokens,
+                                                           key=key, temperature=temperature, tool_choice=tool_choice,
+                                                           cache=use_cache)
+    else:
+        url, headers, body = build_tools_request_openai(profile, mid, system, messages, tools, max_tokens=max_tokens,
+                                                        key=key, temperature=temperature, tool_choice=tool_choice)
+    reserved = 0.0
+    if budget is not None:
+        budget.check()
+        pt = int(math.ceil(len(json.dumps(body, ensure_ascii=False)) / PROMPT_CHARS_PER_TOKEN_WORST))
+        worst = profile.cost_usd(mid, pt, int(max_tokens))
+        if worst is not None and use_cache:
+            worst = max(worst, profile.cost_usd(mid, 0, int(max_tokens), cache_write=pt,
+                                                cache_ttl=str(profile.cache_cfg.get("ttl") or "5m")) or 0.0)
+        reserved = budget.reserve(worst)
+    try:
+        send = transport or _urlopen_transport
+        t0 = time.time()
+        attempt, last = -1, ""
+        while True:
+            attempt += 1
+            req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+            try:
+                status, raw = send(req, timeout)
+            except Exception as e:  # noqa: BLE001
+                status, raw = 0, {"error": {"message": type(e).__name__}}
+            if status == 200:
+                break
+            last = f"HTTP {status}: {str((raw.get('error') or {}).get('message') or raw)[:200]}"
+            if status not in (0, 408, 429, 500, 502, 503, 504) or attempt >= retries - 1:
+                raise ProviderError(f"{profile.name}/{mid}: {last}")
+            sleep(min(30, 4 * (attempt + 1)))
+        text, calls, blocks, stop = parse_tools_response(raw, wire)
+        u = parse_usage(raw)
+        cached, written = u["cached_tokens"], u.get("cache_write_tokens", 0)
+        ttl = str(profile.cache_cfg.get("ttl") or "5m")
+        cost, src = None, "none"
+        if u["reported_cost"] is not None:
+            cost, src = float(u["reported_cost"]), "reported"
+        else:
+            c = profile.cost_usd(mid, max(0, u["prompt_tokens"] - cached - written), u["completion_tokens"],
+                                 cache_read=cached, cache_write=written, cache_ttl=ttl)
+            if c is not None:
+                cost, src = c, "table"
+        if budget is not None:
+            if cost is None:
+                budget.charge(None)
+                raise UnpricedModel(f"{profile.name}/{mid} has no price entry and the provider reported no cost: "
+                                    "cannot enforce --budget-usd")
+            budget.charge(cost)
+        return ToolChatResult(text=text, tool_calls=calls, content=blocks, stop_reason=stop, usage=u, cost_usd=cost,
+                              cost_source=src, model=mid, profile=profile.name, latency_s=time.time() - t0, wire=wire,
+                              cached=use_cache, sent_temperature="temperature" in body)
+    finally:
+        if budget is not None:
+            budget.release(reserved)
+
+
 # -------------------------------------------------------------------- pi side
 
 def pi_flags(profile: Profile, model: str) -> list[str]:

@@ -899,6 +899,86 @@ with ONE exception, for `oh-provision` / `oh-ingest` / `oh-probe` / `oh-enrich` 
 (`REUSE_COMPATIBLE_FROM`). No hypothesis, threshold, budget, formula or judge of C.7-3 changes; `oh-ingest` spends only the flagged estimate of the
 server-side extraction, `oh-probe` cents, and the probe must precede `oh-enrich` as before.
 
+### 4a.9 PROTOCOL AMENDMENT C.9 (2026-10-28, written BEFORE any agentic record exists; the PRIMARY question and design)
+
+Provenance: the owner's own question, 2026-10-28: *does our memory give a gain when used locally for a session - does the agent spend
+MORE tokens finding the needed information WITHOUT memory than when it fetches facts from memory?* Neither arm ever sees the previous
+session's transcript. The C.7 / C.8 fixed-budget single-shot arms (`nc-enriched` vs `baseline` vs `nc-note-only`, one call with memory in
+the prompt) measure the fidelity of a memory block at a fixed budget; they do not measure what the owner asks (effort to find a fact), so
+they become SECONDARY. Nothing below changes a C.6 record, the judge model, the summariser, the ingest or the C.8 projects; it reuses them.
+
+**C.9-1. Design.** For each question of the finished OH campaign (14 SWE-bench sessions, 140 questions: answerable and unanswerable,
+end-of-session checkpoint) an agent works in a tool loop until it answers (`run_agentic.py`):
+
+- `sum`: the full baseline summary (the C.6 `baseline` rows' `memory_text`, byte for byte, sha256 recorded) + workspace tools;
+- `sum+mem`: the SAME summary + workspace tools + `memory_recall`. The agent writes query, `ll_keywords`, `hl_keywords` itself; the call goes to
+  HARS with `project = nc-<run>-<sid>` (the C.8 project), mode hybrid, the server-default `top_k`, `max_chars` = 6000 (fixed), no `session_id`
+  (the `recall_args_correct` shape minus `session_id`); the tool returns HARS's `context` as-is, graph sections included;
+- `note+mem` (OPTIONAL, `--arms`, off by default): the short C.6 note (`nc-note-only` `memory_text`) + workspace tools + `memory_recall`. Run it only if
+  `sum+mem` shows a gain over `sum`.
+Workspace tools, restricted to the session's workspace dir (realpath-checked, symlinks never followed out): `ls`, `read_file(path, start, end)`
+(<= 250 lines and <= 6000 chars per call), `grep(pattern, path)` (ripgrep, <= 15 matches per file, <= 120 lines, <= 6000 chars), and the final `answer(text)`
+(the agent may say it does not know). The summary sits in the system prompt, so the static prefix (tools + system + summary) is prompt-cached; a
+moving cache breakpoint at the end of the history caches the earlier steps. Cache reads are priced separately and reported separately. Settings:
+agent model = the profile's agent (haiku-5-5), at most 12 steps (the LAST step forces the `answer` tool, `tool_choice`), per-question token cap
+400 000 (a runaway guard: a question that hits it is `no_answer`), `temperature 0` where the profile allows it (Anthropic 5.x: omitted, as everywhere),
+the tool-use call is vendor-neutral (`providers.chat_tools`: Anthropic `/v1/messages` and OpenAI-compatible `tools`).
+Questions of a session run sequentially, arms alternate their order by question parity, so cache warmth is not an arm effect.
+
+**C.9-2. The workspace, and what it cannot be (stated).** The OH import keeps `instance_id` and `repo` of each session (`sessions/<id>.json`) but
+NEITHER `base_commit` NOR the model's final patch (verified in `import_openhands.py` / `select_openhands.py`). `home_run.py oh-workspaces` therefore builds the
+repository at `base_commit` (from `--instances FILE`, or at home from the public SWE-bench Verified dataset, `base_commit` only) and applies the session's
+FINAL PATCH only when `--instances` supplies `model_patch`; the dataset's gold patch is never used. Without a patch (the default with the OH data as
+shipped) the workspace is `base_commit` only and `oh-workspaces` says so. Consequence, a real limit: the session's own edits are not in the workspace, so
+a question about what the session changed is answerable from the summary or from memory only, which favours `sum+mem` on exactly those questions. `.git`
+is removed (the upstream fix lives in later commits). The transcript is never in the workspace: a leak scan (80-char heads of up to 60 transcript
+messages, searched in every workspace file) runs before every session and stops the run on a hit; the workspace may not overlap the campaign or the
+session data; a test plants a leak to prove the scan fires.
+
+**C.9-3. Recorded per question per arm** (`records.jsonl`; full traces in `traces.jsonl`): every step's uncached-input / cache-read / cache-write /
+output tokens (the API's native counts), `tokens_total` = all input incl. cache reads + output (the PRIMARY token measure), `tokens_fresh` = everything
+except cache reads, USD, number and type of tool calls, the memory calls (query, keywords, returned chars, `graph_branch`), the final answer, steps,
+wall-clock, and whether the gold anchor appeared in a tool result, separately for workspace and memory results.
+
+**C.9-4. Outcome taxonomy and hallucination (methodology review of the C.6 bundle).** In the C.6 judged rows `abstained`, `hallucination` and the pass
+score overlap (baseline answerable: 17 rows abstained AND passed, 12 abstained AND hallucinated). The agentic metrics use ONE mutually exclusive outcome per
+answer, decided by the judge with an explicit precedence (a new field `outcome` in the judge schema, `judge_v2.py --outcome`; the default prompt and every
+older judge file are unchanged): 1. `correct` - the answer states the recorded fact (a hedge does not change this); 2. `partial` - part of the fact, no false
+specific; 3. `wrong` - asserts a false, contradicted, fabricated or different specific (= hallucination), even with a hedge; 4. `abstained` - declines and asserts
+nothing relevant. Items with no recorded fact: a clear refusal is `abstained` (the right behaviour), an asserted specific is `wrong`. A hedged answer that states
+the gold fact is correct or partial, never abstained. A run that produced no answer (token cap) is `no_answer`. If a judged row lacks `outcome` the metrics derive it with the same precedence from
+the legacy fields and mark it `derived` (the count is printed). Hallucination is reported BOTH over all questions and conditional on answered
+(wrong / (correct + partial + wrong)); it is a GUARD, not an endpoint: the decision does not reward silence. The mechanical rule `unsupported_no_anchor`
+(judge_v2 post-pass) is reported separately and never counted as hallucination in the guard.
+
+**C.9-5. One anchor matcher; subsets.** `anchors.anchor_found` (token-bounded, case-insensitive, identical to `judge_v2.anchor_re`, pinned by a test) is the only
+anchor matcher of the track: tool results (workspace vs memory), the summary, the dropped context, the answer. (The C.6/C.7 funnel used different matchers over
+different corpora: BM25 found the anchor in 61% of rows where `anchor_in_dropped_context` is 50%; nothing here uses that code.) Everything is reported on
+(a) all questions and (b) the MEMORY-RELEVANT subset = anchor present in the dropped context (messages before the last boundary) and NOT in the summary.
+**The primary analysis is (b).** Unanswerable probes are trivial (100% refusal in every arm so far): kept as a guard only; harder near-miss unanswerables (a plausible
+but never-recorded detail close to a recorded one) are future work.
+
+**C.9-6. Endpoints and statistics.** PRIMARY contrasts, `sum+mem - sum`, paired by question, on subset (b): (1) total tokens per question; (2) accuracy
+(outcome `correct` over answerable questions). Secondary: tokens on the subset where BOTH arms are correct, fresh tokens, USD per question, USD and tokens per correct
+answer, steps, tool calls, accuracy counting partial, the same for subset (a), and `note+mem` contrasts if that arm ran. Inference: cluster bootstrap over SESSIONS
+(`metrics_v2.resample_indices`, 10 000 resamples, seed 1337), Wilcoxon over per-session means as a cross-check. **No WIN / FAIL threshold is applied**: n = 14 sessions
+cannot reach the C-family thresholds by design, so the verdict is an estimate with its 95% CI, read as 'not distinguishable from zero at this n' when the CI contains zero.
+**Power.** The primary endpoint is continuous and paired. The minimal detectable effect (80% power, alpha .05) is MDE = 2.8 x SD / sqrt(n_sessions), with SD the SD of the
+per-session mean paired differences. Before the run, `oh-agentic --dry-run` prints a guess assuming SD = 50% of the mean tokens per question (about 37% of the mean at
+n = 14: a guess, labelled as such); after the run `metrics_agentic.py` prints the MDE from the OBSERVED paired SD (and the optimistic question-level bound).
+
+**C.9-7. Cost and time** (offline model, `oh-agentic --dry-run`; stated assumptions: 8 steps per question, 150 output tokens per step, 1200 tokens per workspace
+result, 600 tokens of tool schemas, 330 of system prompt, a 1500-token summary; step k re-sends the whole history, cache reads cover the history of step k-1):
+14 sessions x 10 questions x 2 arms = 280 agent runs, about USD 0.65 with cache / 1.86 without, upper bound (every question runs 12 steps, no cache) about USD 2.8; judge
+280 items about USD 1.2; about 61 000 tokens per question including cache reads. These are estimates; the first live run replaces them.
+
+**C.9-8. Guard, validity, limits.** EVAL-VERSION `2026-10-28.c9`. `oh-workspaces` / `oh-agentic` accept a campaign stamped `2026-10-27.c6`, `2026-10-28.c7` or
+`2026-10-28.c8` (`REUSE_COMPATIBLE_FROM`; the campaign's stamp is not rewritten, the reuse is recorded under `c7_reuse`), nothing older. `oh-agentic` requires `oh-ingest`
+done (C.8 project layout), the workspaces, the same judge model as the C.6 campaign (else refused), the caps and the per-HARS lock. The judge is blind to the arm (the tool
+name `memory_recall` in an answer is masked like the other arm strings). Limits, stated: one realisation of a stochastic agent per (question, arm) (haiku at provider default
+sampling); the retrieval is not deterministic across calls; the agent chooses its own keywords, so the result measures memory + the agent's use of it; without the final patch
+the workspace lacks the session's edits (C.9-2); wall-clock per step is not controlled; the memory is the C.8 ingest as realised once.
+
 ## 5. Measurement stack
 
 **Recall packer v2** (run_chainreplay.py, frozen after the gate-212839 offline eval):
