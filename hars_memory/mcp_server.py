@@ -3516,7 +3516,7 @@ def _lean_recall_response(
     kept_fields = {
         "ok", "error", "answer", "mode", "lightrag_mode", "mode_fallback", "graph_branch", "top_k",
         "fetch_top_k", "fetch_top_k_source", "question", "last_ingest", "stale_days",
-        "staleness_warning", "session", "session_id", "error_kind", "session_graph",
+        "staleness_warning", "session", "session_id", "error_kind", "session_graph", "context_cap",
     }
     if not include_answer:
         kept_fields.discard("answer")
@@ -4446,6 +4446,160 @@ def _merge_context_with_fusion(
 
 
 # ---------------------------------------------------------------------------
+# Hard TOTAL cap (memory_recall `max_chars`)
+#
+# The chunk assembly above budgets only the CONTENT of the Document Chunks
+# section; the entity / relation sections of the LightRAG context, the session
+# graph splice, the JSON envelope, the reference list and the section headers
+# were never counted, and the lightrag / merged-not-applied paths returned the
+# context unbounded. When the caller passes `max_chars` (> 0) the RENDERED
+# `context` string must be <= max_chars on EVERY path, so a final pass trims it.
+#
+# Material is cut lowest priority first, always from the tail of its section
+# (every section is already ordered best-first; the session-graph splice puts
+# its lines at the head of the KG sections, so they are cut last within them):
+#   1. relation lines (a section that becomes empty is removed with its header)
+#   2. entity lines (same)
+#   3. document chunks, last (lowest score / rank) first, with their reference
+#      lines; the best chunk is never dropped
+#   4. the best chunk's content, cut at a line boundary with the usual marker
+#   5. last resort (only a budget smaller than the best chunk's envelope): a hard
+#      cut of the string
+# Without `max_chars` (or with 0) nothing here runs and the context is
+# byte-identical to before.
+# ---------------------------------------------------------------------------
+_CONTEXT_CAP_FENCE_CLOSE = "\n```"
+
+
+def _cap_locate_section(ctx: str, header: str) -> tuple[int, int, int, int] | None:
+    """(header_start, content_start, content_end, section_end) of the fenced block
+    after `header`. The closing fence is the one at the START OF A LINE, so a
+    ``` inside a JSON-escaped chunk line cannot end the block early."""
+    h = ctx.find(header)
+    if h == -1:
+        return None
+    fence = ctx.find("```", h)
+    if fence == -1:
+        return None
+    nl = ctx.find("\n", fence)
+    if nl == -1:
+        return None
+    close = ctx.find(_CONTEXT_CAP_FENCE_CLOSE, nl)
+    if close == -1:
+        return None
+    content_start = nl + 1
+    content_end = close if close >= content_start else content_start
+    end = close + len(_CONTEXT_CAP_FENCE_CLOSE)
+    while end < len(ctx) and ctx[end] == "\n":
+        end += 1
+    return h, content_start, content_end, end
+
+
+def _cap_section_lines(ctx: str, header: str) -> list[str] | None:
+    loc = _cap_locate_section(ctx, header)
+    if loc is None:
+        return None
+    _, cs, ce, _ = loc
+    return [ln for ln in ctx[cs:ce].split("\n") if ln.strip()]
+
+
+def _cap_set_section_lines(ctx: str, header: str, lines: list[str]) -> str:
+    """Rewrite a section's lines in place; an empty list removes the whole section."""
+    loc = _cap_locate_section(ctx, header)
+    if loc is None:
+        return ctx
+    h, cs, ce, end = loc
+    if not lines:
+        return ctx[:h] + ctx[end:]
+    return ctx[:cs] + "\n".join(lines) + ctx[ce:]
+
+
+def _cap_drop_tail_lines(ctx: str, header: str, max_chars: int) -> tuple[str, int]:
+    """Drop lines from the tail of one KG section until `ctx` fits or the section is gone."""
+    lines = _cap_section_lines(ctx, header)
+    if not lines:
+        if lines is not None:                       # an empty block: remove the bare header
+            ctx = _cap_set_section_lines(ctx, header, [])
+        return ctx, 0
+    dropped = 0
+    while lines and len(ctx) > max_chars:
+        excess = len(ctx) - max_chars
+        saved = 0
+        while lines and saved < excess:
+            saved += len(lines.pop()) + 1
+            dropped += 1
+        ctx = _cap_set_section_lines(ctx, header, lines)
+    return ctx, dropped
+
+
+def _cap_reference_id(line: str) -> str:
+    try:
+        obj = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    return str(obj.get("reference_id", "")) if isinstance(obj, dict) else ""
+
+
+def _cap_context_total(context: str, max_chars: int) -> tuple[str, dict[str, Any]]:
+    """Bound the TOTAL rendered `context` to <= max_chars (see the section comment).
+
+    Returns (context, report). The report is the response's `context_cap` field:
+    what was cut, so a caller sees that the budget bit and where."""
+    cut = {"relation_lines": 0, "entity_lines": 0, "chunks": 0, "references": 0,
+           "best_chunk_trimmed": False, "hard_cut": False}
+    report: dict[str, Any] = {"max_chars": max_chars, "chars_before": len(context), "chars_after": len(context),
+                              "applied": False, "cut": cut}
+    if max_chars <= 0 or len(context) <= max_chars:
+        return context, report
+    ctx = context
+    ctx, cut["relation_lines"] = _cap_drop_tail_lines(ctx, _CONTEXT_RELATION_SECTION_HEADER, max_chars)
+    if len(ctx) > max_chars:
+        ctx, cut["entity_lines"] = _cap_drop_tail_lines(ctx, _CONTEXT_ENTITY_SECTION_HEADER, max_chars)
+    if len(ctx) > max_chars:
+        chunk_lines = _cap_section_lines(ctx, _CONTEXT_CHUNK_SECTION_HEADER)
+        ref_lines = _cap_section_lines(ctx, _CONTEXT_REFERENCE_SECTION_HEADER)
+        if chunk_lines:
+            has_refs = ref_lines is not None
+            ref_lines = ref_lines or []
+            n_ref0 = len(ref_lines)
+            while len(chunk_lines) > 1 and len(ctx) > max_chars:
+                gone_id = _cap_reference_id(chunk_lines.pop())
+                cut["chunks"] += 1
+                if gone_id and not any(_cap_reference_id(c) == gone_id for c in chunk_lines):
+                    ref_lines = [r for r in ref_lines if not r.startswith(f"[{gone_id}]")]
+                ctx = _cap_set_section_lines(ctx, _CONTEXT_CHUNK_SECTION_HEADER, chunk_lines)
+                if has_refs and ref_lines:
+                    ctx = _cap_set_section_lines(ctx, _CONTEXT_REFERENCE_SECTION_HEADER, ref_lines)
+            cut["references"] = n_ref0 - len(ref_lines)
+            if len(ctx) > max_chars and len(chunk_lines) == 1:
+                try:
+                    obj = json.loads(chunk_lines[0])
+                except (TypeError, json.JSONDecodeError):
+                    obj = None
+                if isinstance(obj, dict) and isinstance(obj.get("content"), str):
+                    orig = obj["content"]
+                    keep = len(orig)
+                    for _ in range(12):
+                        excess = len(ctx) - max_chars
+                        if excess <= 0:
+                            break
+                        keep -= excess + 4                # JSON escaping can cost more than raw chars: the loop corrects
+                        if keep <= len(CONTEXT_TRUNCATION_MARKER):
+                            break
+                        obj["content"] = _truncate_on_line_boundary(orig, keep)
+                        ctx = _cap_set_section_lines(
+                            ctx, _CONTEXT_CHUNK_SECTION_HEADER, [json.dumps(obj, ensure_ascii=False)]
+                        )
+                        cut["best_chunk_trimmed"] = True
+    if len(ctx) > max_chars:                         # only a budget below the best chunk's own envelope gets here
+        cut["hard_cut"] = True
+        mk = CONTEXT_TRUNCATION_MARKER
+        ctx = (ctx[: max_chars - len(mk)] + mk) if max_chars > 2 * len(mk) else ctx[:max_chars]
+    report.update({"applied": True, "chars_after": len(ctx)})
+    return ctx, report
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -4588,7 +4742,12 @@ async def list_tools() -> list[Tool]:
                         "HARS_MEMORY_CONTEXT_MAX_DOC_CHARS chars (default 6000, line-boundary "
                         "truncation with a '…[truncated]' marker). "
                         "Omit to use the server default (HARS_MEMORY_CONTEXT_MAX_CHARS, default 15000 — "
-                        "the documented consumer window); pass 0 to disable the total cap."
+                        "the documented consumer window); pass 0 to disable the total cap. "
+                        "A positive value is also a HARD cap on the whole rendered `context` string on every "
+                        "path (entity / relation sections, session-graph lines, JSON envelope, reference "
+                        "list and headers included): relation lines are cut first, then entity lines, then "
+                        "the lowest-ranked chunks, then the best chunk's tail; the response carries "
+                        "`context_cap` (chars before / after and what was cut)."
                     ),
                 },
                 "context_priority": {
@@ -5496,6 +5655,19 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
                             sg_entity_lines,
                             sg_relation_lines,
                         )
+                    # Hard TOTAL cap: every path above (lightrag, merged, merged-not-
+                    # applied, fusion-only, the session-graph splice) ends here, so
+                    # `max_chars` bounds the whole rendered context. Not set (or 0):
+                    # untouched, byte-identical to before.
+                    context_cap_report: dict[str, Any] | None = None
+                    if max_chars_arg:
+                        if isinstance(context_for_response, str):
+                            context_for_response, context_cap_report = _cap_context_total(
+                                context_for_response, max_chars_arg
+                            )
+                        else:
+                            context_cap_report = {"max_chars": max_chars_arg, "applied": False,
+                                                  "reason": "context is not a string"}
                     has_context = bool(
                         context_for_response and str(context_for_response).strip()
                     )
@@ -5626,6 +5798,8 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
                         "hybrid": hybrid_block,
                         **staleness_fields,
                     }
+                    if context_cap_report is not None:
+                        response["context_cap"] = context_cap_report
                     if session_block is not None:
                         response["session_id"] = session_id_arg
                         response["session"] = session_block
@@ -6525,7 +6699,18 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
                 logger.info("Purging stale chunks for modified doc %s before upsert", doc.doc_id)
                 await rag.adelete_by_doc_id(doc.doc_id)
 
-            await _insert_all_batches(rag, [doc], batch_size=1)
+            # Extractor LLM cost of THIS insert (calls, prompt / completion tokens from the provider's
+            # `usage`; an estimate is flagged). A context variable scopes it to this call, so concurrent
+            # upserts do not mix; `process_delta` (the process-global counter over the same window) is the
+            # cross-check and also includes any concurrent insert.
+            from hars_memory.server import lightrag_init as _li
+
+            _proc0 = dict(_li.LLM_USAGE)
+            with _li.track_extract_usage() as _extract_usage:
+                await _insert_all_batches(rag, [doc], batch_size=1)
+            extract_usage = _extract_usage.to_dict()
+            extract_usage["scope"] = "this_call"
+            extract_usage["process_delta"] = {k: _li.LLM_USAGE[k] - _proc0[k] for k in _proc0}
 
             # Record the fingerprint only once THIS index really processed the document. LightRAG's
             # ainsert can return with the document merely enqueued (pipeline busy) or failed; a fingerprint
@@ -6539,6 +6724,7 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
                              "the fingerprint was not recorded, so a retry re-runs the extraction",
                     "doc_id": doc.doc_id,
                     "file_path": str(path),
+                    "extract_usage": extract_usage,
                 })
 
             store.set(doc.doc_id, current_fp)
@@ -6563,6 +6749,7 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
                 "doc_id": doc.doc_id,
                 "file_path": str(path),
                 "fingerprint": current_fp,
+                "extract_usage": extract_usage,
             })
 
         # ------------------------------------------------------------------ #
