@@ -7,10 +7,11 @@ What the OH data holds (verified in import_openhands.py / select_openhands.py): 
 `instance_id` and `repo` (and the capped events); it keeps NEITHER `base_commit` NOR the model's final patch. So:
   * base_commit  comes from `--instances FILE` (jsonl/json: instance_id, base_commit[, model_patch]) or, at home, from the
                  public SWE-bench Verified dataset (HF datasets-server, `base_commit` field only);
-  * final patch  is applied ONLY when `--instances` / `--patches` supplies `model_patch` for the instance (e.g. the
-                 trajectory submission's preds). The dataset's gold `patch` is NEVER used (it is the upstream fix, not the
-                 session's work). Without a patch the workspace is base_commit only and the meta says so
-                 (`workspace_kind: "base_commit"`), loudly.
+  * final patch  is the session's own submitted patch: `model_patch` from `--instances` if given, otherwise fetched
+                 from the SAME public submission the trajectories come from
+                 (`<submission>/logs/<instance_id>/patch.diff`, see SUBMISSION_PREFIX). The dataset's gold `patch` is
+                 NEVER used (it is the upstream fix, not the session's work). Without a patch the workspace is
+                 base_commit only and the meta says so (`workspace_kind: "base_commit"`), loudly.
 Provisioning needs network (git clone of github.com/<repo>, dataset lookup) - at home. Tests use a local fixture repo through
 `clone_url_template`. Output: <dest>/<sid>/repo/ (the workspace the agent sees) + <dest>/<sid>.json (meta, NOT inside it).
 """
@@ -31,6 +32,9 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 CLONE_URL = "https://github.com/{repo}.git"
+S3_HOST = "https://swe-bench-submissions.s3.amazonaws.com"
+# the submission whose trajs/ select_openhands.py imports; its logs/<iid>/patch.diff is the session's final patch
+SUBMISSION_PREFIX = "verified/20250524_openhands_claude_4_sonnet/"
 HF_ROWS = ("https://datasets-server.huggingface.co/filter?dataset=princeton-nlp/SWE-bench_Verified&config=default&split=test"
            "&where={where}&offset=0&length=1")
 
@@ -87,6 +91,19 @@ def fetch_base_commit(instance_id: str, fetch=None) -> str | None:
         return None
 
 
+def fetch_submission_patch(instance_id: str, fetch_text=None, prefix: str = SUBMISSION_PREFIX) -> str | None:
+    """The session's final patch as submitted for evaluation (network; `fetch_text(url) -> str` injectable).
+    None when missing or not a diff."""
+    if fetch_text is None and os.environ.get("NC_OFFLINE") == "1":       # hermetic tests: never touch the network
+        return None
+    url = f"{S3_HOST}/{prefix}logs/{urllib.parse.quote(instance_id)}/patch.diff"
+    try:
+        t = fetch_text(url) if fetch_text else urllib.request.urlopen(url, timeout=60).read().decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return None
+    return t if t and t.lstrip().startswith("diff --git") else None
+
+
 def run_git(args: list[str], cwd: str | None = None, stdin: str | None = None, timeout: int = 1800) -> str:
     p = subprocess.run(["git", *args], cwd=cwd, input=stdin, capture_output=True, text=True, timeout=timeout)
     if p.returncode != 0:
@@ -140,7 +157,8 @@ def build_workspace(sid: str, info: dict, base_commit: str, patch: str | None, c
 
 
 def provision(chains: list[dict], oh_dir: str, cache_dir: str, dest: str, instances: dict | None = None,
-              url_template: str = CLONE_URL, git=run_git, fetch=None, only: list[str] | None = None) -> dict:
+              url_template: str = CLONE_URL, git=run_git, fetch=None, only: list[str] | None = None,
+              fetch_text=None, fetch_patches: bool = True) -> dict:
     """Workspaces for every chain/eval session. Returns {"workspaces": {sid: meta}, "errors": {sid: msg}}."""
     instances = instances or {}
     infos = session_infos(oh_dir, chains)
@@ -163,7 +181,8 @@ def provision(chains: list[dict], oh_dir: str, cache_dir: str, dest: str, instan
             commit = row.get("base_commit") or fetch_base_commit(iid, fetch)
             if not commit:
                 raise RuntimeError(f"no base_commit for {iid} (pass --instances with base_commit, or allow the dataset lookup)")
-            res[cid] = build_workspace(cid, info, commit, row.get("model_patch") or None, cache_dir, dest, url_template, git)
+            patch = row.get("model_patch") or (fetch_submission_patch(iid, fetch_text) if fetch_patches else None)
+            res[cid] = build_workspace(cid, info, commit, patch, cache_dir, dest, url_template, git)
         except Exception as e:  # noqa: BLE001
             errs[cid] = f"{type(e).__name__}: {str(e)[:300]}"
     summary = {"workspaces": res, "errors": errs, "kinds": {k: sum(1 for m in res.values() if m["workspace_kind"] == k)
@@ -180,9 +199,11 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--instances", default=None)
     ap.add_argument("--clone-url", default=CLONE_URL)
+    ap.add_argument("--no-fetch-patches", action="store_true", help="do not fetch the submission's patch.diff")
     a = ap.parse_args(argv)
     chains = read_any(a.chains)
-    s = provision(chains, a.oh_dir, a.cache_dir, a.out, load_instances(a.instances), a.clone_url)
+    s = provision(chains, a.oh_dir, a.cache_dir, a.out, load_instances(a.instances), a.clone_url,
+                  fetch_patches=not a.no_fetch_patches)
     print(json.dumps({"kinds": s["kinds"], "errors": s["errors"]}, indent=1))
     return 1 if s["errors"] else 0
 

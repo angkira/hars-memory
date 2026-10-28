@@ -3017,7 +3017,7 @@ def cmd_oh_workspaces(camp: Campaign, args) -> int:
         row = instances.get(info.get("instance_id") or "", {})
         print(f"  {cid}: instance {info.get('instance_id') or row.get('instance_id') or '?'} repo {info.get('repo') or row.get('repo') or '?'}"
               f"  base_commit {'given' if row.get('base_commit') else 'from the SWE-bench Verified dataset'}"
-              f"  final patch {'given' if row.get('model_patch') else 'NOT available'}")
+              f"  final patch {'given' if row.get('model_patch') else 'from the submission (' + OW.SUBMISSION_PREFIX + 'logs/<iid>/patch.diff)'}")
     if args.dry_run:
         return 0
     summ = OW.provision(chains, oh_dir, cache, dest, instances, getattr(args, "clone_url", None) or OW.CLONE_URL)
@@ -3031,7 +3031,8 @@ def cmd_oh_workspaces(camp: Campaign, args) -> int:
     print(f"\n[oh-workspaces] {len(summ['workspaces'])} workspace(s): {kinds}")
     if "base_commit+final_patch" not in kinds or kinds.get("base_commit"):
         print("  NOTE: workspace = base_commit WITHOUT the session's final patch for "
-              f"{kinds.get('base_commit', 0)} session(s) (the OH data does not hold it; pass --instances with model_patch). "
+              f"{kinds.get('base_commit', 0)} session(s) (the submission's patch.diff was missing or did not apply; pass "
+              "--instances with model_patch). "
               "The agent then cannot find the session's edits in the workspace; REPORT-PROTOCOL.md C.9 states this limit.")
     print(f"  next: home_run.py oh-agentic --dry-run --resume {os.path.basename(camp.path)}")
     return 0

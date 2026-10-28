@@ -18,6 +18,7 @@ import types
 
 import pytest
 
+os.environ["NC_OFFLINE"] = "1"          # no network from tests (e.g. the submission patch fetch)
 _FAKE = os.environ.get("NC_TEST_TOKENIZER", "") == "fake-tiktoken"
 
 if _FAKE:

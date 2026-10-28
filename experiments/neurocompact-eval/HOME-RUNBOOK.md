@@ -255,8 +255,8 @@ Exact sequence after `oh-ingest` (the server from 6.0c keeps running; `CAMP` = t
 cd experiments/neurocompact-eval/scripts
 CAMP=<the finished oh campaign>
 # 1) workspaces (NETWORK; spends nothing): clones github.com/<repo> into a cache, checks out base_commit, deletes .git. The OH data has neither
-#    base_commit nor the final patch: base_commit comes from the SWE-bench Verified dataset; to apply each session's FINAL patch pass --instances FILE
-#    (jsonl/json rows {instance_id, base_commit[, model_patch]}). Without it the workspace is base_commit only and the command says so.
+#    base_commit nor the final patch: base_commit comes from the SWE-bench Verified dataset; each session's FINAL patch is fetched from the same
+#    submission (logs/<instance_id>/patch.diff) unless --instances FILE supplies model_patch. A missing/unapplicable patch is reported loudly.
 uv run python home_run.py oh-workspaces --resume $CAMP --dry-run                 # the plan: instance, repo, base_commit source, patch yes/no
 uv run python home_run.py oh-workspaces --resume $CAMP [--instances FILE] [--cache-dir DIR]   # default cache ~/.cache/nc-eval/workspaces
 # 2) the cost estimate (zero spend): the steps x tokens model with its assumptions, the cache / no-cache run cost, the judge, the pre-run power guess

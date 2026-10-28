@@ -928,9 +928,11 @@ Questions of a session run sequentially, arms alternate their order by question 
 **C.9-2. The workspace, and what it cannot be (stated).** The OH import keeps `instance_id` and `repo` of each session (`sessions/<id>.json`) but
 NEITHER `base_commit` NOR the model's final patch (verified in `import_openhands.py` / `select_openhands.py`). `home_run.py oh-workspaces` therefore builds the
 repository at `base_commit` (from `--instances FILE`, or at home from the public SWE-bench Verified dataset, `base_commit` only) and applies the session's
-FINAL PATCH only when `--instances` supplies `model_patch`; the dataset's gold patch is never used. Without a patch (the default with the OH data as
-shipped) the workspace is `base_commit` only and `oh-workspaces` says so. Consequence, a real limit: the session's own edits are not in the workspace, so
-a question about what the session changed is answerable from the summary or from memory only, which favours `sum+mem` on exactly those questions. `.git`
+session's FINAL PATCH: `model_patch` from `--instances` if given, otherwise the patch the same submission sent for evaluation
+(`verified/20250524_openhands_claude_4_sonnet/logs/<instance_id>/patch.diff` in the public bucket the trajectories come from; checked live to be a
+`diff --git` patch, 2026-10-28). The dataset's gold patch is never used. Without a patch (missing or not applying) the workspace is `base_commit` only,
+`oh-workspaces` says so and the meta records `workspace_kind`; then the session's own edits are not in the workspace, which favours `sum+mem` on
+questions about what the session changed, so such sessions are reported separately. `.git`
 is removed (the upstream fix lives in later commits). The transcript is never in the workspace: a leak scan (80-char heads of up to 60 transcript
 messages, searched in every workspace file) runs before every session and stops the run on a hit; the workspace may not overlap the campaign or the
 session data; a test plants a leak to prove the scan fires.

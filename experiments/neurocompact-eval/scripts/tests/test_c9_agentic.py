@@ -727,7 +727,8 @@ class Workspaces(unittest.TestCase):
         self.d.cleanup()
 
     def build(self, inst):
-        return OW.provision(self.chains, self.oh, os.path.join(self.d.name, "cache"), os.path.join(self.d.name, "out"), inst, self.tmpl)
+        return OW.provision(self.chains, self.oh, os.path.join(self.d.name, "cache"), os.path.join(self.d.name, "out"), inst, self.tmpl,
+                            fetch_patches=False)
 
     def test_base_commit_only_without_a_patch_and_no_history_or_upstream_fix(self):
         s = self.build({"acme__widget-1": {"instance_id": "acme__widget-1", "base_commit": self.base}})
@@ -760,7 +761,8 @@ class Workspaces(unittest.TestCase):
         s = self.build({})
         self.assertIn("chain_s0_c0", s["errors"])                                   # no base_commit and no network (fetch fails)
         os.remove(os.path.join(self.oh, "sessions", "sess0.json"))
-        s = OW.provision(self.chains, self.oh, os.path.join(self.d.name, "c2"), os.path.join(self.d.name, "o2"), {}, self.tmpl)
+        s = OW.provision(self.chains, self.oh, os.path.join(self.d.name, "c2"), os.path.join(self.d.name, "o2"), {}, self.tmpl,
+                         fetch_patches=False)
         self.assertIn("instance_id", s["errors"]["chain_s0_c0"])
 
     def test_dataset_lookup_is_injectable_and_reads_only_base_commit(self):
@@ -769,10 +771,35 @@ class Workspaces(unittest.TestCase):
         def fetch(url):
             seen.append(url)
             return {"rows": [{"row": {"base_commit": self.base, "patch": "THE GOLD PATCH MUST NEVER BE USED"}}]}
-        s = OW.provision(self.chains, self.oh, os.path.join(self.d.name, "c3"), os.path.join(self.d.name, "o3"), {}, self.tmpl, fetch=fetch)
+        s = OW.provision(self.chains, self.oh, os.path.join(self.d.name, "c3"), os.path.join(self.d.name, "o3"), {}, self.tmpl, fetch=fetch,
+                         fetch_patches=False)
         self.assertEqual(s["errors"], {})
         self.assertEqual(s["workspaces"]["chain_s0_c0"]["workspace_kind"], "base_commit")
         self.assertIn("SWE-bench_Verified", seen[0])
+
+    def test_submission_patch_is_fetched_when_not_supplied(self):
+        seen = []
+        diff = "diff --git a/a.py b/a.py\n" + self.patch
+
+        def fetch_text(url):
+            seen.append(url)
+            return diff
+        s = OW.provision(self.chains, self.oh, os.path.join(self.d.name, "c4"), os.path.join(self.d.name, "o4"),
+                         {"acme__widget-1": {"instance_id": "acme__widget-1", "base_commit": self.base}}, self.tmpl,
+                         fetch_text=fetch_text)
+        m = s["workspaces"]["chain_s0_c0"]
+        self.assertEqual((m["workspace_kind"], m["patch_applied"]), ("base_commit+final_patch", True))
+        self.assertIn("SESSION_PATCH", open(os.path.join(m["repo_dir"], "a.py")).read())
+        self.assertTrue(seen[0].endswith("/logs/acme__widget-1/patch.diff"))
+        self.assertIn(OW.SUBMISSION_PREFIX, seen[0])
+
+    def test_a_non_diff_submission_response_is_not_applied(self):
+        self.assertIsNone(OW.fetch_submission_patch("x", lambda u: "<Error>NoSuchKey</Error>"))
+        self.assertIsNone(OW.fetch_submission_patch("x", lambda u: (_ for _ in ()).throw(OSError("offline"))))
+
+    def test_submission_prefix_matches_the_trajectory_source(self):
+        import select_openhands as SO
+        self.assertEqual(SO.S3_PREFIX, OW.SUBMISSION_PREFIX + "trajs/")
 
 
 # --------------------------------------------------------------------------- home_run
@@ -852,10 +879,10 @@ class Home(T7.Base):
         self.assertEqual(rc, 0, so + se)
         return so
 
-    def test_workspaces_build_from_base_commit_and_say_there_is_no_patch(self):
+    def test_workspaces_build_from_base_commit_and_say_when_the_patch_is_missing(self):
         rc, so, se = self.go(AgenticRunner(), "oh-workspaces", "--dry-run", "--cache-dir", self.cache, "--instances", self.inst_file)
         self.assertEqual(rc, 0, so + se)
-        self.assertIn("final patch NOT available", so)
+        self.assertIn("final patch from the submission", so)
         self.assertNotIn("oh.workspaces", self.steps())
         so = self.provision_ws()
         self.assertIn("WITHOUT the session's final patch", so)
