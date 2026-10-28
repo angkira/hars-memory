@@ -8,7 +8,7 @@ the fields judge_v2.py requires:
   question, canonical_short_answer, answer, gold_anchor, answerable, rubric (BEAM rubric: passed
   to the judge when present), span_text (the evidence messages, role-tagged), evidence (list of
   verbatim snippets -> one +-500-char window each), visible_context (what the arm actually saw:
-  note/summary + injected recall + the verbatim post-boundary tail; the question and the answer
+  note/summary + injected recall (nc-enriched: the recalled-facts block of the compaction) + the verbatim post-boundary tail; the question and the answer
   are excluded, so judge_v2's transcript verification and metrics_v2's primed_hit stay honest).
 
 Blindness is the chains' machinery: judge_v2 masks arm-revealing strings in the judge-visible
@@ -94,6 +94,9 @@ def main(argv=None) -> int:
     ap.add_argument("--context-cap", type=int, default=DEFAULT_CONTEXT_CAP)
     ap.add_argument("--include-sid", default="", metavar="REGEX")
     ap.add_argument("--exclude-sid", default="", metavar="REGEX")
+    ap.add_argument("--skip-judged", default="", metavar="JUDGED.jsonl[,..]",
+                    help="Amendment C.7 reuse: do not export rows whose rid already carries a verdict in these judge_v2 "
+                         "outputs (validity is still decided on ALL rows; only the judge input shrinks)")
     a = ap.parse_args(argv)
 
     paths = sorted(p for pat in a.records.split(",") for p in glob.glob(pat))
@@ -109,6 +112,14 @@ def main(argv=None) -> int:
     if not rows:
         print("no valid rows left after the validity filter", file=sys.stderr)
         return 1
+    skip = set()
+    for pth in [x for x in a.skip_judged.split(",") if x.strip()]:
+        for l in open(pth):
+            if l.strip():
+                j = json.loads(l)
+                if j.get("rid") and j.get("score") is not None:
+                    skip.add(j["rid"])
+    n_skip_total = 0
     sessions = {s["sid"]: s for s in L.load_sessions(a.sessions)}
     qa = {sid: {q["qid"]: q for q in s.get("questions") or []} for sid, s in sessions.items()}
 
@@ -116,6 +127,9 @@ def main(argv=None) -> int:
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "w") as fo:
         for r in rows:
+            if raw_rid(r) in skip:
+                n_skip_total += 1
+                continue
             sid = str(pick(r, "chain_id"))
             s = sessions.get(sid)
             q = qa.get(sid, {}).get(r.get("base_qid") or str(r.get("qid")).split("@c")[0])
@@ -138,10 +152,10 @@ def main(argv=None) -> int:
             n_out += 1
     if missing:
         print(f"WARNING unmatched records (dropped): {sorted(missing)[:5]} ...", file=sys.stderr)
-    print(f"exported {n_out}/{len(rows)} valid records ({n_raw} read) -> {a.out}; "
+    print(f"exported {n_out}/{len(rows) - n_skip_total} valid records to judge ({n_raw} read, {n_skip_total} already judged and skipped) -> {a.out}; "
           f"visible_context present={ctx_present} truncated={truncated}; "
           f"rubric on {sum(1 for l in open(a.out) if json.loads(l).get('rubric'))} record(s)")
-    return 0 if n_out == len(rows) else 1
+    return 0 if n_out == len(rows) - n_skip_total else 1
 
 
 if __name__ == "__main__":

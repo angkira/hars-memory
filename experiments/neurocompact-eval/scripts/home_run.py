@@ -93,7 +93,12 @@ PHASES = ("gen", "run", "judge")
 CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
 PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
 PLACEHOLDER_CAP = 0.0
-HOME_RUN_VERSION = "2026-10-27.c6"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+HOME_RUN_VERSION = "2026-10-28.c7"      # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+# Amendment C.7: `oh-probe` / `oh-enrich` may spend on a campaign made under one of these versions (only those,
+# only for those two commands). Why that is valid is written in REPORT-PROTOCOL.md Amendment C.7: the reused HARS
+# sessions, notes, baseline / nc-note-only rows and judge verdicts are artifacts of code that C.7 did not change.
+REUSE_COMPATIBLE_FROM = ("2026-10-27.c6",)
+REUSE_CMDS = ("oh-probe", "oh-enrich")
 EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
 HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
 BUDGET_TOTAL_DEFAULT = 30.0
@@ -339,6 +344,7 @@ class Campaign:
         self.echo = echo
         self.force_steps: set[str] = set()
         self.kind = ""
+        self.reuse_ok = False                   # oh-probe / oh-enrich: accept a REUSE_COMPATIBLE_FROM campaign (C.7)
         # guards (version/void check before paid steps, HARS lock + lease) run only with the real subprocess runner;
         # tests inject a fake runner and switch them on explicitly
         self.guards_enabled = runner is None or runner is subprocess_runner
@@ -507,7 +513,7 @@ class Campaign:
 # ---------------------------------------------------------------------------
 # campaign selection (owner bug 2): NEVER an implicit resume
 # ---------------------------------------------------------------------------
-READ_ONLY_CMDS = ("bundle", "status")          # need an explicit target (--resume [ID|PATH])
+READ_ONLY_CMDS = ("bundle", "status", "oh-probe", "oh-enrich")   # need an explicit target (--resume [ID|PATH])
 NOT_RESUMABLE_KINDS = ("smoke", "dry-run")      # `--resume` (newest) skips these throw-away campaigns
 _STAMP_RE = re.compile(r"^(\d{8}T\d{6}Z)-homerun-")
 
@@ -612,7 +618,7 @@ def open_campaign(cfg: dict, args, kind: str, runner=None, echo: bool = True) ->
         else:
             print(f"[campaign] resuming {path}")
     elif kind in READ_ONLY_CMDS:
-        raise HomeRunError(f"`{kind}` is read-only and never guesses a campaign: name one. "
+        raise HomeRunError(f"`{kind}` {'works on an EXISTING campaign' if kind in REUSE_CMDS else 'is read-only'} and never guesses a campaign: name one. "
                            f"--resume (newest by creation time) or --resume ID|PATH.\n  newest campaigns under {root}:\n"
                            + fmt_campaigns(list_campaigns(root)))
     else:
@@ -667,9 +673,12 @@ def spend_blockers(camp: "Campaign") -> list[str]:
     if marker and marker != code:
         why.append(f"this checkout is inconsistent: EVAL-VERSION {marker!r} != home_run.py {code!r} (stale/mixed copy)")
     made = campaign_eval_version(camp.path)
-    if made != code:
+    reuse_ok = bool(getattr(camp, "reuse_ok", False)) and made in REUSE_COMPATIBLE_FROM
+    if made != code and not reuse_ok:
         why.append(f"the campaign was made under EVAL-VERSION {made or '(unknown)'!r}, the code is {code!r}: its "
-                   "calibration, caps and records belong to another protocol version")
+                   "calibration, caps and records belong to another protocol version"
+                   + (f" (only {'/'.join(REUSE_CMDS)} may reuse a {'/'.join(REUSE_COMPATIBLE_FROM)} campaign, Amendment C.7)"
+                      if made in REUSE_COMPATIBLE_FROM else ""))
     cal = read_json(camp.p(CAL_FILE), None)
     if cal:
         want = "C.5" if getattr(camp, "legacy_replay", False) else "C.6"
@@ -679,7 +688,7 @@ def spend_blockers(camp: "Campaign") -> list[str]:
             why.append(f"{CAL_FILE} is from Amendment {cal.get('amendment') or '(none)'}, this "
                        f"{'legacy ' if want == 'C.5' else ''}run needs {want} (a pre-{want} calibration counted other tokens "
                        "or capped differently and is VOID)")
-        elif cal.get("eval_version") and cal["eval_version"] != code:
+        elif cal.get("eval_version") and cal["eval_version"] != code and not (reuse_ok and cal["eval_version"] in REUSE_COMPATIBLE_FROM):
             why.append(f"{CAL_FILE} was written under EVAL-VERSION {cal['eval_version']!r}, the code is {code!r}")
     caps = read_json(camp.p("oh", "caps.json"), None)
     if caps:
@@ -1364,8 +1373,9 @@ def parse_gen_dry(text: str) -> float:
     return float(m.group(1).replace(",", "")) if m else 0.0
 
 
-def ls_dry_summary(res: dict, n_budgets: int, judge_unit: float) -> dict:
-    """run_longsession --dry-run --json -> run usd, judged items, wall-clock model."""
+def ls_dry_summary(res: dict, n_budgets: int, judge_unit: float, only_arm: str | None = None, reused: bool = False) -> dict:
+    """run_longsession --dry-run --json -> run usd, judged items, wall-clock model. only_arm: count the asks (= judge
+    items) of that arm only (Amendment C.7 reuse: the other arms' rows exist already); reused: no ingest, no summaries."""
     asks = 0
     boundaries = 0
     ingest_h = 0.0
@@ -1373,8 +1383,8 @@ def ls_dry_summary(res: dict, n_budgets: int, judge_unit: float) -> dict:
         boundaries += int(s.get("boundaries") or 0)
         ingest_h += float((s.get("hars") or {}).get("est_ingest_hours") or 0.0)
         for B, d in (s.get("per_budget") or {}).items():
-            asks += sum(int(v) for v in (d.get("asks") or {}).values())
-    llm_h = (boundaries * n_budgets * 2 * LLM_S_PER_SUMMARY + asks * LLM_S_PER_ASK) / 3600.0
+            asks += sum(int(v) for k, v in (d.get("asks") or {}).items() if only_arm is None or k == only_arm)
+    llm_h = ((boundaries * 30.0 if reused else boundaries * n_budgets * 2 * LLM_S_PER_SUMMARY) + asks * LLM_S_PER_ASK) / 3600.0
     return {"run_usd": float(res.get("grand_total_usd") or 0.0), "sessions": len(res.get("sessions", [])),
             "boundaries": boundaries, "asks": asks, "judged_items": asks, "judge_usd": asks * judge_unit,
             "wall_hours": ingest_h + llm_h, "ingest_hours": ingest_h,
@@ -1586,7 +1596,7 @@ def parse_json_block(text: str) -> dict:
 
 
 def estimate_ls(camp: Campaign, track: str, data: str, budgets, checkpoints: str, real: bool,
-                extra: list[str] | None = None, tag: str = "") -> dict:
+                extra: list[str] | None = None, tag: str = "", only_arm: str | None = None, reused: bool = False) -> dict:
     argv = [camp.script("run_longsession.py"), "--sessions", data, "--dry-run", "--json",
             *profile_args(camp.cfg), "--mem-budgets", budgets_arg(budgets), "--checkpoints", checkpoints,
             "--budget-usd", "1000000"] + (["--use-real-compactions"] if real else []) + (extra or [])
@@ -1594,7 +1604,7 @@ def estimate_ls(camp: Campaign, track: str, data: str, budgets, checkpoints: str
     if rc != 0:
         raise HomeRunError(f"run_longsession --dry-run failed for {track}; see logs/dry.{track}{tag}.log")
     res = parse_json_block(text)
-    return ls_dry_summary(res, len(budgets), judge_unit_usd(camp.cfg))
+    return ls_dry_summary(res, len(budgets), judge_unit_usd(camp.cfg), only_arm, reused)
 
 
 def estimate_beam(camp: Campaign) -> dict:
@@ -1770,7 +1780,7 @@ def judge_spend_from_text(text: str) -> float | None:
 # judge / metrics steps shared by the tracks
 # =============================================================================
 def judge_step(camp: Campaign, track: str, tag: str, judge_in: str, judged: str, mapping: str,
-               accept_partial: bool = False, cap_override: float | None = None) -> dict:
+               accept_partial: bool = False, cap_override: float | None = None, step: str | None = None) -> dict:
     n = sum(1 for _ in open(judge_in)) if os.path.isfile(judge_in) else 0
     unit = judge_unit_usd(camp.cfg)
     est = n * unit
@@ -1783,7 +1793,7 @@ def judge_step(camp: Campaign, track: str, tag: str, judge_in: str, judged: str,
         camp.quarantine(judged)
     argv = [camp.script("judge_v2.py"), "--in", judge_in, "--out", judged, "--mapping", mapping,
             *profile_args(camp.cfg), "--allow-same-family-judge", "--budget-usd", str(rem)]
-    step = f"{track}.judge"
+    step = step or f"{track}.judge"
     rc, text = camp.run(step, argv, check=False)
     spent = judge_spend_from_text(text)
     if spent is None:
@@ -2311,7 +2321,8 @@ def cmd_oh_legacy(camp: Campaign, args) -> int:
 # =============================================================================
 # OpenHands track on the streaming long-session runner (Amendment C.6)
 # =============================================================================
-OH_ARMS = "baseline,nc-chunks,nc-graph,nc-note-only"
+OH_ARMS = "baseline,nc-enriched,nc-note-only"       # Amendment C.7 (one memory configuration); nc-chunks / nc-graph are opt-in
+OH_ENRICH_ARMS = OH_ARMS
 # Fixed, question-independent probes of the parity CHECK: no decision-set question is ever asked by the check.
 PARITY_PROBES = (
     "What are the most important files, identifiers, commands and results of this session so far?",
@@ -2319,11 +2330,11 @@ PARITY_PROBES = (
 )
 
 
-def oh_ls_extra(cfg: dict) -> list[str]:
+def oh_ls_extra(cfg: dict, arms: str | None = None) -> list[str]:
     """run_longsession flags of the OH track (besides --use-real-compactions, set by `real=True`): the converted
     chains carry their synthetic boundaries as compactions, the tail after C3 is empty as in the chain replay."""
     o = cfg["oh"]
-    return ["--keep-tail", "0", "--arms", OH_ARMS,
+    return ["--keep-tail", "0", "--arms", arms or OH_ARMS,
             "--session-concurrency", str(int(o.get("session_concurrency") or 1))] + list(o.get("extra_args") or [])
 
 
@@ -2402,12 +2413,13 @@ def parity_from_records(rows: list[dict], comps: list[dict], budgets: list[int])
             return {sid: _mean([float(r[field]) for r in rb if r["arm"] == arm and str(r["chain_id"]) == sid
                                 and r.get(field) is not None]) for sid in sids}
         base, chunks, graph = per_sid("baseline"), per_sid("nc-chunks"), per_sid("nc-graph")
+        enr = per_sid("nc-enriched")
         note = per_sid("nc-note-only")
 
         def ratio(num):
             rs = [num[s_] / base[s_] for s_ in sids if num.get(s_) and base.get(s_)]
             return round(sum(rs) / len(rs), 4) if rs else None
-        rc_, rg = ratio(chunks), ratio(graph)
+        rc_, rg, re_ = ratio(chunks), ratio(graph), ratio(enr)
         clip = {}
         for r in rb:
             cs = r.get("clipped_summaries") or {}
@@ -2424,16 +2436,19 @@ def parity_from_records(rows: list[dict], comps: list[dict], budgets: list[int])
         inwin = lambda v: v is not None and PARITY_LO <= v <= PARITY_HI  # noqa: E731
         out[str(B)] = {
             "sessions": sids, "rows": len(rb),
-            "ratio_nc_chunks": rc_, "ratio_nc_graph": rg, "window": [PARITY_LO, PARITY_HI],
-            "in_window": bool(inwin(rc_) and inwin(rg)),
+            "ratio_nc_chunks": rc_, "ratio_nc_graph": rg, "ratio_nc_enriched": re_, "window": [PARITY_LO, PARITY_HI],
+            "in_window": bool([x for x in (rc_, rg, re_) if x is not None]
+                              and all(inwin(x) for x in (rc_, rg, re_) if x is not None)),
             "baseline_memory_tokens_mean": _mean(list(base.values())),
             "nc_chunks_memory_tokens_mean": _mean(list(chunks.values())),
             "nc_graph_memory_tokens_mean": _mean(list(graph.values())),
+            "nc_enriched_memory_tokens_mean": _mean(list(enr.values())),
             "nc_note_only_memory_tokens_mean": _mean(list(note.values())),
-            "note_tokens_mean": _mean([float(r["arm_note_tokens"]) for r in rb if r["arm"] == "nc-chunks"
+            "note_tokens_mean": _mean([float(r["arm_note_tokens"]) for r in rb if r["arm"] in ("nc-chunks", "nc-enriched")
                                        and r.get("arm_note_tokens") is not None]),
             "injected_recall_tokens_mean": _mean([float(r["memory_tokens_injected"]) for r in rb
-                                                  if r["arm"] == "nc-chunks" and r.get("memory_tokens_injected") is not None]),
+                                                  if r["arm"] in ("nc-chunks", "nc-enriched")
+                                                  and r.get("memory_tokens_injected") is not None]),
             "baseline_fill_of_B": (round(_mean(list(base.values())) / B, 4) if _mean(list(base.values())) else None),
             "pooled_summary_tokens": {"baseline_mean": _mean(bsum), "note_mean": _mean(nsum),
                                       "baseline_n": len(bsum), "note_n": len(nsum)},
@@ -2474,8 +2489,9 @@ def run_oh_parity(camp: Campaign, *, budgets: list[int]) -> dict:
         if not d["clip_free"]:
             why.append(f"B={B}: CLIP {d['clip_fail']}")
         if not d["in_window"]:
-            why.append(f"B={B}: ask-time ratio nc-chunks {d['ratio_nc_chunks']} / nc-graph {d['ratio_nc_graph']} "
-                       f"outside [{PARITY_LO}, {PARITY_HI}] (baseline fills {d['baseline_fill_of_B']} of B)")
+            why.append(f"B={B}: ask-time ratio nc-enriched {d['ratio_nc_enriched']} / nc-chunks {d['ratio_nc_chunks']} / "
+                       f"nc-graph {d['ratio_nc_graph']} outside [{PARITY_LO}, {PARITY_HI}] (baseline fills "
+                       f"{d['baseline_fill_of_B']} of B)")
         if expect_native and d["tokenizer_native"] is False:
             why.append(f"B={B}: counted with {d['tokenizer']!r} (native=False): Amendment C.5 measures NATIVE tokens")
     pb = per_b.get(str(max(budgets, key=lambda b: (b == 1536, b)))) or {}
@@ -2484,7 +2500,8 @@ def run_oh_parity(camp: Campaign, *, budgets: list[int]) -> dict:
            "status": "fail" if why else "pass", "stopped_because": why, "chain_id": ids[0], "chain_ids": ids,
            "parity_sessions": [f"parity-{i}"[:64] for i in ids], "budgets": budgets, "window": [PARITY_LO, PARITY_HI],
            "tokenizer": pb.get("tokenizer"), "tokenizer_native": pb.get("tokenizer_native"),
-           "ratio": pb.get("ratio_nc_graph"), "ratio_nc_chunks": pb.get("ratio_nc_chunks"),
+           "ratio": pb.get("ratio_nc_enriched") if pb.get("ratio_nc_enriched") is not None else pb.get("ratio_nc_graph"),
+           "ratio_nc_chunks": pb.get("ratio_nc_chunks"), "ratio_nc_enriched": pb.get("ratio_nc_enriched"),
            "ratio_nc_graph": pb.get("ratio_nc_graph"), "per_b": per_b,
            "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first k',
                                "seed": cfg["oh"].get("calibration_seed", 20261026)},
@@ -2498,10 +2515,11 @@ def run_oh_parity(camp: Campaign, *, budgets: list[int]) -> dict:
     if why:
         print(f"[parity] FAIL: {'; '.join(why)}")
     else:
-        print(f"[parity] PASS: ask-time ratio nc-chunks {pb['ratio_nc_chunks']} / nc-graph {pb['ratio_nc_graph']} "
-              f"(window {PARITY_LO}-{PARITY_HI}); baseline {pb['baseline_memory_tokens_mean']:.0f} tok, nc-chunks "
-              f"{pb['nc_chunks_memory_tokens_mean']:.0f} (note {pb['note_tokens_mean']:.0f} + recall "
-              f"{pb['injected_recall_tokens_mean']:.0f}); {tokcount_label(pb)}; spent {fmt_usd(spent)} -> {camp.p(CAL_FILE)}")
+        nc_mean = pb.get("nc_enriched_memory_tokens_mean") or pb.get("nc_chunks_memory_tokens_mean") or 0
+        print(f"[parity] PASS: ask-time ratio nc-enriched {pb['ratio_nc_enriched']} / nc-chunks {pb['ratio_nc_chunks']} / "
+              f"nc-graph {pb['ratio_nc_graph']} (window {PARITY_LO}-{PARITY_HI}); baseline {pb['baseline_memory_tokens_mean']:.0f} "
+              f"tok, nc memory {nc_mean:.0f} (note {(pb['note_tokens_mean'] or 0):.0f} + recalled "
+              f"{(pb['injected_recall_tokens_mean'] or 0):.0f}); {tokcount_label(pb)}; spent {fmt_usd(spent)} -> {camp.p(CAL_FILE)}")
     return cal
 
 
@@ -2600,6 +2618,213 @@ def cmd_oh(camp: Campaign, args) -> int:
                 "note": "best effort: funnel_chains reads run_chainreplay run dirs; a longsession run dir may only fill part of it"}
     camp.step("oh.funnel", do_funnel)
     summarize_track(camp, "oh", run_dir)
+    return 0
+
+
+# =============================================================================
+# Amendment C.7: oh-probe / oh-enrich on a FINISHED oh campaign (no re-ingest, no re-summarising, no re-judging)
+# =============================================================================
+REUSE_ARMS = "baseline,nc-note-only"
+
+
+def oh_old_run(camp: Campaign, args, need_judged: bool = False) -> str:
+    """The finished run_longsession dir of the campaign whose HARS sessions / notes / baseline / nc-note-only rows are reused."""
+    d = os.path.abspath(getattr(args, "reuse_dir", None) or camp.p("oh", "run"))
+    need = ["config.json", "records.jsonl", "done.jsonl", "compactions.jsonl"] + (["judged.jsonl"] if need_judged else [])
+    miss = [fn for fn in need if not os.path.isfile(os.path.join(d, fn))]
+    if miss:
+        raise HomeRunError(f"{d} is not a finished `oh` run dir (missing {miss}). `oh-probe` / `oh-enrich` reuse the HARS sessions, "
+                           "notes and judged baseline / nc-note-only rows of a finished `home_run.py oh` campaign: "
+                           "--resume <that campaign> (or --reuse-dir <its oh/run>).")
+    return d
+
+
+def oh_reuse_extra(cfg: dict, old: str, *, probe: bool = False, args=None) -> list[str]:
+    ex = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--reuse-arms", REUSE_ARMS]
+    nq = getattr(args, "enrich_queries", None)
+    if nq:
+        ex += ["--enrich-queries", str(int(nq))]
+    if getattr(args, "packer", None):
+        ex += ["--packer", args.packer]
+    if probe:
+        ex += ["--recall-probe"]
+        if getattr(args, "probe_caps", None):
+            ex += ["--probe-caps", args.probe_caps]
+    return ex
+
+
+def estimate_oh_enrich(camp: Campaign, args, old: str, *, probe: bool) -> dict:
+    """run_longsession's own projection WITH --reuse-run: no ingest / extraction / memory_compact, no baseline / note
+    summaries, no ask for the reused arms; judge items = the NEW nc-enriched rows only."""
+    data = oh_convert(camp)
+    b = [max(int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"]))] if probe else \
+        [int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])]
+    tag = ".probe" if probe else ".enrich"
+    s = estimate_ls(camp, "oh", data, b, "end", True, extra=oh_reuse_extra(camp.cfg, old, probe=probe, args=args), tag=tag,
+                    only_arm=None if probe else "nc-enriched", reused=True)
+    return {"track": "oh", "gen_usd": 0.0, "run_usd": s["run_usd"], "judge_usd": 0.0 if probe else s["judge_usd"],
+            "judged_items": 0 if probe else s["judged_items"], "wall_hours": s["wall_hours"], "budgets": b,
+            "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": 0.0,
+            "unpriced_models": s["unpriced_models"], "cache_saving_usd": s.get("cache_saving_usd", 0.0),
+            "note": ("recall probe: one keyword-writing call per anchored answerable question; HARS recalls are free"
+                     if probe else
+                     "nc-enriched only: query-writing call per boundary + its asks; NO ingest / extraction (reused HARS "
+                     "sessions), baseline / nc-note-only copied from the old run; judge = new rows only")}
+
+
+def print_estimate(camp: Campaign, est: dict, what: str) -> None:
+    tot = est["run_usd"] + est["judge_usd"]
+    caps = {ph: cap_for(camp.cfg, "oh", ph) for ph in ("run", "judge")}
+    print(f"\n[{what}] estimate (zero spend): run {fmt_usd(est['run_usd'])} + judge {fmt_usd(est['judge_usd'])} "
+          f"({est['judged_items']} new item(s)) = {fmt_usd(tot)} | caps run {caps['run']:.2f} / judge {caps['judge']:.2f} | "
+          f"{est['sessions']} session(s), wall-clock ~{est['wall_hours']:.1f} h | {est['note']}")
+    write_json(camp.p(f"{what}-estimate.json"), {"ts": utc_iso(), **est, "total_usd": tot})
+
+
+def mark_reuse(camp: Campaign, old: str, what: str) -> None:
+    camp.reuse_ok = True
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj.setdefault("c7_reuse", {})[what] = {"ts": utc_iso(), "eval_version": HOME_RUN_VERSION, "reused_run": old,
+                                          "campaign_eval_version": cj.get("eval_version")}
+    write_json(camp.p("campaign.json"), cj)
+    dst = camp.p("scripts", "c7")
+    os.makedirs(dst, exist_ok=True)
+    for fn in ("home_run.py", "run_longsession.py", "run_chainreplay.py", "longsession.py", "metrics_v2.py",
+               "judge_v2.py", "export_longsession_judge.py", "funnel_chains.py", "tokcount.py", "providers.py"):
+        src = os.path.join(BASE, fn)
+        if os.path.isfile(src) and not os.path.exists(os.path.join(dst, fn)):
+            shutil.copy2(src, os.path.join(dst, fn))
+
+
+def cmd_oh_probe(camp: Campaign, args) -> int:
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-probe")
+    cfg = camp.cfg
+    old = oh_old_run(camp, args)
+    chains_path = oh_inputs(camp)
+    ids = [c["chain_id"] for c in read_jsonl(chains_path)]
+    data = oh_convert(camp)
+    if args.dry_run:
+        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=True), "oh-probe")
+        return 0
+    mark_reuse(camp, old, "oh-probe")
+    est = camp.step("oh.probe.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=True)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", "probe-run")
+    budgets = [max(int(b) for b in (args.budgets or cfg["oh"]["budgets"]))]
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, probe=True, args=args), len(ids),
+                args.accept_partial, "oh-probe", step="oh.probe.run")
+    summ = read_json(os.path.join(run_dir, "probe-summary.json"), {}) or {}
+    rep = os.path.join(run_dir, "REPORT-probe.md")
+    if os.path.isfile(rep):
+        print("\n" + open(rep).read())
+
+    def done():
+        return {"summary": os.path.join(run_dir, "probe-summary.json"), "report": rep, "probe_jsonl": os.path.join(run_dir, "probe.jsonl"),
+                "n_questions": summ.get("n_questions"), "n_recoverable": summ.get("n_recoverable"),
+                "headline": {k: (summ.get("all", {}).get(k) or {}).get("rate") for k in
+                             ("A_raw", "A_packed", "B_raw", "C_old_cap", "D_old_cap")}}
+    camp.step("oh.probe", done)
+    print(f"\n[oh-probe] done. Read {rep}; next (paid): home_run.py oh-enrich --resume {os.path.basename(camp.path)}")
+    summarize_track(camp, "oh", run_dir)
+    return 0
+
+
+def merge_judged(old_judged: str, new_judged: str, records: list[dict], out: str) -> dict:
+    """judged.jsonl for metrics = the old verdicts of the reused rows (their rids) + the new verdicts; every valid row
+    must carry one."""
+    rids = {r["rid"] for r in records if r.get("valid") is True}
+    rows = [j for j in read_jsonl(old_judged) if j.get("rid") in rids]
+    new = read_jsonl(new_judged)
+    have = {j["rid"] for j in rows}
+    rows += [j for j in new if j.get("rid") not in have]
+    have = {j.get("rid") for j in rows if j.get("score") is not None or j.get("rid")}
+    missing = sorted(rids - have)
+    with open(out, "w") as f:
+        for j in rows:
+            f.write(json.dumps(j, ensure_ascii=False) + "\n")
+    return {"rows": len(rows), "from_old": len([j for j in rows if j.get("rid") in rids and j not in new]), "from_new": len(new),
+            "missing": missing}
+
+
+def cmd_oh_enrich(camp: Campaign, args) -> int:
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-enrich")
+    cfg = camp.cfg
+    old = oh_old_run(camp, args, need_judged=True)
+    chains_path = oh_inputs(camp)
+    ids = [c["chain_id"] for c in read_jsonl(chains_path)]
+    data = oh_convert(camp)
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    if args.dry_run:
+        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=False), "oh-enrich")
+        return 0
+    if not camp.is_done("oh.probe") and not args.skip_probe:
+        raise HomeRunError("run the recall probe first (it is cheap and tells whether the retrieval can work at all): "
+                           f"home_run.py oh-probe --resume {os.path.basename(camp.path)}; or pass --skip-probe (recorded)")
+    if args.skip_probe:
+        print("[oh-enrich] --skip-probe: the recall probe is skipped (recorded)")
+    prof = P.load_profile(cfg["general"]["profile"])
+    jm = P.resolve_models(prof, {})["judge"]
+    old_map = read_json(os.path.join(old, "judge-mapping.json"), {}) or {}
+    old_jm = old_map.get("judge_model") or old_map.get("model")
+    if old_jm and old_jm != jm:
+        raise HomeRunError(f"the old verdicts were made by judge {old_jm!r}, this profile judges with {jm!r}: a paired "
+                           "contrast across two judges is not valid. Use the same profile / judge model.")
+    mark_reuse(camp, old, "oh-enrich")
+    est = camp.step("oh.enrich.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=False)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", "enrich-run")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, args=args), len(ids),
+                args.accept_partial, "oh-enrich", step="oh.enrich.run")
+    summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
+    par = summ.get("parity_enriched") or {}
+    bad = {B: v for B, v in par.items() if not v.get("in_window")}
+    for B, v in par.items():
+        print(f"[parity] B={B}: nc-enriched / baseline realized ask-time memory {v['ratio_enriched_vs_baseline']} "
+              f"(window {PARITY_LO}-{PARITY_HI}) {'IN' if v['in_window'] else 'OUTSIDE'}")
+    if bad and not getattr(args, "accept_parity_fail", False):
+        raise HomeRunError(f"parity FAILED for B={sorted(bad)}: the realized nc-enriched memory is outside [{PARITY_LO}, {PARITY_HI}] "
+                           "of the baseline's. Nothing was judged. Look at oh/enrich-run/summary.json and the enrich/ artifacts, "
+                           "or pass --accept-parity-fail (recorded; the metrics win_mem_token_ratio gate will report it).")
+    rec = os.path.join(run_dir, "records.jsonl")
+    ji, ji_new = os.path.join(run_dir, "judge-input.jsonl"), os.path.join(run_dir, "judge-input.new.jsonl")
+    old_judged = os.path.join(old, "judged.jsonl")
+    camp.step("oh.enrich.export", lambda: (camp.run("oh.enrich.export", [camp.script("export_longsession_judge.py"), "--records", rec,
+                                                                           "--sessions", data, "--out", ji]), {"out": ji})[1])
+    camp.step("oh.enrich.export_new", lambda: (camp.run("oh.enrich.export_new", [
+        camp.script("export_longsession_judge.py"), "--records", rec, "--sessions", data, "--out", ji_new,
+        "--skip-judged", old_judged]), {"out": ji_new, "items": sum(1 for _ in open(ji_new))})[1])
+    if args.skip_judge:
+        print("[oh-enrich] --skip-judge: stopping before the judge")
+        return 0
+    new_j, mp = os.path.join(run_dir, "judged.new.jsonl"), os.path.join(run_dir, "judge-mapping.json")
+    camp.step("oh.enrich.judge", lambda: judge_step(camp, "oh", "oh-enrich", ji_new, new_j, mp, args.accept_partial,
+                                                    step="oh.enrich.judge"))
+    merged = os.path.join(run_dir, "judged.jsonl")
+
+    def do_merge():
+        info = merge_judged(old_judged, new_j, read_jsonl(rec), merged)
+        if info["missing"]:
+            raise HomeRunError(f"{len(info['missing'])} valid row(s) have no judge verdict (old or new): {info['missing'][:3]}")
+        return info
+    camp.step("oh.enrich.merge", do_merge)
+    excl = oh_exclusions(camp)
+    xs = (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else [])
+    camp.step("oh.enrich.metrics", lambda: metrics_step(
+        camp, "oh.enrich.metrics", rec, merged, mp, ji, os.path.join(run_dir, "REPORT-oh-enrich.md"),
+        os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only", "--ls-family", "oh"] + xs))
+
+    def do_funnel():
+        argv = [camp.script("funnel_chains.py"), "--run", run_dir, "--chains", chains_path,
+                "--out-md", os.path.join(run_dir, "funnel.md"), "--out-json", os.path.join(run_dir, "funnel.json")]
+        if cfg["oh"].get("graph_store"):
+            argv += ["--graph-store", cfg["oh"]["graph_store"]]
+        rc, _ = camp.run("oh.enrich.funnel", argv, check=False)
+        return {"md": os.path.join(run_dir, "funnel.md"), "rc": rc, "note": "best effort"}
+    camp.step("oh.enrich.funnel", do_funnel)
+    summarize_track(camp, "oh", run_dir)
+    print(f"\n[oh-enrich] report: {os.path.join(run_dir, 'REPORT-oh-enrich.md')}; next: home_run.py bundle --resume {os.path.basename(camp.path)}")
     return 0
 
 
@@ -2898,6 +3123,7 @@ def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int
             pb = (cal.get("per_b") or {}).get("1536") or {}
             return {"chain": pick, "verdict": (m.get("gates") or {}).get("verdict"), "exit": rcode,
                     "parity": cal.get("status"), "parity_ratio_nc_chunks": pb.get("ratio_nc_chunks"),
+                    "parity_ratio_nc_enriched": pb.get("ratio_nc_enriched"),
                     "parity_ratio_nc_graph": pb.get("ratio_nc_graph"),
                     "memory_tokens": {"baseline": pb.get("baseline_memory_tokens_mean"),
                                       "nc_chunks": pb.get("nc_chunks_memory_tokens_mean"),
@@ -3273,6 +3499,25 @@ def build_parser() -> argparse.ArgumentParser:
             t.add_argument("--pick", type=int, default=None, metavar="N", help="choose candidate N of --find/--session-id (non-interactive)")
             t.add_argument("--projects-root", default=None, help="where transcripts live (default [cc] root = ~/.claude/projects)")
             t.add_argument("--top", type=int, default=15, help="--list: how many sessions")
+    for name, hlp in (("oh-probe", "Amendment C.7: recall probe on a FINISHED oh campaign (reuses its HARS sessions; cents; no answer model, "
+                                   "no judge): where is the anchor lost - old shape, packer, or retrieval?"),
+                      ("oh-enrich", "Amendment C.7: run ONLY nc-enriched against a FINISHED oh campaign (reuses its HARS sessions, "
+                                    "notes and judged baseline / nc-note-only rows), judge the new rows only, merge, metrics")):
+        t = sub.add_parser(name, parents=[common], help=hlp)
+        t.add_argument("--dry-run", action="store_true", help="print the estimate (zero spend, no step markers) and stop")
+        t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+        t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
+        t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
+        if name == "oh-probe":
+            t.add_argument("--probe-caps", default=None, metavar="N,N", help="token caps of the max_chars sweep (default 800,1536,3000,6000)")
+        else:
+            t.add_argument("--enrich-queries", type=int, default=None, help="K queries per boundary (default 8)")
+            t.add_argument("--packer", choices=("server", "legacy"), default=None,
+                           help="server (default): the server's own max_chars; legacy: packing v2 (comparison only)")
+            t.add_argument("--skip-probe", action="store_true", help="do not require the recall probe first (recorded)")
+            t.add_argument("--skip-judge", action="store_true", help="stop after export (no judge spend)")
+            t.add_argument("--accept-parity-fail", action="store_true",
+                           help="judge although the realized memory is outside the parity window (recorded)")
     sub.add_parser("status", parents=[common], help="read-only: campaigns under the artifact root, or (with --resume) one "
                                                     "campaign's steps / spend / calibration / validity")
     b = sub.add_parser("bundle", parents=[common], help="tar.gz of what the analyst needs (redaction-scanned)")
@@ -3409,6 +3654,9 @@ def _main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
             dry_run_report(camp, tracks)
             camp.write_manifest()
             return 0
+        if args.cmd in REUSE_CMDS:
+            camp.reuse_ok = True
+            return {"oh-probe": cmd_oh_probe, "oh-enrich": cmd_oh_enrich}[args.cmd](camp, args)
         if args.cmd == "calibrate":
             return cmd_calibrate(camp, args)
         if args.cmd == "oh":

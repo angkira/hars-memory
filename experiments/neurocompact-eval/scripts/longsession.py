@@ -665,6 +665,24 @@ def mock_complete(user: str, system: str | None, max_tokens: int, model: str = "
             text += f"- {k}\n"
         text += "DECISIONS & RATIONALE\n- none recorded.\nACTIVE STATE\n- continuing.\n"
         out = text
+    elif "retrieval queries" in user and "<recent_context>" in user:
+        # Amendment C.7 query generation: one JSON line (query + ll/hl keywords) per distinct identifier of the note
+        m = re.search(r"Write (\d+) short", user)
+        k = int(m.group(1)) if m else 8
+        body = user.split("<note>", 1)[-1]
+        seen = []
+        for tkn in _IDENT_RE.findall(body):
+            if tkn not in seen:
+                seen.append(tkn)
+        out = "\n".join(json.dumps({"query": f"details about {t}", "ll_keywords": [t], "hl_keywords": ["session state"]})
+                        for t in seen[:k]) or json.dumps({"query": "session state", "ll_keywords": [], "hl_keywords": ["state"]})
+    elif "keywords for a memory search" in user:
+        body = user.split("<question>", 1)[-1]
+        ids = []
+        for tkn in _IDENT_RE.findall(body):
+            if tkn not in ids:
+                ids.append(tkn)
+        out = json.dumps({"ll_keywords": ids[:6], "hl_keywords": ["session"]})
     else:
         q = user.rsplit("Question:", 1)[-1].strip().split("\n")[0]
         qw = set(re.findall(r"\w{3,}", q.lower()))

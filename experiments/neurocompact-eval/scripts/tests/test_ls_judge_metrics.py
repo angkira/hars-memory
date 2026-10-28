@@ -18,7 +18,8 @@ import qtypes as QT
 import run_longsession as R
 
 COMMON = ["--window", "14000", "--keep-tail", "3000", "--provider", "mock", "--agent-model", "mock",
-          "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4"]
+          "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4",
+          "--arms", "baseline,nc-chunks,nc-graph,nc-note-only"]
 FAKE_VERDICT = json.dumps({"score": 2, "unsupported_claim": False, "abstained": False, "reason": "ok"})
 
 
@@ -226,7 +227,7 @@ class RealCompactionOrig(unittest.TestCase):
             rc = quiet(R.main, ["--sessions", sd, "--out", run, "--use-real-compactions", "--checkpoints", "all",
                                 "--keep-tail", "1500", "--window", "14000", "--mem-budgets", "512",
                                 "--provider", "mock", "--agent-model", "mock", "--fake-hars", "--no-preflight",
-                                "--piece-chars", "3000"])
+                                "--piece-chars", "3000", "--arms", "baseline,nc-chunks,nc-graph,nc-note-only,orig"])
             self.assertEqual(rc, 0)
             rows = [json.loads(l) for l in open(os.path.join(run, "records.jsonl"))]
             self.assertTrue(any(r["arm"] == "orig" for r in rows))

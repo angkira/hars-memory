@@ -139,3 +139,17 @@ python3 scripts/run_longsession.py --sessions data/cc-qa --use-real-compactions 
 Limits: BEAM ships 2 questions per type per chat (10 kept per session); BEAM answers are mostly sentences, so
 `gold_anchor` exists for few of them - score with the rubric/judge. Notes: the summariser prompts are a
 hand-synced Python port of `pi-agent/extensions/neurocompact.ts` (`PROMPT_VERSION` in the cache key).
+
+## Amendment C.7 (2026-10-28): `nc-enriched`, `--reuse-run`, `--recall-probe`
+
+- Default arms are `baseline,nc-enriched,nc-note-only`; `--arms ...,nc-chunks,nc-graph` brings the question-time arms back (exploratory).
+- `nc-enriched`: at each checkpoint boundary the summariser writes `--enrich-queries` (8) retrieval queries with `ll_keywords` / `hl_keywords`
+  from the note + the kept recent context only; each is a `memory_recall(session_id, query, ll, hl, mode=hybrid, max_chars)` (server-default
+  top_k, no session_graph, `--packer server`); chunks are deduped, filled to `B - note` tokens, and the ask context is note + block with NO
+  recall at ask time. Artifacts: `enrich/<sid>/j<j>.b<B>.json`, `recall_raw.jsonl` (raw recall text, every recall arm), rows with
+  `anchor_in_enriched` / `anchor_in_enriched_raw`. `summary.json` carries `parity_enriched` (window [0.80, 1.05]).
+- `--reuse-run DIR` (previous run dir): HARS sessions `ls-<its run id>-<sid>` reused, no `memory_compact`, HARS status gate, the old note
+  (memory cache or the `nc-note-only` rows), `--reuse-arms` (default `baseline,nc-note-only`) copied with `reused_from`; end-only checkpoints.
+- `--recall-probe` (with `--reuse-run`): anchor presence for (A) old shape + packing v2, (B) correct shape raw, (C) `max_chars` at the old cap and
+  `--probe-caps`, (D) BM25; no answer model, no judge. Writes `probe.jsonl`, `probe-summary.json`, `REPORT-probe.md`.
+- Home commands: `home_run.py oh-probe --resume CAMP`, `oh-enrich --resume CAMP` (HOME-RUNBOOK.md 6.0b).

@@ -15,7 +15,7 @@ import longsession as L
 import test_home_run as thr
 from oh_chain_fixture import make_artifact
 
-ARMS = ("baseline", "nc-chunks", "nc-graph", "nc-note-only")
+ARMS = ("baseline", "nc-enriched", "nc-note-only")
 
 
 class LSFakeRunner:
@@ -61,20 +61,22 @@ class LSFakeRunner:
         sessions = L.load_sessions([self.arg(argv, "--sessions")])
         budgets = [int(b) for b in self.arg(argv, "--mem-budgets").split(",")]
         recs, comps, done = [], [], []
+        arms = self.arg(argv, "--arms").split(",") if "--arms" in argv else list(ARMS)
         for s in sessions:
             sid = s["sid"]
             for B in budgets:
-                for arm in ARMS:
+                for arm in arms:
                     ok = arm != self.invalid_arm
                     base, note, rec = 1500, 600, 1500 * self.ratio - 600
-                    mem = {"baseline": base, "nc-chunks": note + rec, "nc-graph": note + rec, "nc-note-only": note}[arm]
+                    mem = {"baseline": base, "nc-chunks": note + rec, "nc-graph": note + rec, "nc-enriched": note + rec,
+                           "nc-note-only": note}[arm]
                     for q in s["questions"]:
                         recs.append({"rid": f"{q['qid']}::{arm}::b{B}", "qid": q["qid"], "base_qid": q["qid"], "chain_id": sid,
                                      "sid": sid, "cluster_session": sid, "arm": arm, "mem_budget": B, "b_tag": True,
                                      "valid": ok, "chain_invalid_reasons": [] if ok else ["RECALL FAIL"],
                                      "qtype": q["qtype"], "answerable": q["answerable"], "is_end": True, "checkpoint": 3,
                                      "memory_tokens": mem, "arm_note_tokens": 0 if arm == "baseline" else note,
-                                     "memory_tokens_injected": rec if arm in ("nc-chunks", "nc-graph") else 0,
+                                     "memory_tokens_injected": rec if arm in ("nc-chunks", "nc-graph", "nc-enriched") else 0,
                                      "clipped_summaries": {"n": 3, "unrepaired": 3 if (self.clip and arm == "baseline") else 0},
                                      "tokenizer": "anthropic:count_tokens:claude-haiku-5-5", "tokenizer_native": self.native,
                                      "cost_usd": 0.001})
@@ -160,7 +162,7 @@ class OhPipeline(Base):
                      "--mcp", "--profile"):
             self.assertIn(flag, a)
         self.assertEqual(r.arg(a, "--keep-tail"), "0")
-        self.assertEqual(r.arg(a, "--arms"), "baseline,nc-chunks,nc-graph,nc-note-only")
+        self.assertEqual(r.arg(a, "--arms"), "baseline,nc-enriched,nc-note-only")
         self.assertEqual(r.arg(a, "--checkpoints"), "end")
         self.assertEqual(r.arg(a, "--mem-budgets"), "1536")
         self.assertNotIn("--baseline-cap", a)
@@ -182,7 +184,7 @@ class OhPipeline(Base):
             self.assertTrue(os.path.isfile(os.path.join(c, "steps", st + ".json")), st)
         recs = H.read_jsonl(os.path.join(c, "oh", "run", "records.jsonl"))
         self.assertEqual({x["chain_id"] for x in recs}, set(self.ids()))
-        self.assertEqual(len(recs), 4 * 5 * 4)                            # chains x questions x arms
+        self.assertEqual(len(recs), 4 * 5 * 3)                            # chains x questions x arms (baseline, nc-enriched, nc-note-only)
         qids = {x["qid"] for x in recs}
         self.assertEqual(qids, {q["qid"] for ch in self.chains for q in ch["qa"]})      # qids preserved
         led = H.read_json(os.path.join(c, "ledger.json"))["entries"]
@@ -249,7 +251,7 @@ class OhPipeline(Base):
         self.assertEqual(rc, 0, so2 + se2)
         pa = H.read_json(out_json)["per_arm"]
         self.assertIsInstance(pa["baseline"]["anchor_in_summary"], dict)
-        self.assertIsInstance(pa["nc-chunks"]["anchor_in_note"], dict)
+        self.assertIsInstance(pa["nc-enriched"]["anchor_in_note"], dict)
 
 
 class ParityCheck(Base):
@@ -279,7 +281,7 @@ class ParityCheck(Base):
         self.assertEqual(cal["excluded_from_decision_set"], [])
         self.assertIn("outside", " ".join(cal["stopped_because"]))
         self.assertEqual(cal["chain_ids"], [cid])
-        self.assertAlmostEqual(cal["per_b"]["1536"]["ratio_nc_chunks"], 1.4)
+        self.assertAlmostEqual(cal["per_b"]["1536"]["ratio_nc_enriched"], 1.4)
 
     def test_pass_records_ratios_and_tokens(self):
         r = LSFakeRunner(ratio=0.95)
@@ -288,8 +290,8 @@ class ParityCheck(Base):
         cal = self.cal()
         pb = cal["per_b"]["1536"]
         self.assertEqual(cal["status"], "pass")
-        self.assertAlmostEqual(pb["ratio_nc_chunks"], 0.95)
-        self.assertAlmostEqual(pb["ratio_nc_graph"], 0.95)
+        self.assertAlmostEqual(pb["ratio_nc_enriched"], 0.95)
+        self.assertIsNone(pb["ratio_nc_graph"])
         self.assertEqual((pb["baseline_memory_tokens_mean"], pb["note_tokens_mean"]), (1500, 600))
         self.assertTrue(pb["clip_free"] and pb["all_valid"] and pb["tokenizer_native"])
         self.assertEqual(cal["window"], [0.8, 1.05])
@@ -310,7 +312,7 @@ class ParityCheck(Base):
         self.assertEqual(len(L.load_sessions([r.arg(r.runs()[0], "--sessions")])), 2)
 
     def test_clip_invalid_cell_and_non_native_tokens_fail_the_check(self):
-        for kw, needle in (({"clip": True}, "CLIP"), ({"invalid_arm": "nc-chunks"}, "invalid cells"),
+        for kw, needle in (({"clip": True}, "CLIP"), ({"invalid_arm": "nc-enriched"}, "invalid cells"),
                            ({"native": False}, "native=False")):
             with tempfile.TemporaryDirectory() as d2:
                 base = ["--root", os.path.join(d2, "r"), "--oh-dir", self.art, "--run-cap", "100", "--judge-cap", "100"]
@@ -374,7 +376,7 @@ class ParityCheck(Base):
         self.assertIn("B=[512]", se)
 
     def test_check_failure_message_is_actionable_for_the_shim_embedder_case(self):
-        r = LSFakeRunner(invalid_arm="nc-graph")
+        r = LSFakeRunner(invalid_arm="nc-enriched")
         rc, so, se = self.go(r, "calibrate")
         self.assertEqual(rc, 1)
         self.assertIn("invalid cells", so)
@@ -387,7 +389,7 @@ class DryRunAndLegacy(Base):
         self.assertEqual(rc, 0, so + se)
         est = H.read_json(os.path.join(self.camp(), "dry-run.json"))["estimates"]["oh"]
         self.assertEqual(est["sessions"], 4)
-        self.assertEqual(est["judged_items"], 4 * 5 * 4)           # chains x questions x arms
+        self.assertEqual(est["judged_items"], 4 * 5 * 3)           # chains x questions x arms (baseline, nc-enriched, nc-note-only)
         self.assertIn("parity_check_usd", est)
         self.assertEqual(est["budgets"], [1536])
         cmds = open(os.path.join(self.camp(), "scripts", "cmdlines.txt")).read()
@@ -441,7 +443,7 @@ class Smoke(Base):
             self.assertTrue(all(x["ok"] for x in rep), rep)
             oh = [x for x in rep if x["stage"].startswith("oh")][0]
             self.assertEqual(oh["parity"], "pass")
-            self.assertAlmostEqual(oh["parity_ratio_nc_chunks"], 0.95)
+            self.assertAlmostEqual(oh["parity_ratio_nc_enriched"], 0.95)
             self.assertEqual(oh["memory_tokens"]["baseline"], 1500)
 
 

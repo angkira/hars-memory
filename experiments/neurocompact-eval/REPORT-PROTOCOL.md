@@ -82,6 +82,8 @@ evidence (EMPTY). All gates passed at rate 1.000 on all 70 items; hard-gate fail
   appended after the question and carries no arm-specific abstention instruction.
 - Cost ceilings: pre-freeze gate $0.60; full run $2.50 hard (RUNBOOK-gate.md).
 
+> **Amendment C.7 (2026-10-28), section 4a.7:** the primary treatment is now `nc-enriched` (memory recalled at compaction time, none at ask time); `nc-chunks` / `nc-graph` are exploratory.
+
 ## 4. Budget parity protocol, and why (amendment log)
 
 The original caps (baseline 1000 vs nc note 2048 + unbounded recall) granted nc roughly
@@ -748,6 +750,107 @@ boundary (3-4 pieces of 8000 chars each: about 50 s per piece, the model assumes
 and about 3 h in total; and HARS made 59 / 64 / 69 extraction chunks per boundary (192 per chain) where the estimate assumes 18, so the
 HARS-extraction part of the run estimate (about USD 0.15 of the 0.33) is a lower bound, plausibly up to 10x too low (no extractor usage is
 logged on the client side: unverified). The run cap (USD 20) is unaffected. Opt-in sweep: about 3x the asks.
+
+### 4a.7 PROTOCOL AMENDMENT C.7 (2026-10-28, written AFTER the OpenHands question-time result was seen and BEFORE any `nc-enriched` record exists)
+
+Provenance and honesty. The OpenHands home run under C.6 finished first: arms `nc-chunks` / `nc-graph` recall from HARS AT QUESTION TIME with the
+question as the query. Result (14 sessions, 140 questions, B = 1536): no significant gain over `baseline`, more hallucination than `baseline`,
+`nc-graph` indistinguishable from `nc-chunks`. C.7 is therefore a post-result amendment of the design, not a pre-registration of the old one:
+its hypotheses are fixed here before the first `nc-enriched` record exists, and nothing below may be edited after that record exists (a
+deviation is Amendment D), but the choice of the new arm was informed by the old result and by the owner's actual hypothesis, which the
+question-time arms never tested. C.7 changes the TREATMENT ARM, the default arm set, the metrics regime and the version string. It changes no
+budget B, no formula, no ask prompt, no summariser prompt, no judge, no thresholds of the section-5 WIN / FAIL rules, no window.
+
+**C.7-1. Demotion of the question-time arms.** `nc-chunks` and `nc-graph` become EXPLORATORY (descriptive side arms in every report; they
+never invalidate a chain of the primary and never enter an inference). Cause found after the result: they were run with a mis-specified
+memory call. The frozen call `memory_recall(session_id, question, top_k=8)` sends NO `ll_keywords` / `hl_keywords`, so the server resolves the
+query to LightRAG `naive` mode and (HARS_MEMORY_GRAPH_BRANCH=auto) skips its graph branch entirely; `top_k = 8` is below the shipped default
+(DEFAULT_QUERY_TOP_K = 20); and our own packer (`run_chainreplay` packing v2) then discards about 80% of the roughly 16k-char result to fit
+about 820 tokens. The repo's usage guide (CLAUDE.md, "Using the hars-memory MCP") prescribes the opposite on all three points. The old arms
+therefore say nothing about the owner's memory used correctly; their result is kept as a record of that mis-specification, not as evidence
+about memory. `nc-graph` additionally differs from `nc-chunks` only by `session_graph`, which does not change this.
+
+**C.7-2. The treatment: `nc-enriched`, ONE memory configuration.** The owner's hypothesis: at COMPACTION time call the memory many times,
+fold the recalled facts into the post-compaction context, then let the model work WITHOUT memory access, and compare with a plain summary of
+the same token budget. At each boundary that precedes asks (end-only tracks: the last boundary), after the rolling note for budget B exists:
+
+1. The summariser model writes K = 8 (`--enrich-queries`) short retrieval queries, each with `ll_keywords` (exact identifiers: paths,
+   function names, error strings, numbers, verbatim) and `hl_keywords` (2-3 topics), from the NOTE and the kept recent context ONLY. A question
+   can never reach that prompt: `enrich_query_prompt(note, recent, k)` has no other parameter, and a test asserts it end to end with a sentinel.
+2. Each query is one `memory_recall(session_id, question = <query>, ll_keywords, hl_keywords, mode = "hybrid", max_chars)`: the server's
+   DEFAULT `top_k` (not sent), no `session_graph`, the output budgeted by the SERVER'S OWN `max_chars` (token cap -> chars with the chars per
+   token measured on the session's dropped text with the run tokenizer, verified in native tokens). This is the only memory configuration of
+   the decision run (the default session recall); no other configuration is run in the decision.
+3. The chunks of the K answers are deduplicated across queries (exact normalised content), interleaved by rank (rank 1 of every query first)
+   and filled whole into the cap (a chunk that no longer fits is skipped, like the server's own assembly). `--packer legacy` keeps packing v2 for
+   comparison only.
+4. Cap = `recall_cap(B, realized note tokens)` = clamp(B - note, floor, ceil) of C.1 (native tokens, C.5), wrapper included. The ask context is
+   note + the "facts recalled from long-term memory" block. There is NO recall at ask time. The block is computed ONCE per (sid, boundary, B)
+   and persisted under `enrich/` (queries, keywords, per-query latency / errors / graph_branch.enabled / lightrag_mode, raw payload files,
+   packed text, tokens); raw recall text also goes to the sidecar `recall_raw.jsonl` (all recall arms), never inline in records.
+5. Validity of a block: at most `--enrich-max-failed-frac` (25%) of its recalls failed or came back empty, keywords present on at least half of
+   the queries, `graph_branch.enabled` true on at least half of the keyworded recalls (else the server is not in the intended configuration),
+   no degraded channel unless `--allow-degraded`, at least one chunk packed, status gate (entities, vectors_indexed). Rows carry
+   `anchor_in_enriched` (anchor regex over the packed block) and `anchor_in_enriched_raw` (over the raw recall of all queries), so a loss is
+   attributable to retrieval or to the budget; `anchor_in_recall` / `anchor_in_recall_raw` are aliases for the funnel and for the old arms.
+
+**C.7-3. Hypotheses.** Computed by `metrics_v2.py --track longsession --end-only` (auto-detects the regime from the presence of
+`nc-enriched` rows): required arm set `baseline` / `nc-enriched` / `nc-note-only`; clustering, MIN_CHAINS = 8, bootstrap as before.
+
+- PRIMARY: `nc-enriched` vs `baseline` (plain summary of the same B): the section-5 WIN / FAIL rules with treatment `nc-enriched`, thresholds
+  unchanged, including the realized ask-time memory ratio `nc-enriched / baseline` in [0.80, 1.05] (native tokens, memory = note + block).
+- KEY SECONDARY: `nc-enriched` vs `nc-note-only` (the same note without the recalled facts: isolates the facts). Family of m = 2, Holm
+  step-down at one-sided alpha 0.025, judge score: E1 `nc-enriched - nc-note-only`, E2 `nc-enriched - baseline` (superiority). Strata
+  (knowledge_update, temporal_reasoning, contradiction_resolution, xspan_locator) are descriptive.
+- HALLUCINATION BREAKDOWN (descriptive, always reported): per arm, hallucination rate on answerable vs unanswerable items (k/n), paired deltas
+  `hallucination_answerable` and `false_answer` (unanswerable).
+- `nc-chunks` / `nc-graph`, when present: descriptive pairs only.
+- Cost and latency: the compaction-time query-writing call is part of the arm's cost per question (amortised over the questions of its
+  boundary) so `fail_cost` cannot be dodged by moving spend out of the ask; ask latency is the ask. The wall-clock of the enrichment is
+  recorded (`enrich_seconds`) and is not an ask latency.
+
+**C.7-4. Reuse rule (no re-ingest, no re-summarising, no re-judging).** `run_longsession.py --reuse-run DIR` and the home commands
+`home_run.py oh-probe --resume <campaign>` / `oh-enrich --resume <campaign>` run ONLY the new arm against a finished `oh` campaign:
+
+- the HARS sessions `ls-<old run id>-<sid>` are used as they stand; `memory_compact` is never called; a HARS status gate per session
+  (compactions > 0, vectors_indexed present and > 0, entities) must pass or nothing is spent;
+- the note is the one the old `nc-note-only` arm used: from `memory/<sid>.json` when present (sha-checked against the config), else the
+  `memory_text` of the old `nc-note-only` rows (identical across the sid's rows, hashed against the `summary_sha256` of the last note entry of
+  `compactions.jsonl`; only the last boundary, hence end-only checkpoints are required: an earlier checkpoint would see HARS data of later
+  boundaries); a missing or differing note is an error (`--reuse-regenerate-notes` is the explicit override);
+- the finished, VALID rows of `baseline` and `nc-note-only` are copied with all original fields plus `reused_from`; their judge verdicts are
+  reused (rid join), the judge sees only the NEW rows, the verdict sets are merged before metrics. The judge model of the old verdicts must
+  equal the current profile's judge (else the paired contrast would cross two judges: refused);
+- static checks before any spend: input files equal (sha256), the copied arms answered exactly the questions this run asks, the old cells valid,
+  `hars_per_budget` equal; then the parity of the realized memory before any judge spend (`--accept-parity-fail` records an override).
+
+Why this is valid, and where its limit is. EVAL-VERSION moves to `2026-10-28.c7`. The paid-step guard keeps refusing every campaign made under
+another version, with ONE exception: the commands `oh-probe` / `oh-enrich` accept a campaign stamped `2026-10-27.c6`, nothing older and no other
+command (`REUSE_COMPATIBLE_FROM`; the campaign's own stamp is not rewritten, the reuse is recorded under `c7_reuse` in `campaign.json` and the
+c7 scripts are snapshotted under `scripts/c7/`). Reuse is valid because everything it reuses was produced by code that C.7 does not touch:
+conversion and boundaries (`chains_to_longsession`), the summariser prompts / caps / trimmer, HARS ingest, the ask prompt, native token
+counting (C.5), the judge and its blinding. C.7 adds an arm, changes defaults and the metrics regime, and widens the judge's masking list for the
+new arm's strings. The enriched arm and the reused arms therefore see the same dropped text, the same note, the same tail (empty), the same
+question set and the same ask prompt; only the memory block differs. Residual risks, stated: (a) retrieval is not deterministic across calls
+(section 6, item 2), so the enrichment is one realisation, persisted so that it is auditable; (b) the HARS server may have changed since the
+ingest (the status gate and the recall validity rules are the guard, not a proof); (c) the new rows are judged in a separate pass after the old
+ones (same model, same blinding; a drift would bias against nothing in particular but cannot be excluded); (d) the question set was seen
+after the old result: the enrichment never sees a question and the new arm was not tuned on any answer.
+
+**C.7-5. The recall probe (diagnostic, not a gate).** `oh-probe` (`run_longsession.py --recall-probe --reuse-run DIR`) asks no answer model and
+calls no judge. For every answerable question with a gold anchor it records side by side (A) the old frozen shape + packing v2 at the old cap,
+(B) the correct shape raw (server default budget), (C) the correct shape via `max_chars` at the old cap and at a sweep (800 / 1536 / 3000 /
+6000 tokens), (D) BM25 over the full dropped context at the same caps, plus the anchor in the note and in the dropped context (the ceiling), the
+server's `graph_branch.enabled` / `lightrag_mode`, the share of recalled chunks that belong to the session itself, and the keyword rate. The
+probe's only decision rights: it may stop the paid run (a retrieval ceiling of zero is a finding, not a reason to spend). It selects no parameter
+of the decision run: the decision cap stays the B = 1536 parity cap. The sweep exists because that cap is self-imposed and the owner's own
+earlier evaluations did not cap memory that hard; a run at a larger cap would break the parity window and is a separate, labelled exploratory
+contrast (Amendment D), never a replacement of the primary.
+
+**C.7-6. Defaults and migration.** `run_longsession.py` default arms: `baseline,nc-enriched,nc-note-only` (`orig` with real compactions);
+`nc-chunks` / `nc-graph` remain available with `--arms`. `home_run.py oh` runs the new arm set (fresh campaign: ingest happens in the run;
+parity check on the enriched arm). The legacy 4-arm regime still analyses (rows without `nc-enriched`), flagged exploratory by C. The
+section-5 gate table is unchanged and now reads `treatment = nc-enriched`.
 
 ## 5. Measurement stack
 

@@ -95,7 +95,7 @@ ABSTAIN_RE = re.compile(
     r"|\bnot\s+sure\b|\bthere\s+is\s+no\s+mention\b|\bdecline\b", re.I)
 
 ARM_LABEL_RE = re.compile(
-    r"^\s*(?:\[\s*arm\s*=\s*[^\]\s]+\s*\]|(?:nc-baseline|nc-note-only|nc-chunks|nc-graph|baseline|nc|orig|none)"
+    r"^\s*(?:\[\s*arm\s*=\s*[^\]\s]+\s*\]|(?:nc-baseline|nc-note-only|nc-enriched|nc-chunks|nc-graph|baseline|nc|orig|none)"
     r"\s*(?:[:>\-—]\s*|\s*\)\s*:?\s*)?|(?:answer|assistant|response)\s*"
     r"(?:\([^)]{0,30}\))?\s*:\s*)", re.I)
 
@@ -105,8 +105,9 @@ ARM_LABEL_RE = re.compile(
 # judge-visible answer; post_pass keeps the unmasked text.
 ARM_LEAK_RE = re.compile(
     r"\bcr-[\w./:-]+"                                         # runner session ids
-    r"|[\w./:]*-(?:nc-note-only|nc-chunks|nc-graph|nc|baseline)-[\w./:-]*"   # -nc-/-nc-chunks-/-nc-graph-/-baseline- id parts
-    r"|\bnc-note-only\b|\bnote-only\b|\bnc-chunks\b|\bnc-graph\b"
+    r"|[\w./:]*-(?:nc-note-only|nc-enriched|nc-chunks|nc-graph|nc|baseline)-[\w./:-]*"   # -nc-/-nc-chunks-/-nc-graph-/-baseline- id parts
+    r"|\bnc-note-only\b|\bnote-only\b|\bnc-enriched\b|\bnc-chunks\b|\bnc-graph\b"
+    r"|facts\s+recalled\s+from\s+long-term\s+memory[^\n]*|</?\s*recalled-facts\s*>"
     # Amendment C: graph section headers of the injected recall (the KG sections exist ONLY
     # in the nc-graph arm's recall, so they would reveal the arm), the packer's own heading
     # and the chunk-section headers

@@ -107,7 +107,7 @@ class FunnelChains(unittest.TestCase):
                   "anchor_in_recall", "anchor_in_kg_recall", "anchor_in_chunk_recall"):
             self.assertIn(s, fc.STAGES)
         self.assertEqual(fc.APPLIES["anchor_in_kg_recall"], {"nc-graph"})
-        self.assertEqual(fc.APPLIES["anchor_in_recall"], {"nc-chunks", "nc-graph"})
+        self.assertEqual(fc.APPLIES["anchor_in_recall"], {"nc-chunks", "nc-graph", "nc-enriched"})
         self.assertIn("nc-note-only", fc.APPLIES["anchor_in_graph"])
         self.assertNotIn("baseline", fc.APPLIES["anchor_in_graph"])
 

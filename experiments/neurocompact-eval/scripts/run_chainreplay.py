@@ -713,6 +713,35 @@ def hars_recall(mcp_url: str, session_id: str, question: str, timeout: int = 600
         return {"context": "", "error": describe_exception(e)}
 
 
+CORRECT_RECALL_MODE = "hybrid"
+
+
+def recall_args_correct(session_id: str, query: str, ll_keywords, hl_keywords, max_chars: int | None = None) -> dict:
+    """Amendment C.7 "correct usage" call shape (the ONE memory configuration): the caller model supplies the
+    query plus ll_keywords (exact identifiers) and hl_keywords (topics), mode hybrid, the SERVER'S default top_k
+    (top_k is deliberately NOT sent), no session_graph, and the output is budgeted by the server's own
+    `max_chars` (derived from a token cap by the caller) instead of an external packer. This is the usage
+    CLAUDE.md "Using the hars-memory MCP" prescribes; the frozen `recall_args` shape (no keywords, top_k=8)
+    makes the server fall back to naive mode and skip its graph branch."""
+    a = {"session_id": session_id, "question": query, "mode": CORRECT_RECALL_MODE,
+         "ll_keywords": [str(x) for x in (ll_keywords or [])], "hl_keywords": [str(x) for x in (hl_keywords or [])]}
+    if max_chars is not None:
+        a["max_chars"] = int(max_chars)
+    return a
+
+
+def hars_recall_correct(mcp_url: str, session_id: str, query: str, ll_keywords, hl_keywords,
+                        max_chars: int | None = None, timeout: int = 600) -> dict:
+    try:
+        d = mcp_call(mcp_url, "memory_recall",
+                     recall_args_correct(session_id, query, ll_keywords, hl_keywords, max_chars), timeout=timeout)
+        if not isinstance(d, dict):
+            return {"context": "", "error": f"unexpected payload {type(d).__name__}"}
+        return d
+    except Exception as e:
+        return {"context": "", "error": describe_exception(e)}
+
+
 # ---------------------------------------------------------------------------
 # recall packing v2: rank-aware salience packer, <=cap tokens.
 #
@@ -2054,7 +2083,7 @@ def preflight_verdict(pf: dict, preflight_session: str | None, allow_degraded: b
 
 
 def pack_injection(raw: str, sid: str, budget: int = RECALL_BUDGET_TOKENS,
-                   query: str | None = None, counter=None) -> dict:
+                   query: str | None = None, counter=None, wrapper=None) -> dict:
     """Pack recall so that wrapper + body fits the budget; verify, don't assume.
 
     Amendment C.5: with a counter (explicit, or the run's installed one) the budget is in the answering
@@ -2063,6 +2092,7 @@ def pack_injection(raw: str, sid: str, budget: int = RECALL_BUDGET_TOKENS,
     fits (and, if it undershoots, grown back toward the budget). `tokens` / `total_tokens` are native.
     """
     counter = counter if counter is not None else COUNTER
+    build_injection = wrapper or globals()["build_injection"]   # Amendment C.7: nc-enriched uses its own wrapper
     if counter is None:               # legacy estimator-only path (unit tests of the packer)
         scaffold = build_injection(sid, "", budget)
         body_budget = budget - count_tokens(scaffold)

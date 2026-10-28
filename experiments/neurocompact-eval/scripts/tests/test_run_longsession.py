@@ -339,7 +339,8 @@ class RunTests(unittest.TestCase):
     def test_budget_sweep_shares_hars_and_scales_caps(self):
         rc, so, se = self.run_main(["--mem-budgets", "512,1024"], base=[a for a in F.RUN_ARGS if a not in ("512",)][:0] + [
             "--window", "14000", "--keep-tail", "3000", "--provider", "mock", "--agent-model", "mock",
-            "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4"])
+            "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4",
+            "--arms", "baseline,nc-chunks,nc-graph,nc-note-only"])
         self.assertEqual(rc, 0, so + se)
         rows = rows_of(self.out)
         self.assertEqual({r["mem_budget"] for r in rows}, {512, 1024})
@@ -355,7 +356,8 @@ class RunTests(unittest.TestCase):
     def test_hars_per_budget_uses_separate_sessions(self):
         rc, so, se = self.run_main(["--hars-per-budget", "--mem-budgets", "512,1024"], base=[
             "--window", "14000", "--keep-tail", "3000", "--provider", "mock", "--agent-model", "mock",
-            "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4"])
+            "--fake-hars", "--no-preflight", "--piece-chars", "3000", "--pieces-per-call", "4",
+            "--arms", "baseline,nc-chunks,nc-graph,nc-note-only"])
         self.assertEqual(rc, 0, so + se)
         sids = {(r["mem_budget"], r["session_id"]) for r in rows_of(self.out) if r["arm"] == "nc-chunks"}
         self.assertEqual(len({s for _, s in sids}), 2)

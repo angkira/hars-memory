@@ -35,6 +35,8 @@
    uv run python home_run.py cc --find "HARS Experts Research"          # prints candidates, you pick; then import -> QA -> run -> judge
    uv run python home_run.py bundle                 # send the ONE .tar.gz back
    ```
+   **You already have a finished `oh` campaign (question-time arms)?** Do NOT re-run it. Read section 6.0b: `oh-probe --resume <campaign>`
+   (cents), then `oh-enrich --resume <campaign>` (the Amendment C.7 treatment, nc-enriched, against its stored HARS sessions).
 
 ---
 
@@ -177,13 +179,16 @@ HR smoke                         # 1 smallest OH chain (parity check + the whole
 HR calibrate                     # Amendment C.6: cheap parity CHECK on the run_longsession path (1 session of the seeded order, compaction + 2 fixed
                                  #   probe asks, ~cents; spends no decision-set answer, so nothing is excluded) -> <campaign>/calibration.json; must say PASS
 HR oh                            # OpenHands chains (add --oh-tar TAR the first time): chains_to_longsession -> parity check (if not done) ->
-                                 #   run_longsession (4 arms, end checkpoint, B=1536) -> export_longsession_judge -> judge -> metrics_v2 --track longsession
+                                 #   run_longsession (3 arms baseline,nc-enriched,nc-note-only [C.7], end checkpoint, B=1536) -> export_longsession_judge -> judge -> metrics_v2 --track longsession
                                  #   (+ the descriptive chain-family reading) -> funnel. `--legacy-replay` = the old pi path (not the decision runner)
 HR beam                          # BEAM-1M: seeded 10-chat import -> run_longsession (end checkpoint, B per [beam] budgets)
                                  #   -> export_longsession_judge -> judge (rubric) -> metrics_v2 --end-only --include-sid ^beam-1M-
 HR cc --find "TITLE"             # (or --session-id ID / --list): pick the session, then import (redacted) -> QA generation
                                  #   -> run (real boundaries, orig arm)
                                  #   -> judge -> metrics (all rows, and --end-only)
+HR oh-probe  --resume CAMP       # Amendment C.7 (section 6.0b): recall probe on a FINISHED oh campaign - cents, no answer model, no judge
+HR oh-enrich --resume CAMP       # Amendment C.7: ONLY nc-enriched against that campaign (reuses its HARS sessions, notes, judged baseline /
+                                 #   nc-note-only), judges the new rows only, merges, metrics. Run oh-probe first; --dry-run on both
 HR bundle                        # step 9
 ```
 Useful flags: `--budgets 1536` (primary only), `--skip-judge` (stop after export, judge later), `--retries N` (legacy replay only),
@@ -230,6 +235,46 @@ campaign may still spend.
 
 Recommended order: `doctor --deep` -> `smoke` -> `dry-run` -> `calibrate` -> `oh` (cheapest, ~2.3 h at B=1536) -> `cc` (2-3 h) -> `beam` (~19 h) -> `bundle`.
 Run `bundle` after each track if you want an early look; it is idempotent.
+
+### 6.0b Amendment C.7 - the OH result, the mis-specified recall, and the ONE paid command that follows (read before `oh-enrich`)
+
+The question-time arms (`nc-chunks`, `nc-graph`) of the finished OH campaign recalled at ask time with a call that sends no keywords, top_k = 8
+and goes through our own packer; they are EXPLORATORY now (`REPORT-PROTOCOL.md` 4a.7). The primary treatment is **`nc-enriched`**: facts
+recalled at COMPACTION time (query + `ll_keywords` + `hl_keywords`, mode hybrid, the server's default top_k, budget via the server's
+`max_chars`), folded into the post-compaction context, no recall at ask time. It runs ONLY against your finished campaign: no re-ingest, no
+re-summarising, no re-judging of baseline / nc-note-only. Name the campaign explicitly (`--resume <ID|PATH>`, both commands refuse without it);
+its HARS server must be the one it was ingested on (same data dir) and running.
+
+```bash
+cd experiments/neurocompact-eval/scripts
+CAMP=<the finished oh campaign, e.g. 20261027T...-homerun-home>
+uv run python home_run.py oh-probe  --resume $CAMP --dry-run     # estimate, zero spend
+uv run python home_run.py oh-probe  --resume $CAMP               # 1) cents, NO answer model, NO judge: where does the anchor get lost?
+uv run python home_run.py oh-enrich --resume $CAMP --dry-run     # estimate (no ingest, new rows only), zero spend
+uv run python home_run.py oh-enrich --resume $CAMP               # 2) PAID: nc-enriched only, judge only the new rows, merge, metrics
+uv run python home_run.py bundle    --resume $CAMP               # send the .tar.gz back
+```
+
+- **`oh-probe` must run before `oh-enrich`** (enforced; `--skip-probe` is recorded). It writes `oh/probe-run/REPORT-probe.md`: per answerable
+  question, side by side, (A) the old frozen shape + packing v2 at the old cap, (B) the correct shape raw, (C) the correct shape budgeted by the
+  server's `max_chars` at the old cap and at 800 / 1536 / 3000 / 6000 tokens, (D) BM25 over the full dropped context at the same caps, plus the
+  anchor in the note and in the dropped context (the ceiling). It costs one keyword call per question (cents); the HARS recalls are free. If the
+  recoverable ceiling is low or (B)/(C) do not beat (A)/(D), read the report before paying for `oh-enrich`.
+- **`oh-enrich`** reuses `oh/run` of that campaign (`--reuse-dir DIR` to point elsewhere): its HARS sessions `ls-<old run id>-<sid>` (HARS status
+  gate first: compactions > 0, vectors_indexed > 0, else it stops before spending), the exact note of the old `nc-note-only` arm, the valid
+  `baseline` / `nc-note-only` rows and their judge verdicts. Output: `oh/enrich-run/` (`records.jsonl` with the copied rows marked
+  `reused_from`, `enrich/<sid>/j3.b1536.json` = queries, keywords, per-query latency / errors / graph_branch, packed block, tokens;
+  `recall_raw.jsonl` = raw recall text; `judged.jsonl` = old + new verdicts; `REPORT-oh-enrich.md` + `metrics.json`; `funnel.md`).
+  Parity (realized `nc-enriched / baseline` ask-time memory in [0.80, 1.05]) is checked BEFORE the judge is paid; `--accept-parity-fail`
+  overrides (recorded). Flags: `--enrich-queries K` (default 8), `--packer server|legacy` (legacy = packing v2, comparison only),
+  `--skip-judge`, `--accept-partial`, `--budgets`.
+- **Guard rules.** The campaign was made under EVAL-VERSION `2026-10-27.c6`; the code is `2026-10-28.c7`. Every paid command still refuses
+  such a campaign EXCEPT `oh-probe` / `oh-enrich` (why that is valid: protocol 4a.7, "Reuse rule"). Caps (`[caps]` run / judge / total), the
+  per-HARS lock / lease, the dry-run estimate check and the ledger apply as everywhere; the estimate contains NO ingest and NO baseline / note
+  summaries. Typical size for 14 sessions / 140 questions: run well under USD 0.1, judge about 140 x USD 0.0034 = USD 0.48.
+- A fresh campaign (`oh`, `beam`, `cc`) now runs `baseline,nc-enriched,nc-note-only` (ingest happens in the run); `--arms` on
+  `run_longsession.py` brings `nc-chunks` / `nc-graph` back for exploration.
+
 
 ### 6.0 Amendment C.6 - the OpenHands track is a long-session run (read first)
 

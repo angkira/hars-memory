@@ -374,7 +374,7 @@ class BeamEndToEnd(unittest.TestCase):
         run = os.path.join(c, "beam", "run")
         rows = H.read_jsonl(os.path.join(run, "records.jsonl"))
         self.assertTrue(rows)
-        self.assertEqual({r["arm"] for r in rows}, {"baseline", "nc-chunks", "nc-graph", "nc-note-only"})
+        self.assertEqual({r["arm"] for r in rows}, {"baseline", "nc-enriched", "nc-note-only"})
         self.assertEqual({r["chain_id"] for r in rows}, {"beam-1M-1", "beam-1M-2"})
         for n in ("MANIFEST.json", "summary.json", "run.log", "done.jsonl", "judge-input.jsonl"):
             self.assertTrue(os.path.isfile(os.path.join(run, n)), n)
@@ -781,7 +781,7 @@ class SmokeOffline(unittest.TestCase):
             rep = H.read_json(os.path.join(root, camps[0], "smoke-report.json"))
             self.assertTrue(all(r["ok"] for r in rep), rep)
             recs = H.read_jsonl(os.path.join(root, camps[0], "smoke", "ls-run", "records.jsonl"))
-            self.assertEqual({r["arm"] for r in recs}, {"baseline", "nc-chunks", "nc-graph", "nc-note-only"})
+            self.assertEqual({r["arm"] for r in recs}, {"baseline", "nc-enriched", "nc-note-only"})
             self.assertFalse(os.path.exists(os.path.join(root, ".homerun-current")))   # smoke never becomes "current"
 
     def test_oh_smoke_picks_the_cheapest_chain_and_runs_the_whole_flow(self):

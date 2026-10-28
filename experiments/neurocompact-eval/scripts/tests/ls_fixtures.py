@@ -57,4 +57,4 @@ def write_session(dirpath: str, session: dict) -> str:
 # small-window parameters that give several boundaries on make_session()
 RUN_ARGS = ["--window", "14000", "--keep-tail", "3000", "--mem-budgets", "512", "--provider", "mock",
             "--agent-model", "mock", "--fake-hars", "--no-preflight", "--piece-chars", "3000",
-            "--pieces-per-call", "4"]
+            "--pieces-per-call", "4", "--arms", "baseline,nc-chunks,nc-graph,nc-note-only"]

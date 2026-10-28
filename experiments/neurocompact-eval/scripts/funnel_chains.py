@@ -93,8 +93,12 @@ ARMS_AMENDED = ("baseline", "nc-chunks", "nc-graph", "nc-note-only")
 ARMS_LEGACY = ("baseline", "nc-chunks", "nc-note-only")
 ARMS = ARMS_AMENDED
 ARM_ALIASES = {"nc": "nc-chunks"}
-RECALL_ARMS = ("nc-chunks", "nc-graph")
-NC_ARMS = ("nc-chunks", "nc-graph", "nc-note-only")        # share the nc-chunks note + session store
+# Amendment C.7: nc-enriched recalls at COMPACTION time; its anchor_in_recall / BM25 comparison are the same funnel
+# stages (anchor_in_recall = the budgeted recalled-facts block, anchor_in_recall_raw = before the budget)
+ARMS_ENRICHED = ("baseline", "nc-enriched", "nc-note-only")
+EXPLORATORY = ("nc-chunks", "nc-graph")
+RECALL_ARMS = ("nc-chunks", "nc-graph", "nc-enriched")
+NC_ARMS = ("nc-chunks", "nc-graph", "nc-enriched", "nc-note-only")        # share the nc-chunks note + session store
 STAGES = ("anchor_in_dropped_context", "anchor_in_dropped_payload", "anchor_in_summary",
           "anchor_in_note",
           # Amendment C item 10: session graph = entities / relations; recall split by section
@@ -340,16 +344,20 @@ def validate_rows(rows: list[dict]) -> tuple[list[dict], dict]:
     (duplicates are reported, first row wins -- merge_runs.py refuses them). Validity is per
     (chain, mem_budget) cell; a qid must carry every arm of its cell's arm set (4 amended arms,
     or the 3 legacy arms when the run has no nc-graph row at all)."""
-    legacy = not any(r.get("arm") == "nc-graph" for r in rows)
-    need = set(ARMS_LEGACY if legacy else ARMS_AMENDED)
+    enriched = any(r.get("arm") == "nc-enriched" for r in rows)
+    legacy = not enriched and not any(r.get("arm") == "nc-graph" for r in rows)
+    need = set(ARMS_ENRICHED if enriched else ARMS_LEGACY if legacy else ARMS_AMENDED)
     bad: dict = defaultdict(set)
     for r in rows:
+        if enriched and r.get("arm") in EXPLORATORY:        # C.7: exploratory arms never invalidate the primary
+            continue
         cid = (str(r.get("chain_id")), cell_of(r))
         if r.get("valid") is not True:
             bad[cid].add(f"valid={json.dumps(r.get('valid'))}")
         if r.get("recall_error"):
             bad[cid].add(f"recall_error={str(r['recall_error'])[:40]}")
-    kept = [r for r in rows if (str(r.get("chain_id")), cell_of(r)) not in bad]
+    kept = [r for r in rows if (str(r.get("chain_id")), cell_of(r)) not in bad
+            and not (enriched and r.get("arm") in EXPLORATORY and (r.get("valid") is not True or r.get("recall_error")))]
     have: dict = defaultdict(set)
     for r in kept:
         have[(r.get("qid"), cell_of(r))].add(r.get("arm"))
@@ -398,7 +406,7 @@ def build(args) -> dict:
     validity = None
     if not args.include_invalid:
         rows, validity = validate_rows(rows)
-    legacy = not any(r.get("arm") == "nc-graph" for r in d["rows"])
+    legacy = not any(r.get("arm") in ("nc-graph", "nc-enriched") for r in d["rows"])
     seen, uniq = set(), []
     for r in rows:
         k = (r.get("qid"), r.get("arm"), cell_of(r))
@@ -641,7 +649,8 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
                 out[name] = "-"
         return out
 
-    arm_set = ARMS_LEGACY if legacy else ARMS_AMENDED
+    enriched = any(x["arm"] == "nc-enriched" for x in recs)
+    arm_set = (ARMS_ENRICHED + EXPLORATORY) if enriched else (ARMS_LEGACY if legacy else ARMS_AMENDED)
     per_arm = {a: dict(n=len([x for x in recs if x["arm"] == a]),
                        **agg([x for x in recs if x["arm"] == a]))
                for a in arm_set if any(x["arm"] == a for x in recs)}
@@ -663,9 +672,10 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
         k = sum(1 for x in sel if x["stages"][target])
         return {"k": k, "n": len(sel), "rate": round(k / len(sel), 4) if sel else None}
 
-    treat = "nc-chunks" if legacy else "nc-graph"
+    treat = "nc-enriched" if enriched else ("nc-chunks" if legacy else "nc-graph")
     conditionals = {}
-    for a in (("nc-chunks",) if legacy else ("nc-chunks", "nc-graph")):
+    for a in (("nc-enriched",) + tuple(x for x in EXPLORATORY if any(r_["arm"] == x for r_ in recs))
+              if enriched else (("nc-chunks",) if legacy else ("nc-chunks", "nc-graph"))):
         conditionals.update({
             f"{a} P(anchor_hit | anchor_in_recall)": cond(a, "anchor_in_recall", "anchor_hit"),
             f"{a} P(anchor_hit | NOT anchor_in_recall)": cond(a, "anchor_in_recall",
@@ -674,7 +684,7 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
                 a, "anchor_in_dropped_payload", "anchor_in_recall"),
             f"{a} P(anchor_in_recall | anchor_in_graph)": cond(a, "anchor_in_graph",
                                                                 "anchor_in_recall")})
-    if not legacy:
+    if not legacy and not enriched:
         conditionals.update({
             "nc-graph P(anchor_in_kg_recall | anchor_in_graph_entities)": cond(
                 "nc-graph", "anchor_in_graph_entities", "anchor_in_kg_recall"),
@@ -702,7 +712,7 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
 
     # (1) C11: H-graph restated as nc-graph vs nc-chunks on anchor_in_recall (descriptive label
     #     from the protocol's S1 thresholds; the inferential S1 test is metrics_v2's)
-    if not legacy:
+    if not legacy and not enriched:
         pairs = paired_rate("nc-graph", "anchor_in_recall", "nc-chunks", "anchor_in_recall")
         if pairs:
             g = sum(p[0] for p in pairs) / len(pairs)
@@ -723,9 +733,11 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
                 "verdict": "n/a", "why": "no paired answerable nc-graph/nc-chunks anchor_in_recall"}
     # (2) BM25 comparison kept for the CHUNK channel (nc-chunks); informational for nc-graph
     for bm in ("bm25_in_payload", "bm25_in_context"):
-        for a in (("nc-chunks",) if legacy else ("nc-chunks", "nc-graph")):
+        for a in (("nc-enriched",) + tuple(x for x in EXPLORATORY if any(r_["arm"] == x for r_ in recs))
+                  if enriched else (("nc-chunks",) if legacy else ("nc-chunks", "nc-graph"))):
             pairs = paired_rate(a, "anchor_in_recall", a, bm)
             key = (f"kill_graph[{bm}]" if legacy else
+                   f"enriched_vs_bm25[{bm}]" if a == "nc-enriched" else
                    f"kill_chunk_channel[{bm}]" if a == "nc-chunks" else f"graph_arm_vs_bm25[{bm}]")
             if not pairs:
                 pa_ = per_arm.get(a, {})
@@ -737,7 +749,7 @@ def build_cell(args, run, rows, comps, chains, questions, count, cell, pmode, le
             b = sum(p[1] for p in pairs) / len(pairs)
             kill = h <= b + margin + 1e-12
             rules[key] = {
-                "verdict": ("KILL" if kill else "KEEP") if a == "nc-chunks" or legacy
+                "verdict": ("KILL" if kill else "KEEP") if a in ("nc-chunks", "nc-enriched") or legacy
                 else ("<= BM25+margin" if kill else "> BM25+margin"),
                 "arm": a, "n_paired": len(pairs),
                 "hars_anchor_in_recall": round(h, 4), "bm25": round(b, 4),
