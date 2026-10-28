@@ -3191,7 +3191,7 @@ def estimate_oh_agentic(camp: Campaign, args, old: str) -> dict:
     sids = sorted(src["summary"])
     est = RA.estimate_for(sessions, src, sids, arms, prof, model, args.max_steps, retrieval_cap_of(args), judge_unit_usd(camp.cfg),
                           piece_chars_of(camp.cfg), old_rows, reused)
-    est["run_usd"] = est["run_usd_expected_without_cache"]            # the cap check uses the no-cache expectation (conservative)
+    est["run_usd"] = est["run_usd_guard"]            # the cap check: the no-cache expectation (conservative); the oracle's cached prefix is priced cached
     est["judge_usd_total"] = est["judge_usd"]
     est["reuse_dir"] = reuse or None
     est["retrieval_max_chars"] = retrieval_cap_of(args)

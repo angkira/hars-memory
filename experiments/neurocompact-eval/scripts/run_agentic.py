@@ -1022,7 +1022,11 @@ def estimate(arms, summaries_tokens: dict, n_questions_by_sid: dict, prof, model
                     acc["nocache"] += nq_s * (prof.cost_usd(model, int(sum(inputs)), int(S * o)) or 0.0)
                     acc["tokens"] += nq_s * (sum(inputs) + S * o)
             nq += nq_s
+        has_prefix = any(int(extra.get((sid, arm), 0)) for sid in n_questions_by_sid)
         per_arm[arm] = {"questions": nq, "usd_with_cache": round(acc["cached"], 4), "usd_without_cache": round(acc["nocache"], 4),
+                        # the cap check's figure: no cache (conservative) unless the arm carries a large STABLE prefix (the oracle's
+                        # transcript, far above any model's cache minimum), where caching certainly engages
+                        "usd_guard": round(acc["cached"] if has_prefix else acc["nocache"], 4),
                         "usd_calibrated": round(acc["calib"], 4), "steps_calibrated": S_cal,
                         "tokens_per_question": round(acc["tokens"] / max(1, nq)), "steps_assumed": S0}
     # upper bound: every question runs max_steps steps with the same increments
@@ -1031,6 +1035,7 @@ def estimate(arms, summaries_tokens: dict, n_questions_by_sid: dict, prof, model
     run_cached = sum(v["usd_with_cache"] for v in per_arm.values())
     run_nocache = sum(v["usd_without_cache"] for v in per_arm.values())
     run_calib = sum(v["usd_calibrated"] for v in per_arm.values())
+    run_guard = sum(v["usd_guard"] for v in per_arm.values())
     judge_items = n_q * len(arms)
     mean_tok = statistics.mean(v["tokens_per_question"] for v in per_arm.values()) if per_arm else 0
     ncl = n_sessions or len(n_questions_by_sid)
@@ -1039,8 +1044,8 @@ def estimate(arms, summaries_tokens: dict, n_questions_by_sid: dict, prof, model
             "assumptions": dict(EST), "max_steps": max_steps,
             "per_arm": per_arm, "run_usd_expected_with_cache": round(run_cached, 3),
             "run_usd_expected_without_cache": round(run_nocache, 3),
-            "run_usd_expected_calibrated": round(run_calib, 3),
-            "run_usd_upper_bound": round(run_nocache * cap_scale, 3),
+            "run_usd_expected_calibrated": round(run_calib, 3), "run_usd_guard": round(run_guard, 3),
+            "run_usd_upper_bound": round(run_guard * cap_scale, 3),
             "judge_items": judge_items, "judge_usd": round(judge_items * judge_unit_usd, 3),
             "mean_tokens_per_question": round(mean_tok),
             "mde_prior": {"rule": "MDE(80% power, alpha .05) = 2.8 * SD_paired_cluster / sqrt(n_sessions), SD assumed = "

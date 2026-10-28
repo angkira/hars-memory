@@ -435,6 +435,10 @@ class ControlsAndReuse(Base):
         pa = est["per_arm"]
         self.assertEqual(pa["sum+mem"]["usd_with_cache"], pa["sum+bm25"]["usd_with_cache"])        # same tool-result size in the model
         self.assertGreater(pa["oracle"]["tokens_per_question"], pa["sum+mem"]["tokens_per_question"])   # the transcript prefix
+        # the cap check prices the oracle's big stable prefix as cached (caching certainly engages), the others without cache (conservative)
+        self.assertEqual(pa["oracle"]["usd_guard"], pa["oracle"]["usd_with_cache"])
+        self.assertEqual(pa["sum+mem"]["usd_guard"], pa["sum+mem"]["usd_without_cache"])
+        self.assertAlmostEqual(est["run_usd_guard"], sum(v["usd_guard"] for v in pa.values()), places=2)
         self.assertGreater(est["run_usd_expected_calibrated"], 0)
         self.assertLessEqual(est["run_usd_expected_calibrated"], est["run_usd_expected_with_cache"])
         self.assertEqual(pa["sum+mem"]["steps_calibrated"], max(1, round(
