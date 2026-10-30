@@ -998,7 +998,8 @@ class HomeC10(T9.Home):
             json.dump({"budget_spent_all_invocations": 0.01, "failed_sessions": []}, open(os.path.join(out, "MANIFEST.json"), "w"))
             json.dump({"hars_extraction_measured": {}}, open(os.path.join(out, "summary.json"), "w"))
             open(os.path.join(out, "done.jsonl"), "w").write("")
-            open(os.path.join(out, "ingest.jsonl"), "w").write(json.dumps({"sid": sid, "ok": True, "extract_usage": {
+            open(os.path.join(out, "ingest.jsonl"), "w").write(json.dumps({"sid": sid, "ok": True, "project": pid, "ts": H.utc_iso(),
+                                                                            "extract_usage": {
                 "calls": 40, "prompt_tokens": 80000, "completion_tokens": 8000, "total_tokens": 88000, "usd": 0.012, "estimated": False,
                 "documents": 3, "documents_unmeasured": 0}}) + "\n")
             return 0, "ok\n"
@@ -1019,6 +1020,45 @@ class HomeC10(T9.Home):
         self.assertEqual(H.ingest_for_metrics(H.Campaign(self.camp, self.cfg_for_judge())), os.path.join(self.camp, "oh", "ingest-measure", "measure.json"))
         # the main projects were never written
         self.assertFalse([1 for pid_ in main_pids if os.path.exists(os.path.join(pdir, pid_))])
+        self.assertEqual(meas["plan"], plan["hars_run_id"])
+        self.assertTrue(os.path.isfile(os.path.join(self.camp, "oh", "ingest-measure", plan["hars_run_id"], "measure.json")))
+
+        # a repeated call never re-runs or rewrites a finished measurement (the bug: old numbers under a new timestamp)
+        before = open(os.path.join(self.camp, "oh", "ingest-measure", "measure.json")).read()
+        n_runs = len([1 for s_, a in r.calls if s_ == "run_longsession.py" and "--dry-run" not in a])
+        rc, so, se = self.go(r, "oh-ingest-measure", "--sessions", "1", "--projects-dir", pdir)
+        self.assertEqual(rc, 0, so + se)
+        self.assertIn("already MEASURED", so)
+        self.assertEqual(open(os.path.join(self.camp, "oh", "ingest-measure", "measure.json")).read(), before)
+        self.assertEqual(len([1 for s_, a in r.calls if s_ == "run_longsession.py" and "--dry-run" not in a]), n_runs)
+
+        # --new-measure: fresh ids AND a fresh run dir; rows that ran no extraction are refused, not reported
+        rc, so, se = self.go(r, "oh-ingest-measure", "--sessions", "1", "--projects-dir", pdir, "--new-measure",
+                             "--mcp", "http://127.0.0.1:8318/mcp")
+        self.assertEqual(rc, 3, so + se)
+        plan2 = H.read_json(os.path.join(self.camp, "campaign.json"))["c10_ingest_measure"]
+        self.assertEqual(plan2["mcp"], "http://127.0.0.1:8318/mcp")
+        pid2 = next(iter(plan2["pids"].values()))
+
+        def idle(argv):
+            if "--dry-run" in argv:
+                return orig_ls(argv)
+            self.assertEqual(r.arg(argv, "--mcp"), "http://127.0.0.1:8318/mcp")
+            out = r.arg(argv, "--out")
+            self.assertIn(plan2["hars_run_id"], out)                       # never the old run dir
+            os.makedirs(out, exist_ok=True)
+            json.dump({"run_id": "m2"}, open(os.path.join(out, "config.json"), "w"))
+            json.dump({"budget_spent_all_invocations": 0.0, "failed_sessions": []}, open(os.path.join(out, "MANIFEST.json"), "w"))
+            json.dump({}, open(os.path.join(out, "summary.json"), "w"))
+            open(os.path.join(out, "done.jsonl"), "w").write("")
+            open(os.path.join(out, "ingest.jsonl"), "w").write(json.dumps({"sid": sid, "ok": True, "project": pid2, "ts": H.utc_iso(),
+                                                                            "extract_usage": {"calls": 0, "total_tokens": 0}}) + "\n")
+            return 0, "ok\n"
+        r.longsession = idle
+        rc, so, se = self.go(r, "oh-ingest-measure", "--sessions", "1", "--projects-dir", pdir, "--mcp", "http://127.0.0.1:8318/mcp")
+        self.assertNotEqual(rc, 0, so + se)
+        self.assertIn("ran NO extraction", se + so)
+        self.assertEqual(open(os.path.join(self.camp, "oh", "ingest-measure", "measure.json")).read(), before)
 
 
 # --------------------------------------------------------------------------- bundle

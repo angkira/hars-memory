@@ -268,6 +268,12 @@ uv run python home_run.py oh-agentic --controls --resume $CAMP        # [--retri
 uv run python home_run.py oh-ingest-measure --resume $CAMP --dry-run
 uv run python home_run.py oh-ingest-measure --resume $CAMP --sessions 3   # first call: writes 3 throwaway project dirs and exits 3 -> RESTART the server ONCE
 uv run python home_run.py oh-ingest-measure --resume $CAMP --sessions 3   # second call: ingests them, writes oh/ingest-measure/measure.json, recomputes the C.10 report
+# MEASURE AGAIN (another server / other chunking): --new-measure is REQUIRED (fresh throwaway projects + a fresh run dir);
+# without it a finished measurement is reported, never re-run or rewritten. Point it at the server to measure with --mcp:
+#   uv run python home_run.py oh-ingest-measure --resume $CAMP --sessions 3 --new-measure --mcp http://127.0.0.1:8318/mcp   # exits 3 -> restart THAT server
+#   uv run python home_run.py oh-ingest-measure --resume $CAMP --sessions 3 --mcp http://127.0.0.1:8318/mcp
+# A run whose sessions ran no extraction (server answered "unchanged") is refused, not reported. Each plan keeps its own
+# oh/ingest-measure/<plan>/measure.json; oh/ingest-measure/measure.json is the latest (what the metrics read).
 # 6) the bundle (now includes the agentic traces, ingest.jsonl, recall/probe sidecars, gzip-compressed, redacted, <= --max-raw-mb 200)
 uv run python home_run.py bundle --resume $CAMP
 # 7) delete the 3 throwaway projects with the commands step 5 printed (rm -r <projects dir>/nc-<run id>m<MMDDHHMM>-<sid>; their Qdrant collections), restart once

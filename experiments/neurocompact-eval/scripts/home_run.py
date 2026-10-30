@@ -3409,12 +3409,25 @@ def cmd_oh_ingest_measure(camp: Campaign, args) -> int:
     plan = cj.get("c10_ingest_measure") if not getattr(args, "new_measure", False) else None
     if plan and plan.get("k") != k:
         plan = None
+    mcp = getattr(args, "mcp", None) or cfg["general"]["mcp"]
+    if plan and plan.get("measured_ts") and not args.dry_run:
+        # a finished measurement is never silently redone or rewritten: a new server config needs --new-measure
+        print(f"[oh-ingest-measure] plan {plan['hars_run_id']} was already MEASURED at {plan['measured_ts']} against {plan.get('mcp', '?')}; "
+              f"its result is {camp.p('oh', 'ingest-measure', plan['hars_run_id'], 'measure.json')}.\n"
+              "  Nothing was run and nothing was rewritten. To measure again (e.g. after changing the server's chunking / gleaning), pass "
+              "--new-measure (fresh throwaway projects, a fresh run dir).")
+        return 0
     if not plan:
         sids = measure_sids([x["sid"] for x in sessions], k)
+        used = set((cj.get("c10_ingest_measures") or {})) | ({(cj.get("c10_ingest_measure") or {}).get("hars_run_id")} - {None})
         rid_m = f"{pj['hars_run_id']}m{time.strftime('%m%d%H%M', time.gmtime())}"
+        n_ = 1
+        while rid_m in used:                                           # a second plan in the same minute must still be NEW
+            n_ += 1
+            rid_m = f"{pj['hars_run_id']}m{time.strftime('%m%d%H%M', time.gmtime())}{chr(96 + min(n_, 26))}"
         pdir = projects_dir_of(cfg, args)
         plan = {"k": k, "hars_run_id": rid_m, "sids": sids, "projects_dir": pdir, "pids": {sid: LS.make_project_id(rid_m, sid) for sid in sids},
-                "ts": utc_iso(), "provisioned": False, "main_run_id": pj["hars_run_id"], "n_sessions_total": len(sessions)}
+                "ts": utc_iso(), "provisioned": False, "main_run_id": pj["hars_run_id"], "n_sessions_total": len(sessions), "mcp": mcp}
         if set(plan["pids"].values()) & set(pj["pids"].values()) or "default" in plan["pids"].values():
             raise HomeRunError("a throwaway project id collides with a main nc-* project or `default`")
     print(f"[oh-ingest-measure] {len(plan['sids'])} of {len(sessions)} session(s) {plan['sids']} -> throwaway projects `nc-{plan['hars_run_id']}-<sid>` "
@@ -3442,29 +3455,50 @@ def cmd_oh_ingest_measure(camp: Campaign, args) -> int:
               f"projects dir at start only; HARS_MEMORY_PROJECTS_DIR={plan['projects_dir']}), then re-run THE SAME command:\n"
               f"  home_run.py oh-ingest-measure --resume {os.path.basename(camp.path)} --sessions {k}")
         return 3
+    if plan.get("mcp") and plan["mcp"] != mcp:
+        raise HomeRunError(f"plan {plan['hars_run_id']} was provisioned for {plan['mcp']}, this call targets {mcp}; pass the same --mcp, "
+                           "or --new-measure for a new plan")
     cj["c10_ingest_measure"] = plan
     write_json(camp.p("campaign.json"), cj)
     if not cfg["general"].get("_offline") and camp.guards_enabled:          # a fake runner (tests) has no server to ask
         try:
-            lp = (getattr(camp, "probes", None) or Probes()).mcp(cfg["general"]["mcp"], "memory_list_projects", {}, 60)
+            lp = (getattr(camp, "probes", None) or Probes()).mcp(mcp, "memory_list_projects", {}, 60)
             have = {p.get("project_id") for p in (lp or {}).get("projects", [])}
         except Exception as e:  # noqa: BLE001
             raise HomeRunError(f"memory_list_projects failed ({type(e).__name__}: {str(e)[:120]}): is the server up?")
         miss = [p for p in plan["pids"].values() if p not in have]
         if miss:
             raise HomeRunError(f"{len(miss)} throwaway project(s) are not registered on the server ({miss[:2]}): restart it once, then re-run")
-    ddir = camp.p("oh", "ingest-measure", "ls-data")                  # the K sessions only (run_longsession --sessions takes files / dirs)
+    mdir = camp.p("oh", "ingest-measure", plan["hars_run_id"])        # one dir per plan: a new plan never resumes an old run
+    ddir = os.path.join(mdir, "ls-data")                              # the K sessions only (run_longsession --sessions takes files / dirs)
     os.makedirs(ddir, exist_ok=True)
     wanted = set(plan["sids"])
     for x in sessions:
         if x["sid"] in wanted and x.get("_path"):
             shutil.copy2(x["_path"], os.path.join(ddir, os.path.basename(x["_path"])))
-    run_dir = camp.p("oh", "ingest-measure", "run")
+    run_dir = os.path.join(mdir, "run")
     budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
     extra = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--hars-layout", "project", "--hars-run-id", plan["hars_run_id"], "--ingest-only"]
-    ls_run_step(camp, "oh", ddir, run_dir, budgets, "end", True, extra, len(plan["sids"]), args.accept_partial, "oh-ingest-measure",
-                step="oh.ingest.measure.run")
+    saved_mcp = cfg["general"]["mcp"]
+    cfg["general"]["mcp"] = mcp                                       # ls_run_step passes the campaign's --mcp
+    try:
+        ls_run_step(camp, "oh", ddir, run_dir, budgets, "end", True, extra, len(plan["sids"]), args.accept_partial, "oh-ingest-measure",
+                    step=f"oh.ingest.measure.run.{plan['hars_run_id']}")
+    finally:
+        cfg["general"]["mcp"] = saved_mcp
     rows = read_jsonl(os.path.join(run_dir, "ingest.jsonl"))
+    # the rows must come from THIS plan's throwaway projects and from real extraction, never from an earlier run
+    want = set(plan["pids"].values())
+    foreign = [r.get("project") for r in rows if r.get("project") not in want]
+    if foreign:
+        raise HomeRunError(f"ingest rows of other projects in {run_dir} ({foreign[:2]}): refusing to report them as this plan's measurement")
+    stale = [r.get("sid") for r in rows if str(r.get("ts") or "") < str(plan["ts"])]
+    if stale:
+        raise HomeRunError(f"ingest rows older than plan {plan['hars_run_id']} ({stale[:3]}): not a fresh measurement")
+    idle = [r.get("sid") for r in rows if not ((r.get("extract_usage") or {}).get("calls") or 0)]
+    if idle:
+        raise HomeRunError(f"{len(idle)} session(s) ran NO extraction ({idle[:3]}): the server answered 'unchanged' (already-ingested "
+                           "content) or did not report usage; nothing was measured. Use --new-measure for fresh projects.")
     ext_price = None
     summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
     m = (summ.get("hars_extraction_measured") or {})
@@ -3487,10 +3521,17 @@ def cmd_oh_ingest_measure(camp: Campaign, args) -> int:
                                   "calls": mean("calls") * total_n,
                                   "estimated": any(x["estimated"] or x["documents_unmeasured"] for x in good),
                                   "note": f"mean of {n} measured session(s) x {total_n} sessions (the sessions differ in size by ~10%: a mean, not a sum)"},
-           "run_summary": m, "throwaway_projects": plan["pids"]}
+           "run_summary": m, "throwaway_projects": plan["pids"], "plan": plan["hars_run_id"], "mcp": mcp, "run_dir": run_dir}
     out.update(out["extrapolated_total"])                                 # metrics_agentic.load_ingest reads usd / total_tokens
     out["usd"], out["total_tokens"] = out["extrapolated_total"]["usd"], out["extrapolated_total"]["total_tokens"]
-    write_json(camp.p("oh", "ingest-measure", "measure.json"), out)
+    write_json(os.path.join(mdir, "measure.json"), out)                # per plan: kept
+    write_json(camp.p("oh", "ingest-measure", "measure.json"), out)    # the latest: what the metrics read
+    plan["measured_ts"] = out["ts"]
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj["c10_ingest_measure"] = plan
+    cj.setdefault("c10_ingest_measures", {})[plan["hars_run_id"]] = {"ts": out["ts"], "mcp": mcp, "mean_usd": out["mean_per_session"]["usd"]}
+    write_json(camp.p("campaign.json"), cj)
+    camp.force_steps.add("oh.ingest.measure")
     camp.step("oh.ingest.measure", lambda: {"sessions": n, "mean_usd": out["mean_per_session"]["usd"], "extrapolated_usd": out["usd"],
                                              "extrapolated_tokens": out["total_tokens"]})
     print(f"\n[oh-ingest-measure] MEASURED over {n} session(s): mean {out['mean_per_session']['tokens']:,.0f} tokens "
@@ -4352,7 +4393,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "tokens / USD (never the main nc-* projects); first call provisions + asks for a server restart, second ingests")
     t.add_argument("--sessions", type=int, default=3, metavar="K", help="sessions to re-ingest (default 3, spread over the sorted sids)")
     t.add_argument("--dry-run", action="store_true", help="print the plan, the estimate and the delete instructions; write nothing")
-    t.add_argument("--new-measure", action="store_true", help="forget the recorded throwaway ids and mint new ones")
+    t.add_argument("--new-measure", action="store_true", help="forget the recorded throwaway ids and mint new ones (fresh projects, fresh run "
+                                                              "dir); REQUIRED to measure again, e.g. after changing the server's chunking")
     t.add_argument("--projects-dir", default=None, metavar="DIR")
     t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
     t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
