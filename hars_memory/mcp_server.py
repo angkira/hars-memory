@@ -1184,6 +1184,22 @@ def _staging_backlog_info(staging_dir: Path | None = None) -> dict[str, Any]:
 _rag_instance: object | None = None
 
 
+# Opt-in upsert content dedup (see memory_upsert_document). Default off: the
+# exact-content skip changes write semantics, so it must never happen silently.
+# Read once at import like the other HARS_MEMORY_* flags above (the MCP server
+# process picks it up at startup).
+_UPSERT_CONTENT_DEDUP_ENABLED = os.environ.get("HARS_MEMORY_UPSERT_CONTENT_DEDUP", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Opt-in batch queueing of upserts (see memory_upsert_document and
+# hars_memory/ingest/upsert_inbox.py). Default off: "queued_for_batch" defers
+# the document's recall-availability to a later `memory index-batch --source
+# upsert-inbox` run, so it must never happen silently. Read once at import,
+# exactly like the content-dedup flag above.
+_UPSERT_BATCH_QUEUE_ENABLED = os.environ.get("HARS_MEMORY_UPSERT_BATCH_MODE", "").strip().lower() == "queue"
+
+
 async def _doc_processing_state(rag: object, doc_id: str) -> str | None:
     """LightRAG doc_status of *doc_id* in *rag* ("processed", "pending", "failed", ...), "missing"
     when the index has no status row for it, or None when it cannot be read (no doc_status store)."""
@@ -6684,6 +6700,21 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
             stored_fp = store.get(doc.doc_id)
 
             if stored_fp == current_fp:
+                # Bookkeeping-only: make already-indexed documents visible to
+                # the opt-in content dedup without changing the fast path's
+                # answer or touching the index.
+                if _UPSERT_CONTENT_DEDUP_ENABLED:
+                    from hars_memory.ingest.change_detection import (
+                        ContentDedupStore,
+                        default_content_dedup_store_path,
+                    )
+
+                    dedup_store = ContentDedupStore.load(
+                        default_content_dedup_store_path(idx_dir)
+                    )
+                    if dedup_store.lookup(current_fp) != doc.doc_id:
+                        dedup_store.set(current_fp, doc.doc_id)
+                        dedup_store.save()
                 return json_text({
                     "ok": True,
                     "action": "unchanged",
@@ -6693,7 +6724,95 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
                     "note": "Document content is identical to stored fingerprint; skipped.",
                 })
 
+            # Opt-in batch queue (HARS_MEMORY_UPSERT_BATCH_MODE=queue): store the
+            # FINAL document — the source header is already applied in doc.content,
+            # exactly what the synchronous path below would insert — in the
+            # index-dir inbox sidecar instead of extracting now. `memory
+            # index-batch --source upsert-inbox` (collect -> submit -> apply) later
+            # indexes it at batch prices. Contract kept identical to the sync path:
+            # NO fingerprint is recorded and nothing is purged until apply really
+            # processed the document, so a retry re-queues instead of answering
+            # "unchanged". Default (flag unset): this branch is dead code and the
+            # behaviour is byte-for-byte the synchronous path.
+            if _UPSERT_BATCH_QUEUE_ENABLED:
+                from hars_memory.ingest.upsert_inbox import (
+                    UpsertInboxStore,
+                    default_upsert_inbox_path,
+                )
+
+                inbox = UpsertInboxStore.load(default_upsert_inbox_path(idx_dir))
+                entry_id = inbox.put_document(doc, fingerprint=current_fp)
+                inbox.save()
+                log_write_event(
+                    tool="memory_upsert_document",
+                    ok=True,
+                    detail={
+                        "doc_id": doc.doc_id,
+                        "file_path": str(path),
+                        "action": "queued_for_batch",
+                    },
+                )
+                return json_text({
+                    "ok": True,
+                    "action": "queued_for_batch",
+                    "doc_id": doc.doc_id,
+                    "entry_id": entry_id,
+                    "file_path": str(path),
+                    "fingerprint": current_fp,
+                    "note": (
+                        "HARS_MEMORY_UPSERT_BATCH_MODE=queue: document stored in the upsert inbox "
+                        "(no extraction ran, it is NOT visible to recall yet). Run `memory index-batch "
+                        "--source upsert-inbox` (collect -> submit -> apply) to index it at batch prices; "
+                        "apply records the fingerprint and drains the inbox entry."
+                    ),
+                })
+
             rag = await _get_rag(project_id)
+
+            # Opt-in content dedup (HARS_MEMORY_UPSERT_CONTENT_DEDUP): if this
+            # EXACT content was already indexed under a different path, skip the
+            # insert entirely. Placed BEFORE the stale-chunk purge so a dedup hit
+            # never performs a destructive action; a mapping whose target doc is
+            # no longer "processed" is ignored (falls through to a normal insert,
+            # which then re-records the mapping). Default: off, byte-identical to
+            # the pre-flag behaviour.
+            dedup_store = None
+            if _UPSERT_CONTENT_DEDUP_ENABLED:
+                from hars_memory.ingest.change_detection import (
+                    ContentDedupStore,
+                    default_content_dedup_store_path,
+                )
+
+                dedup_store = ContentDedupStore.load(
+                    default_content_dedup_store_path(idx_dir)
+                )
+                existing_doc_id = dedup_store.lookup(current_fp)
+                if existing_doc_id and existing_doc_id != doc.doc_id:
+                    existing_state = await _doc_processing_state(rag, existing_doc_id)
+                    if existing_state == "processed":
+                        log_write_event(
+                            tool="memory_upsert_document",
+                            ok=True,
+                            detail={
+                                "doc_id": doc.doc_id,
+                                "file_path": str(path),
+                                "action": "skipped_duplicate_of_existing",
+                                "existing_doc_id": existing_doc_id,
+                            },
+                        )
+                        return json_text({
+                            "ok": True,
+                            "action": "skipped_duplicate_of_existing",
+                            "doc_id": doc.doc_id,
+                            "existing_doc_id": existing_doc_id,
+                            "file_path": str(path),
+                            "fingerprint": current_fp,
+                            "note": (
+                                "Content identical to an already-processed document "
+                                f"({existing_doc_id}); no insert performed (HARS_MEMORY_UPSERT_CONTENT_DEDUP). "
+                                "The source document at this file_path was not purged or modified."
+                            ),
+                        })
 
             if stored_fp is not None:
                 logger.info("Purging stale chunks for modified doc %s before upsert", doc.doc_id)
@@ -6729,6 +6848,10 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
 
             store.set(doc.doc_id, current_fp)
             store.save()
+
+            if dedup_store is not None:
+                dedup_store.set(current_fp, doc.doc_id)
+                dedup_store.save()
 
             _clear_in_memory_graph_cache(project_id)
             _invalidate_bm25_cache(project_id)
@@ -6801,6 +6924,22 @@ async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
             store = FingerprintStore.load(store_path)
             store.discard(target_doc_id)
             store.save()
+
+            # Keep the opt-in content-dedup store consistent: any mapping that
+            # pointed at the deleted doc_id would otherwise make a re-upsert of
+            # that content skip (the mapping is also ignored at lookup time when
+            # the target doc is not "processed", so this is belt-and-braces).
+            if _UPSERT_CONTENT_DEDUP_ENABLED:
+                from hars_memory.ingest.change_detection import (
+                    ContentDedupStore,
+                    default_content_dedup_store_path,
+                )
+
+                dedup_store = ContentDedupStore.load(
+                    default_content_dedup_store_path(idx_dir)
+                )
+                if dedup_store.discard_doc_id(target_doc_id):
+                    dedup_store.save()
 
             _clear_in_memory_graph_cache(project_id)
             _invalidate_bm25_cache(project_id)

@@ -21,6 +21,7 @@ import pytest
 from hars_memory.retrieval.tokenizer import (
     extract_identifier_terms,
     looks_like_identifier,
+    sparse_stemmer_mode,
     tokenize_identifiers,
 )
 
@@ -107,6 +108,135 @@ class TestIdentifierDetection:
 
     def test_extract_identifier_terms_empty_for_plain_question(self) -> None:
         assert extract_identifier_terms("What happened in training yesterday?") == []
+
+
+class TestSparseStemmerModes:
+    """Item: `HARS_MEMORY_SPARSE_STEMMER` (retrieval/tokenizer.py module
+    docstring) — optional Snowball morphology for the BM25 sparse channel.
+
+    Default "off" must be BYTE-IDENTICAL to the pre-stemmer behaviour (the
+    ASCII identifier guarantee is untouched; Cyrillic yields no tokens at all
+    — a documented, deliberate default limitation, not a regression). The
+    "ru"/"en" modes are exercised only when PyStemmer (extras group
+    `sparse-stem`) is importable; they skip otherwise.
+    """
+
+    # Measured morphology pair that motivated the feature: noun vs infinitive
+    # of the same verb must MATCH under "ru" (they do NOT under bare Snowball
+    # stems — делегирован vs делегирова — hence the additional prefix token;
+    # see the module docstring and the 2026-11-01 experiment numbers).
+    _RU_QUERY = "Как оформить делегирование полномочий?"
+    _RU_DOC = "Чтобы делегировать полномочия, назначьте ответственного и срок."
+
+    def test_default_off_leaves_cyrillic_untokenized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Deliberate default (ASCII-only run regex): the sparse channel is
+        # inert on Cyrillic until the stemmer mode is switched on. Asserting
+        # it here anchors the byte-identical-default guarantee explicitly.
+        monkeypatch.delenv("HARS_MEMORY_SPARSE_STEMMER", raising=False)
+        assert tokenize_identifiers("Делегирование задач делегировать") == []
+
+    def test_default_off_golden_mixed_sentence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("HARS_MEMORY_SPARSE_STEMMER", raising=False)
+        assert tokenize_identifiers("See Q7X42 (also phase_x1_adapter_safe), e.g. vma_native.") == [
+            "see",
+            "q7x42",
+            "q7",
+            "x42",
+            "also",
+            "phase_x1_adapter_safe",
+            "phase",
+            "x1",
+            "adapter",
+            "safe",
+            "e.g",
+            "e",
+            "g",
+            "vma_native",
+            "vma",
+            "native",
+        ]
+
+    def test_explicit_off_matches_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "off")
+        assert (
+            sparse_stemmer_mode() == "off"
+        )  # strip/lower tolerant on the raw value itself
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "  OFF ")
+        assert sparse_stemmer_mode() == "off"
+
+    def test_invalid_mode_raises_valueerror_without_touching_pystemmer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Validation precedes the optional import, so an invalid value fails
+        # fast even on hosts where PyStemmer is not installed at all.
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "de")
+        with pytest.raises(ValueError, match="HARS_MEMORY_SPARSE_STEMMER"):
+            tokenize_identifiers("whatever")
+
+    def test_en_mode_without_pystemmer_raises_clear_importerror(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import importlib.util
+
+        if importlib.util.find_spec("Stemmer") is not None:
+            pytest.skip("PyStemmer installed — the lazy-import guard cannot fire here")
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "en")
+        with pytest.raises(ImportError, match="sparse-stem"):
+            tokenize_identifiers("delegation of tasks")
+
+    def test_ru_mode_matches_noun_with_infinitive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("Stemmer")
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "ru")
+        query_tokens = set(tokenize_identifiers(self._RU_QUERY))
+        doc_tokens = set(tokenize_identifiers(self._RU_DOC))
+        shared = query_tokens & doc_tokens
+        assert shared, (
+            f"«делегирование» must match «делегировать» under ru; "
+            f"query={sorted(query_tokens)} doc={sorted(doc_tokens)}"
+        )
+
+    def test_ru_mode_cyrillic_tokens_are_additive_to_ascii(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("Stemmer")
+        text = "Делегирование задач — см. Q7X42."
+        monkeypatch.delenv("HARS_MEMORY_SPARSE_STEMMER", raising=False)
+        off_tokens = set(tokenize_identifiers(text))
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "ru")
+        ru_tokens = set(tokenize_identifiers(text))
+        # "ru" mode ADDS Cyrillic morphology on top of the byte-identical
+        # ASCII pass — it never removes or rewrites the identifier tokens.
+        assert off_tokens.issubset(ru_tokens)
+        assert "q7x42" in ru_tokens
+        assert ru_tokens - off_tokens, "expected Cyrillic stems to be added"
+
+    def test_ru_mode_stems_converge_regular_inflections(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("Stemmer")
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "ru")
+        # Bare-stem convergence (measured, PyStemmer 3.1.0): instrumental
+        # plural vs genitive singular of "задача" share the stem "задач".
+        assert set(tokenize_identifiers("задачами")) & set(tokenize_identifiers("задач"))
+
+    def test_en_mode_stems_english_inflections_but_keeps_identifiers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("Stemmer")
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "en")
+        query_tokens = set(tokenize_identifiers("delegating authority"))
+        doc_tokens = set(tokenize_identifiers("delegation of tasks, delegate phase_x1_adapter_safe"))
+        assert query_tokens & doc_tokens, "delegating/delegation/delegate must converge"
+        # The identifier guarantee is untouched in "en" mode: only plain-word
+        # runs are stemmed, identifier-shaped runs keep whole + sub-tokens.
+        assert "phase_x1_adapter_safe" in doc_tokens
+        assert {"phase", "x1", "adapter", "safe"} <= doc_tokens
 
 
 class TestFusionMath:
@@ -841,3 +971,114 @@ class TestBM25IndexCache:
 
         with pytest.raises(BM25CacheDirNotAbsoluteError):
             load_index("relative/cache")
+
+
+class TestBM25IndexSparseStemmer:
+    """End-to-end: `HARS_MEMORY_SPARSE_STEMMER` through the real BM25 index
+    (build + search + disk cache). The default ("off") channel is INERT on
+    Russian text — zero tokens, zero hits — which is the shipped behaviour
+    this flag opts out of; "ru" makes noun-vs-infinitive queries hit."""
+
+    def _russian_chunks(self) -> dict[str, dict]:
+        return {
+            "chunk-ru-1": {
+                "content": (
+                    "Чтобы делегировать задачу, назначьте ответственного "
+                    "и срок исполнения."
+                ),
+                "file_path": "docs-ru-делегирование.md",
+            },
+            "chunk-ru-2": {
+                "content": "Ретроспектива спринта проводится в конце итерации.",
+                "file_path": "docs-ru-процессы.md",
+            },
+            "chunk-id-1": {
+                "content": "Experiment Q7X42 stabilized the gate at step 80.",
+                "file_path": "hyp_q7x42.md",
+            },
+        }
+
+    def _write_chunks(self, working_dir: Path, chunks: dict[str, dict]) -> None:
+        working_dir.mkdir(parents=True, exist_ok=True)
+        (working_dir / "kv_store_text_chunks.json").write_text(
+            json.dumps(chunks, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def test_default_off_russian_corpus_is_inert(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hars_memory.retrieval.bm25_index import build_index
+
+        monkeypatch.delenv("HARS_MEMORY_SPARSE_STEMMER", raising=False)
+        working_dir = tmp_path / "working"
+        self._write_chunks(working_dir, self._russian_chunks())
+        index, _ = build_index(str(working_dir))
+        assert index.stemmer_mode == "off"
+        # Shipped default: Cyrillic text produced no tokens, so a Cyrillic
+        # query matches nothing (documented limitation, not a crash).
+        assert index.search("делегирование задач", top_k=3) == []
+        # ...while the identifier channel is untouched:
+        hits = index.search("Q7X42", top_k=3)
+        assert hits and hits[0].chunk_id == "chunk-id-1"
+
+    def test_ru_mode_russian_query_finds_infinitive_document(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("Stemmer")
+        from hars_memory.retrieval.bm25_index import build_index
+
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "ru")
+        working_dir = tmp_path / "working"
+        self._write_chunks(working_dir, self._russian_chunks())
+        index, _ = build_index(str(working_dir))
+        assert index.stemmer_mode == "ru"
+        hits = index.search("делегирование задач", top_k=3)
+        assert hits, "«делегирование задач» must hit the «делегировать задачу» chunk"
+        assert hits[0].chunk_id == "chunk-ru-1"
+        # The identifier channel coexists with the stemmed Cyrillic tokens.
+        assert index.search("Q7X42", top_k=3)[0].chunk_id == "chunk-id-1"
+
+    def test_cache_rebuilds_when_stemmer_mode_changes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("Stemmer")
+        from hars_memory.retrieval.bm25_index import get_or_build_index
+
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        self._write_chunks(working_dir, self._russian_chunks())
+
+        monkeypatch.delenv("HARS_MEMORY_SPARSE_STEMMER", raising=False)
+        _index, stats_off = get_or_build_index(str(working_dir), str(cache_dir))
+        assert stats_off.cache_hit is False
+        _index, stats_off2 = get_or_build_index(str(working_dir), str(cache_dir))
+        assert stats_off2.cache_hit is True  # plain mtime reuse, mode unchanged
+
+        # Flipping the mode must NOT serve the old tokens as a cache hit —
+        # bm25s matches literal token strings, so a mode-stale cache would
+        # yield empty matches. The mode is treated like an mtime change.
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "ru")
+        index_ru, stats_ru = get_or_build_index(str(working_dir), str(cache_dir))
+        assert stats_ru.cache_hit is False
+        assert index_ru.stemmer_mode == "ru"
+
+        # ...and the ru cache is reused while the mode stays "ru".
+        _index, stats_ru2 = get_or_build_index(str(working_dir), str(cache_dir))
+        assert stats_ru2.cache_hit is True
+
+    def test_cache_sidecar_records_stemmer_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("Stemmer")
+        from hars_memory.retrieval.bm25_index import get_or_build_index
+
+        working_dir = tmp_path / "working"
+        working_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        self._write_chunks(working_dir, self._russian_chunks())
+
+        monkeypatch.setenv("HARS_MEMORY_SPARSE_STEMMER", "ru")
+        get_or_build_index(str(working_dir), str(cache_dir))
+        meta = json.loads((cache_dir / "bm25_cache_meta.json").read_text(encoding="utf-8"))
+        assert meta["stemmer_mode"] == "ru"

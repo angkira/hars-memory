@@ -59,7 +59,9 @@ ARM_SUM_BM25 = "sum+bm25"        # the SAME tool (name, schema, prompt) as sum+m
 ARM_SUM_GREP = "sum+grep"        # transcript_grep(pattern) over the same dropped text
 ARM_ORACLE = "oracle"            # the full dropped transcript in the system prompt, no retrieval tool
 ARM_SUM_MEM_UNCAPPED = "sum+mem@uncapped"       # label of the C.9 sum+mem rows (the server ignored max_chars for them)
-ALL_ARMS = (ARM_SUM, ARM_SUM_MEM, ARM_NOTE_MEM, ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE)
+ARM_SUM_NOTE = "sum+note"        # baseline summary + the short C.6 note appended, NO retrieval tool (the no-transcript
+                                 # legal static-memory control: everything it knows was saved at compaction time)
+ALL_ARMS = (ARM_SUM, ARM_SUM_MEM, ARM_NOTE_MEM, ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE, ARM_SUM_NOTE)
 DEFAULT_ARMS = (ARM_SUM, ARM_SUM_MEM)
 CONTROL_ARMS = (ARM_SUM_MEM, ARM_SUM_BM25, ARM_SUM_GREP, ARM_ORACLE)     # `--controls`; `sum` is reused from the C.9 run
 MEM_ARMS = (ARM_SUM_MEM, ARM_NOTE_MEM)                      # backed by HARS
@@ -67,7 +69,8 @@ RECALL_TOOL_ARMS = MEM_ARMS + (ARM_SUM_BM25,)               # arms that are give
 CAPPED_ARMS = RECALL_TOOL_ARMS + (ARM_SUM_GREP,)            # arms whose retrieval tool output is capped at --retrieval-max-chars
 REUSED_ARM_LABELS = {ARM_SUM: ARM_SUM, ARM_SUM_MEM: ARM_SUM_MEM_UNCAPPED}    # arm of the C.9 run -> its label in a C.10 run
 SUMMARY_SOURCE = {ARM_SUM: "baseline", ARM_SUM_MEM: "baseline", ARM_NOTE_MEM: "nc-note-only",
-                  ARM_SUM_BM25: "baseline", ARM_SUM_GREP: "baseline", ARM_ORACLE: "baseline"}   # old-run arm whose memory_text is used
+                  ARM_SUM_BM25: "baseline", ARM_SUM_GREP: "baseline", ARM_ORACLE: "baseline",
+                  ARM_SUM_NOTE: "baseline"}   # old-run arm whose memory_text is used
 WORKSPACE_TOOLS = ("ls", "read_file", "grep")
 DEFAULT_MAX_STEPS = 12
 DEFAULT_QUESTION_TOKEN_CAP = 400_000
@@ -666,6 +669,8 @@ def load_sources(reuse_dir: str, sessions: dict[str, dict], arms, mem_budget: in
     end-checkpoint questions (valid baseline rows). The text is NOT altered; a session whose rows disagree on it is an error."""
     rows = read_jsonl(os.path.join(reuse_dir, "records.jsonl"))
     need_arms = {SUMMARY_SOURCE[a] for a in arms} | {"baseline"}      # baseline rows also define the question set
+    if ARM_NOTE_MEM in arms or ARM_SUM_NOTE in arms:
+        need_arms.add("nc-note-only")
     mem: dict[tuple[str, str], str] = {}
     qrows: dict[str, dict[str, dict]] = {}
     for r in rows:
@@ -688,7 +693,7 @@ def load_sources(reuse_dir: str, sessions: dict[str, dict], arms, mem_budget: in
         if sid not in sessions:
             raise SourceError(f"{sid}: in the old run but not in --sessions")
         out["summary"][sid] = mem[(sid, "baseline")]
-        if ARM_NOTE_MEM in arms:
+        if ARM_NOTE_MEM in arms or ARM_SUM_NOTE in arms:
             if (sid, "nc-note-only") not in mem:
                 raise SourceError(f"{sid}: no valid nc-note-only rows: the note+mem arm needs the old note")
             out["note"][sid] = mem[(sid, "nc-note-only")]
@@ -932,9 +937,12 @@ def run_session(ctx: Ctx, sid: str, session: dict, src: dict, ws_root: str, proj
     ws = Workspace(ws_root, a.tool_output_chars, use_rg=not a.no_rg)
     kit = SessionKit(a, session, ws, load_ws_meta(a, sid), a.arms_list)
     dropped = dropped_text(session)
-    summaries = {arm: src["summary"][sid] for arm in a.arms_list if arm != ARM_NOTE_MEM}
+    summaries = {arm: src["summary"][sid] for arm in a.arms_list
+                 if arm not in (ARM_NOTE_MEM, ARM_SUM_NOTE)}
     if ARM_NOTE_MEM in a.arms_list:
         summaries[ARM_NOTE_MEM] = src["note"][sid]
+    if ARM_SUM_NOTE in a.arms_list:
+        summaries[ARM_SUM_NOTE] = (src["summary"][sid] + "\n\n" + src["note"][sid]).strip()
     n = 0
     for qi, q in enumerate(src["questions"][sid]):
         flags = subset_flags(q, src["summary"][sid], dropped)
@@ -1213,7 +1221,13 @@ class MockAgent:
 
 
 def summaries_tokens_of(src: dict, arms) -> dict:
-    return {(sid, arm): L.count_tokens(src["note"][sid] if arm == ARM_NOTE_MEM else src["summary"][sid])
+    def text_of(arm: str, sid: str) -> str:
+        if arm == ARM_NOTE_MEM:
+            return src["note"][sid]
+        if arm == ARM_SUM_NOTE:
+            return (src["summary"][sid] + "\n\n" + src["note"][sid]).strip()
+        return src["summary"][sid]
+    return {(sid, arm): L.count_tokens(text_of(arm, sid))
             for sid in src["summary"] for arm in arms}
 
 

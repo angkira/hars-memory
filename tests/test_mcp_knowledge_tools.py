@@ -269,6 +269,272 @@ class TestMemoryUpsertDocument:
             assert store.get(data["doc_id"]) is not None
 
 
+def _upsert_fingerprint(doc_file: Path, content: str) -> str:
+    """The fingerprint memory_upsert_document computes for (doc_file, content)."""
+    from hars_memory.ingest.walker import (
+        HEADER_DATE_UNKNOWN,
+        _file_date,
+        _infer_section,
+        apply_source_header,
+        build_source_header,
+        infer_source_kind,
+    )
+
+    kind = infer_source_kind(doc_file)
+    mtime = doc_file.stat().st_mtime if doc_file.exists() else 0.0
+    date_str = _file_date(doc_file, mtime) if doc_file.exists() else HEADER_DATE_UNKNOWN
+    header = build_source_header(
+        document_name=doc_file.name,
+        section=_infer_section(doc_file.parent, kind),
+        date=date_str,
+    )
+    final_content = apply_source_header(content, header)
+    return compute_fingerprint(final_content)
+
+
+class TestUpsertContentDedup:
+    """HARS_MEMORY_UPSERT_CONTENT_DEDUP: opt-in exact-content upsert skip."""
+
+    CONTENT = "# Session Notes\nVerbatim transcript payload."
+
+    def _seed_dedup(self, index_dir: Path, fingerprint: str, doc_id: str) -> Path:
+        from hars_memory.ingest.change_detection import (
+            ContentDedupStore,
+            default_content_dedup_store_path,
+        )
+
+        path = default_content_dedup_store_path(str(index_dir))
+        store = ContentDedupStore.load(path)
+        store.set(fingerprint, doc_id)
+        store.save()
+        return path
+
+    def _processed_rag(self) -> AsyncMock:
+        mock_rag = AsyncMock()
+        mock_rag.adelete_by_doc_id = AsyncMock()
+        mock_rag.doc_status.get_by_id = AsyncMock(
+            return_value={"status": "processed"}
+        )
+        return mock_rag
+
+    def test_disabled_by_default_inserts_duplicate(self, tmp_path: Path) -> None:
+        """Without the flag the behaviour is exactly as before: the duplicate
+        content is processed as a new document (dedup store is not consulted)."""
+        index_dir = tmp_path / "index"
+        staging_dir = tmp_path / "staging"
+        doc_a = tmp_path / "a" / "session.md"
+        doc_b = tmp_path / "b" / "session.md"
+        doc_a.parent.mkdir(parents=True)
+        doc_b.parent.mkdir(parents=True)
+
+        fp = _upsert_fingerprint(doc_b, self.CONTENT)
+        self._seed_dedup(index_dir, fp, "doc-existing")
+
+        mod: Any = _load_mcp_module_with_env({
+            "HARS_MEMORY_INDEX_DIR": str(index_dir),
+            "HARS_MEMORY_STAGING_DIR": str(staging_dir),
+        })
+
+        mock_rag = self._processed_rag()
+        with patch.object(mod, "_get_rag", new=AsyncMock(return_value=mock_rag)), \
+             patch("hars_memory.server.index._insert_all_batches", new=AsyncMock()) as mock_insert:
+            res = asyncio.run(
+                mod.call_tool("memory_upsert_document", {
+                    "file_path": str(doc_b),
+                    "content": self.CONTENT,
+                })
+            )
+        data = json.loads(res[0].text)
+        assert data["ok"] is True
+        assert data["action"] == "inserted"
+        mock_insert.assert_called_once()
+
+    def test_flag_on_skips_insert_when_duplicate_processed(self, tmp_path: Path) -> None:
+        index_dir = tmp_path / "index"
+        staging_dir = tmp_path / "staging"
+        doc_a = tmp_path / "a" / "session.md"
+        doc_b = tmp_path / "b" / "session.md"
+        doc_a.parent.mkdir(parents=True)
+        doc_b.parent.mkdir(parents=True)
+
+        fp = _upsert_fingerprint(doc_b, self.CONTENT)
+        self._seed_dedup(index_dir, fp, "doc-existing")
+
+        mod: Any = _load_mcp_module_with_env({
+            "HARS_MEMORY_INDEX_DIR": str(index_dir),
+            "HARS_MEMORY_STAGING_DIR": str(staging_dir),
+            "HARS_MEMORY_UPSERT_CONTENT_DEDUP": "1",
+        })
+
+        mock_rag = self._processed_rag()
+        with patch.object(mod, "_get_rag", new=AsyncMock(return_value=mock_rag)), \
+             patch("hars_memory.server.index._insert_all_batches", new=AsyncMock()) as mock_insert, \
+             patch.object(mod, "_clear_in_memory_graph_cache") as mock_graph_inv, \
+             patch.object(mod, "_invalidate_bm25_cache") as mock_bm25_inv:
+            res = asyncio.run(
+                mod.call_tool("memory_upsert_document", {
+                    "file_path": str(doc_b),
+                    "content": self.CONTENT,
+                })
+            )
+        data = json.loads(res[0].text)
+        assert data["ok"] is True
+        assert data["action"] == "skipped_duplicate_of_existing"
+        assert data["existing_doc_id"] == "doc-existing"
+        # No insert, no destructive purge, no cache invalidation.
+        mock_insert.assert_not_called()
+        mock_rag.adelete_by_doc_id.assert_not_called()
+        mock_graph_inv.assert_not_called()
+        mock_bm25_inv.assert_not_called()
+
+    def test_flag_on_records_mapping_after_successful_insert(self, tmp_path: Path) -> None:
+        from hars_memory.ingest.change_detection import (
+            ContentDedupStore,
+            default_content_dedup_store_path,
+        )
+
+        index_dir = tmp_path / "index"
+        staging_dir = tmp_path / "staging"
+        doc_file = tmp_path / "new_session.md"
+
+        mod: Any = _load_mcp_module_with_env({
+            "HARS_MEMORY_INDEX_DIR": str(index_dir),
+            "HARS_MEMORY_STAGING_DIR": str(staging_dir),
+            "HARS_MEMORY_UPSERT_CONTENT_DEDUP": "1",
+        })
+
+        fp = _upsert_fingerprint(doc_file, self.CONTENT)
+        mock_rag = self._processed_rag()
+        with patch.object(mod, "_get_rag", new=AsyncMock(return_value=mock_rag)), \
+             patch("hars_memory.server.index._insert_all_batches", new=AsyncMock()):
+            res = asyncio.run(
+                mod.call_tool("memory_upsert_document", {
+                    "file_path": str(doc_file),
+                    "content": self.CONTENT,
+                })
+            )
+        data = json.loads(res[0].text)
+        assert data["ok"] is True
+        assert data["action"] == "inserted"
+
+        saved = ContentDedupStore.load(default_content_dedup_store_path(str(index_dir)))
+        assert saved.lookup(fp) == data["doc_id"]
+
+    def test_flag_on_falls_through_when_mapped_doc_missing(self, tmp_path: Path) -> None:
+        """A mapping whose target is no longer processed is ignored: the insert
+        proceeds and the mapping is re-pointed at the new doc_id."""
+        from hars_memory.ingest.change_detection import (
+            ContentDedupStore,
+            default_content_dedup_store_path,
+        )
+
+        index_dir = tmp_path / "index"
+        staging_dir = tmp_path / "staging"
+        doc_file = tmp_path / "again.md"
+
+        fp = _upsert_fingerprint(doc_file, self.CONTENT)
+        self._seed_dedup(index_dir, fp, "doc-deleted")
+
+        mod: Any = _load_mcp_module_with_env({
+            "HARS_MEMORY_INDEX_DIR": str(index_dir),
+            "HARS_MEMORY_STAGING_DIR": str(staging_dir),
+            "HARS_MEMORY_UPSERT_CONTENT_DEDUP": "1",
+        })
+
+        mock_rag = AsyncMock()
+        mock_rag.adelete_by_doc_id = AsyncMock()
+        # doc_status row gone for the mapped (deleted) doc, present+processed
+        # for the doc this upsert creates -> dedup falls through, insert succeeds.
+        new_doc_id = file_stable_id(doc_file)
+
+        async def _status_lookup(doc_id: str) -> dict[str, str] | None:
+            return {"status": "processed"} if doc_id == new_doc_id else None
+
+        mock_rag.doc_status.get_by_id = AsyncMock(side_effect=_status_lookup)
+        with patch.object(mod, "_get_rag", new=AsyncMock(return_value=mock_rag)), \
+             patch("hars_memory.server.index._insert_all_batches", new=AsyncMock()) as mock_insert:
+            res = asyncio.run(
+                mod.call_tool("memory_upsert_document", {
+                    "file_path": str(doc_file),
+                    "content": self.CONTENT,
+                })
+            )
+        data = json.loads(res[0].text)
+        assert data["ok"] is True
+        assert data["action"] == "inserted"
+        mock_insert.assert_called_once()
+
+        saved = ContentDedupStore.load(default_content_dedup_store_path(str(index_dir)))
+        assert saved.lookup(fp) == data["doc_id"]
+
+    def test_unchanged_fast_path_seeds_dedup_mapping(self, tmp_path: Path) -> None:
+        """The unchanged fast path also records the content->doc_id mapping, so
+        already-indexed documents become dedup anchors (bookkeeping only)."""
+        from hars_memory.ingest.change_detection import (
+            ContentDedupStore,
+            default_content_dedup_store_path,
+        )
+
+        index_dir = tmp_path / "index"
+        staging_dir = tmp_path / "staging"
+        doc_file = tmp_path / "a" / "session.md"
+        doc_file.parent.mkdir(parents=True)
+
+        content = "# Documentation\nSystem overview and details."
+        fp = _upsert_fingerprint(doc_file, content)
+        doc_id = file_stable_id(doc_file)
+
+        store_path = default_fingerprint_store_path(str(index_dir))
+        store = FingerprintStore.load(store_path)
+        store.set(doc_id, fp)
+        store.save()
+
+        mod: Any = _load_mcp_module_with_env({
+            "HARS_MEMORY_INDEX_DIR": str(index_dir),
+            "HARS_MEMORY_STAGING_DIR": str(staging_dir),
+            "HARS_MEMORY_UPSERT_CONTENT_DEDUP": "1",
+        })
+
+        res = asyncio.run(
+            mod.call_tool("memory_upsert_document", {
+                "file_path": str(doc_file),
+                "content": content,
+            })
+        )
+        data = json.loads(res[0].text)
+        assert data["ok"] is True
+        assert data["action"] == "unchanged"
+
+        saved = ContentDedupStore.load(default_content_dedup_store_path(str(index_dir)))
+        assert saved.lookup(fp) == doc_id
+
+    def test_delete_document_discards_dedup_mapping(self, tmp_path: Path) -> None:
+        from hars_memory.ingest.change_detection import ContentDedupStore
+
+        index_dir = tmp_path / "index"
+        staging_dir = tmp_path / "staging"
+        fp = compute_fingerprint("some indexed content")
+        dedup_path = self._seed_dedup(index_dir, fp, "test-doc-delete-me")
+
+        mod: Any = _load_mcp_module_with_env({
+            "HARS_MEMORY_INDEX_DIR": str(index_dir),
+            "HARS_MEMORY_STAGING_DIR": str(staging_dir),
+            "HARS_MEMORY_UPSERT_CONTENT_DEDUP": "1",
+        })
+
+        mock_rag = AsyncMock()
+        mock_rag.adelete_by_doc_id = AsyncMock()
+        with patch.object(mod, "_get_rag", new=AsyncMock(return_value=mock_rag)):
+            res = asyncio.run(
+                mod.call_tool("memory_delete_document", {"doc_id": "test-doc-delete-me"})
+            )
+        data = json.loads(res[0].text)
+        assert data["ok"] is True
+
+        saved = ContentDedupStore.load(dedup_path)
+        assert saved.lookup(fp) is None
+
+
 class TestMemoryDeleteDocument:
     def test_delete_document_by_doc_id(self, tmp_path: Path) -> None:
         index_dir = tmp_path / "index"

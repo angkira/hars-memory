@@ -260,38 +260,24 @@ manual, local operation:
   file, never in this repo, never in a commit message, never in CI config
   checked into git.
 
-## Known parked bug (do not fix casually)
+## Fixed (was: known parked bug)
 
-`hars_memory/eval/battle.py` line 23:
-```python
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-```
-This assumes a monorepo-style directory depth (`tools/memory/eval/battle.py`
-→ 3 parents up = project root) that does not exist once this package is
-genuinely `pip`/`uv`-installed into `site-packages` — a relative `--paths`
-argument to `memory-eval-battle` / `memory_eval_battle_main` will resolve
-against a nonsense path. It is **not load-bearing** for the MCP server or the
-core CLI paths (`memory_recall`, `memory_consolidate`, `memory build/query`,
-etc. never touch it) — it only affects `memory-eval-battle` invoked with
-relative `--paths`. Workaround today: always pass absolute `--paths` to
-`memory-eval-battle`. Flagged here as a known issue for a future v0.1.4, not
-fixed as part of this doc pass.
+The `parents[3]` anti-pattern documented here earlier is **fully fixed as of
+commit `8290698`** ("feat(tui): client core, entry points and optional [tui]
+extra", which carried the path-resolution cleanup):
 
-Note: a near-identical instance of this exact pattern in
-`hars_memory/server/index.py` **was** fixed in v0.1.3 (commit `8f5016f6`) —
-relative `--paths` there now resolve against `Path.cwd()` at invocation time,
-which is what `memory_consolidate`'s subprocess spawn (no `cwd=` override)
-and `cortex-scripts/update_kb.sh`'s relative-extra-paths convention both rely
-on. `battle.py` was not part of that fix wave.
+- `hars_memory/eval/battle.py` `_project_root()` now walks parents until it
+  finds a directory containing both `pyproject.toml` and `hars_memory/`
+  (valid at any install depth; relative `--paths` no longer resolve against a
+  nonsense site-packages root).
+- `hars_memory/cli.py` `_project_root()` / `_ensure_project_root()` no longer
+  compute `parents[3]` ("unlike parents[3], valid at any depth").
+- `hars_memory/server/index.py` was fixed earlier in v0.1.3 (commit
+  `8f5016f6`).
 
-Also worth knowing (found but out of scope to fix here): `hars_memory/cli.py`'s
-`_project_root()` / `_ensure_project_root()` (used by `index_main`,
-`eval_battle_main`, and the unified `memory` command) still computes
-`Path(__file__).resolve().parents[3]` and inserts it into `sys.path`. In
-practice this looks harmless once the package is installed (the actual
-`from hars_memory.X import Y` imports resolve via `site-packages` regardless
-of what garbage this inserts at `sys.path[0]`), but it is the same
-anti-pattern and worth cleaning up alongside `battle.py` in v0.1.4.
+Nothing left to fix here; this section is kept so the history of the issue
+(and the v0.1.3 `Path.cwd()` convention that `memory_consolidate`'s subprocess
+spawn and `cortex-scripts/update_kb.sh` rely on) stays discoverable.
 
 ## torch is CPU-only by design
 

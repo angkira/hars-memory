@@ -118,6 +118,13 @@ tui = ["textual>=8.2,<9"]
 # does not (the loader fails soft to the hand-tuned fusion when lightgbm is
 # absent, and the MLP artifact format is pure numpy).
 ltr = ["lightgbm>=4.0"]
+# Optional Snowball stemmers for the BM25 sparse channel
+# (retrieval/tokenizer.py, HARS_MEMORY_SPARSE_STEMMER=ru|en). Imported lazily;
+# the default mode ("off") never touches it. PyPI distribution name is
+# "PyStemmer" (import name "Stemmer") — the bare PyPI name "stemmer" resolves
+# to an unrelated package (verified 2026-11-01), so spell the dependency
+# exactly "PyStemmer".
+sparse-stem = ["PyStemmer>=2.2"]
 
 [project.scripts]
 memory-index = "hars_memory.cli:index_main"

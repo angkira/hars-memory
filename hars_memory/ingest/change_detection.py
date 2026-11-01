@@ -210,11 +210,99 @@ def detect_changed_documents(
     )
 
 
+_DEDUP_STORE_FILENAME = "doc_content_dedup.json"
+
+
+def default_content_dedup_store_path(working_dir: str | Path) -> Path:
+    """Default sidecar location for the content-dedup store (alongside the index)."""
+    return Path(working_dir) / _DEDUP_STORE_FILENAME
+
+
+class ContentDedupStore:
+    """Sidecar JSON mapping ``content fingerprint -> doc_id`` for opt-in upsert dedup.
+
+    Why it exists
+    -------------
+    ``memory_upsert_document`` keys its "unchanged" fast path on
+    ``doc_id -> fingerprint`` (``FingerprintStore``), and ``doc_id`` is a hash of
+    the file/row *path*. The same content upserted under a DIFFERENT path is
+    therefore a brand-new document: LightRAG re-chunks it (chunk ids are
+    doc_id-scoped), re-runs the extraction pipeline, and stores a second copy of
+    every chunk. The extraction LLM itself is already neutralized by LightRAG's
+    prompt-hash response cache (identical chunk text -> identical prompts ->
+    cache hits, no LLM spend), but the duplicate chunk records still pollute
+    chunk-level retrieval and the pipeline still costs wall time.
+
+    This store lets an opt-in caller (``HARS_MEMORY_UPSERT_CONTENT_DEDUP=1``)
+    answer "this exact content is already in the index as <doc_id>" without any
+    insert. It is deliberately NOT part of the default path: skipping an insert
+    changes write semantics, so it must never happen silently.
+
+    Self-healing contract
+    ---------------------
+    A mapping whose doc_id is no longer "processed" in the index (deleted,
+    failed, or from an abandoned run) is ignored at lookup time; the caller
+    proceeds with a normal insert and overwrites the mapping with the new
+    doc_id. ``discard_doc_id`` keeps the store consistent when a document is
+    deleted. A missing or corrupt sidecar degrades to an empty store — the
+    same "treat everything as unknown" failure surface as ``FingerprintStore``.
+    """
+
+    path: Path
+    _data: dict[str, str]
+
+    def __init__(self, path: Path, _data: dict[str, str] | None = None) -> None:
+        self.path = path
+        self._data = dict(_data or {})
+
+    @classmethod
+    def load(cls, path: Path) -> ContentDedupStore:
+        """Load the store from *path*. A missing file is a valid empty store."""
+        if not path.exists():
+            return cls(path=path)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise FingerprintStoreError(
+                f"Cannot read content-dedup store {path}: {exc}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise FingerprintStoreError(
+                f"Content-dedup store {path} does not contain a JSON object"
+            )
+        return cls(path=path, _data={str(k): str(v) for k, v in raw.items()})
+
+    def lookup(self, fingerprint: str) -> str | None:
+        """The doc_id previously indexed with this exact content, if recorded."""
+        return self._data.get(fingerprint)
+
+    def set(self, fingerprint: str, doc_id: str) -> None:
+        self._data[fingerprint] = doc_id
+
+    def discard_doc_id(self, doc_id: str) -> int:
+        """Drop every mapping that points at *doc_id*; returns how many dropped."""
+        stale = [fp for fp, mapped in self._data.items() if mapped == doc_id]
+        for fp in stale:
+            del self._data[fp]
+        return len(stale)
+
+    def save(self) -> None:
+        """Write the store to disk atomically (write-tmp then replace)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(self._data, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        tmp_path.replace(self.path)
+
+
 __all__ = [
     "ChangeReport",
+    "ContentDedupStore",
     "FingerprintStore",
     "FingerprintStoreError",
     "compute_fingerprint",
+    "default_content_dedup_store_path",
     "default_fingerprint_store_path",
     "detect_changed_documents",
 ]

@@ -14,9 +14,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hars_memory.ingest.change_detection import (
+    ContentDedupStore,
     FingerprintStore,
     FingerprintStoreError,
     compute_fingerprint,
+    default_content_dedup_store_path,
     default_fingerprint_store_path,
     detect_changed_documents,
 )
@@ -90,6 +92,74 @@ class TestDefaultFingerprintStorePath:
         result = default_fingerprint_store_path(tmp_path)
         assert result.parent == tmp_path
         assert result.name == "doc_fingerprints.json"
+
+
+# ---------------------------------------------------------------------------
+# ContentDedupStore — opt-in upsert content dedup sidecar
+# ---------------------------------------------------------------------------
+
+
+class TestContentDedupStore:
+    def test_load_missing_file_is_empty_store(self, tmp_path: Path) -> None:
+        store = ContentDedupStore.load(tmp_path / "missing.json")
+        assert store.lookup("deadbeef") is None
+
+    def test_set_and_lookup_round_trips(self, tmp_path: Path) -> None:
+        path = tmp_path / "dedup.json"
+        store = ContentDedupStore.load(path)
+        store.set("fp-1", "doc-aaa")
+        store.save()
+
+        reloaded = ContentDedupStore.load(path)
+        assert reloaded.lookup("fp-1") == "doc-aaa"
+
+    def test_lookup_miss_returns_none(self, tmp_path: Path) -> None:
+        store = ContentDedupStore.load(tmp_path / "dedup.json")
+        store.set("fp-1", "doc-aaa")
+        assert store.lookup("fp-2") is None
+
+    def test_discard_doc_id_drops_only_its_mappings(self, tmp_path: Path) -> None:
+        store = ContentDedupStore.load(tmp_path / "dedup.json")
+        store.set("fp-1", "doc-aaa")
+        store.set("fp-2", "doc-aaa")
+        store.set("fp-3", "doc-bbb")
+
+        dropped = store.discard_doc_id("doc-aaa")
+        assert dropped == 2
+        assert store.lookup("fp-1") is None
+        assert store.lookup("fp-2") is None
+        assert store.lookup("fp-3") == "doc-bbb"
+
+    def test_discard_doc_id_noop_returns_zero(self, tmp_path: Path) -> None:
+        store = ContentDedupStore.load(tmp_path / "dedup.json")
+        store.set("fp-1", "doc-aaa")
+        assert store.discard_doc_id("doc-unknown") == 0
+        assert store.lookup("fp-1") == "doc-aaa"
+
+    def test_save_is_atomic_no_leftover_tmp_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "dedup.json"
+        store = ContentDedupStore.load(path)
+        store.set("fp-1", "doc-aaa")
+        store.save()
+        assert path.exists()
+        assert not (tmp_path / "dedup.json.tmp").exists()
+
+    def test_load_malformed_json_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "dedup.json"
+        path.write_text("{not valid json")
+        with pytest.raises(FingerprintStoreError):
+            ContentDedupStore.load(path)
+
+    def test_load_non_object_json_raises(self, tmp_path: Path) -> None:
+        path = tmp_path / "dedup.json"
+        path.write_text(json.dumps(["not", "a", "dict"]))
+        with pytest.raises(FingerprintStoreError):
+            ContentDedupStore.load(path)
+
+    def test_default_path_lives_alongside_index(self, tmp_path: Path) -> None:
+        result = default_content_dedup_store_path(tmp_path)
+        assert result.parent == tmp_path
+        assert result.name == "doc_content_dedup.json"
 
 
 # ---------------------------------------------------------------------------
