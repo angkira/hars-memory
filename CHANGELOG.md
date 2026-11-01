@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [semantic versioning](https://semver.org/).
 
+## [0.9.0] - 2026-11-01
+
+### Added
+- **Russian sparse channel** (`HARS_MEMORY_SPARSE_STEMMER=ru|en|off`, default `off`):
+  the BM25 tokenizer was ASCII-only, so Cyrillic documents produced zero
+  tokens and the sparse channel was fully dead on Russian corpora. `ru` adds
+  Snowball stemming plus a `stem[:9]` prefix token (plain Snowball does not
+  merge pairs like делегирование/делегировать); `en` stems plain words while
+  leaving identifier ranks untouched. Mode is pinned in the BM25 sidecar and
+  the on-disk cache is rebuilt on mode change. `PyStemmer` is an optional
+  extra (`sparse-stem`). Measured on the neurocompact eval: facts+ru-sparse
+  0.351 vs 0.297/0.324 with the dead channel.
+- **Content-dedup on upsert** (`HARS_MEMORY_UPSERT_CONTENT_DEDUP=1`, default off):
+  a `doc_content_dedup.json` sidecar skips re-insertion of identical content
+  under a new path (`skipped_duplicate_of_existing`, no purge); delete drops
+  the mapping.
+- **Batch path for MCP upserts** (`HARS_MEMORY_UPSERT_BATCH_MODE=queue`):
+  upserts land in an `upsert_inbox.json` sidecar (`queued_for_batch`,
+  millisecond latency) and `memory index-batch --source upsert-inbox` runs the
+  existing collect/submit/status/apply/cancel phases over the inbox. The
+  chunker config is snapshotted at first collect and apply refuses on drift.
+- **Eval harness**: `sum+note` arm for the neurocompact track.
+- **Docs**: `max_chars` sizing guide in the portable skill (measured 0.17→0.42
+  answer accuracy at 32K vs 6K on a 91K-entity standing KB), `CONTEXT_MAX_CHARS`
+  documented in `config/.env.example`, stale parked-bug section in AGENTS.md
+  closed (fixed in 8290698).
+
 ## [Unreleased]
 
 ### Added
