@@ -223,39 +223,33 @@ lock file — commit it alongside any `pyproject.toml` dependency change.
 ## Publishing a new version
 
 Releases ship through the `.gitlab-ci.yml` pipeline (stages:
-`lint` → `test` → `package` → `publish`). Every branch and merge request
-runs Ruff, the full pytest suite, and wheel/sdist builds. Publishing itself
-is tag-triggered:
+`lint` → `test` → `package` → `publish`, where `publish` currently holds only
+the container-image job). Every branch and merge request runs Ruff, the full
+pytest suite, and wheel/sdist builds. There is no PyPI index — distribution
+is GitHub-only, so a release is just a tag:
 
 1. Bump `version` in `pyproject.toml` (then `uv lock` / `uv sync` so
    `uv.lock` picks it up) and add a `CHANGELOG.md` entry. Commit to `main`.
 2. Run the test suite; it must pass (`uv run pytest -q`).
 3. Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`
    (use the `main` branch HEAD; never rewrite history — `main` is protected).
-4. The `publish-pypi` CI job (runs on tags, needs `lint`+`test`+`package`)
-   runs `uv publish --publish-url "$CI_PYPI_PUBLISH_URL"` with
-   `--password "$CI_PYPI_PUBLISH_TOKEN"`. Both are GitLab CI/CD variables —
-   the token needs the `write_package_registry` scope. No publisher token
-   is stored in the repo.
-5. **Never trust the publish job's own success message.** Re-query the
-   registry's packages API directly (same host as `CI_PYPI_PUBLISH_URL`)
-   to confirm the new version landed.
-6. The `publish-container` job (tags + `main`) builds `Dockerfile.service`
+   Pushing the tag starts the CI pipeline, which validates the release
+   (lint → test → package) and builds the container image.
+4. **Verify, do not trust.** Check the tag pipeline is green and the tag
+   resolves: `git ls-remote --tags origin | grep vX.Y.Z` — confirm before
+   telling anyone the release succeeded.
+5. The `publish-container` job (tags + `main`) builds `Dockerfile.service`
    and pushes to the GitLab Container Registry using GitLab's short-lived
    `CI_REGISTRY_*` credentials.
 
 ## Credential model
 
-- **Consumers** (installing/resolving the package) authenticate to the
-  registry index with a **deploy token**, supplied as
-  `UV_INDEX_<NAME>_USERNAME` / `UV_INDEX_<NAME>_PASSWORD` env vars (uv's
-  convention for a named `[[tool.uv.index]]` — `<NAME>` is that index's
-  uppercased `name`). Store these in a gitignored secrets file on the
-  consumer's own machine, never committed.
-- **Publishers** need a personal/project access token with the
-  `write_package_registry` scope — same rule: kept in a gitignored secrets
-  file, never in this repo, never in a commit message, never in CI config
-  checked into git.
+No registry credentials exist for this package: it is distributed GitHub-only
+from the public repo (consumers install via HTTPS git URL, anonymously). The
+only secrets in play are deploy-time ones (LLM API keys, tokens for an
+operator's own MCP server instance) — kept in gitignored secrets files on
+the operator's machine, never in this repo, never in a commit message, never
+in CI config checked into git.
 
 ## Fixed (was: known parked bug)
 

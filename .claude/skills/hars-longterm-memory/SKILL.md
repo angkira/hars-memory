@@ -41,7 +41,8 @@ name = "your-project-memory-config"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-  "hars-longterm-memory==0.1.3",
+  # No PyPI index: installed straight from the public GitHub repo, pinned to a release tag.
+  "hars-longterm-memory @ git+https://github.com/angkira/hars-memory@v0.9.0",
   # torch MUST be listed here as an explicit DIRECT dependency, even though
   # hars-longterm-memory already depends on it — a built wheel does not
   # propagate its own [tool.uv.sources] table to a consumer, so without this
@@ -51,18 +52,11 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
-name = "hars-longterm-memory"
-url = "https://code.knotgate.com/api/v4/projects/14/packages/pypi/simple"
-explicit = true   # only used when a package explicitly requests this index —
-                   # keeps every OTHER dependency resolving off plain PyPI
-
-[[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-hars-longterm-memory = { index = "hars-longterm-memory" }
 torch = { index = "pytorch-cpu" }
 ```
 
@@ -210,7 +204,7 @@ Trigger incremental (re)ingest. Params: `paths` (array of strings, optional
 only reindex files newer than this), `dry_run` (bool, default `true`).
 Relative `paths` resolve against the **MCP server process's own current
 working directory** at invocation time (fixed in v0.1.3 — see the parent
-repo's `AGENTS.md` "Known parked bug" section for the history). Blocked by
+repo's `AGENTS.md` "Fixed (was: known parked bug)" section for the history). Blocked by
 the GPU guard (if configured) unless `dry_run=true`.
 
 ```json
@@ -246,39 +240,26 @@ Console scripts (`[project.scripts]` in `pyproject.toml`):
   at the same server; `hars-longterm-memory-mcp` is the more explicit name.
 - **`memory-eval-battle`** — generated retrieval battle test:
   `memory-eval-battle --paths <dirs...> --cases 100 --context-only --report <path>`.
-  **Pass `--paths` as absolute paths** — relative paths hit the known parked
-  bug below.
+  Relative `--paths` resolve against the invocation CWD (fixed in 8290698);
+  absolute paths remain the safest choice in scripts.
 
 ## Credentials
 
-Consumers authenticate to the registry index with a **read-only deploy
-token**, obtained from the GitLab project's Settings → Repository → Deploy
-tokens (scope: `read_package_registry`). Configure it as environment
-variables matching the named index above:
-
-```bash
-export UV_INDEX_HARS_LONGTERM_MEMORY_USERNAME=<deploy-token-username>
-export UV_INDEX_HARS_LONGTERM_MEMORY_PASSWORD=<deploy-token>
-```
-
-(uv derives the env var name from the index's `name =` in `[[tool.uv.index]]`,
-uppercased with non-alphanumerics turned to `_` — `hars-longterm-memory` →
-`HARS_LONGTERM_MEMORY`.) Put these in a **gitignored** secrets file on your
-own machine (e.g. `.env.secrets`, sourced by your shell profile or CI
-secrets store) — never commit them. `explicit = true` on both
-`[[tool.uv.index]]` blocks in the snippet above protects every other
-dependency in your project from accidentally resolving off this private
-index (or off the CPU-only torch index) — only packages that explicitly name
-that index via `[tool.uv.sources]` are ever fetched from it.
+No registry credentials: the package is distributed GitHub-only from the
+public repo — consumers install via HTTPS git URL, anonymously (see the
+install snippet at the top: no `[[tool.uv.index]]` needed for
+`hars-longterm-memory` itself, only the `pytorch-cpu` one for torch).
+The only secrets in play are deploy-time ones (your LLM API keys, your own
+MCP server's tokens) — keep those in a **gitignored** secrets file on your
+own machine, never commit them.
 
 ## Known limitations
 
-- **`battle.py` parked path bug**: `hars_memory/eval/battle.py` resolves a
-  monorepo-depth-assumption `_PROJECT_ROOT` from `__file__` that does not
-  correspond to anything once genuinely `pip`/`uv`-installed. It only
-  affects `memory-eval-battle` invoked with **relative** `--paths` — pass
-  absolute paths as a workaround. Not load-bearing for the MCP server or any
-  other CLI path. Tracked for a v0.1.4 fix; not fixed as of v0.1.3.
+- **`battle.py` path bug (fixed in 8290698)**: `hars_memory/eval/battle.py`
+  used to resolve a monorepo-depth-assumption `_PROJECT_ROOT` from `__file__`;
+  it now walks up to the directory containing `pyproject.toml` + `hars_memory/`,
+  so relative `--paths` work. Not load-bearing for the MCP server or any
+  other CLI path.
 - **GPU-guard and entity-schema are optional, consumer-supplied hooks**:
   - No `HARS_MEMORY_GPU_GUARD_SCRIPT_PATH` set → `memory_consolidate` and
     `memory-index` perform **zero** GPU-concurrency checking and always

@@ -54,37 +54,29 @@ outputs only to `/tmp` (it is swept); `/tmp` is for scratch work in progress.
 ## If you're about to publish a new version — checklist
 
 1. Confirm no one else already bumped the version you're about to bump to —
-   check `pyproject.toml`'s current `version` against the registry (see step
-   5) before touching anything.
+   check `pyproject.toml`'s current `version` against the latest GitHub tag
+   (`git ls-remote --tags origin`) and the `CHANGELOG.md` top entry before
+   touching anything.
 2. Bump `version` in `pyproject.toml`.
 3. `uv run pytest -q` — must pass. Do not publish on red tests.
 4. `uv sync --extra dev` once more (picks the new version into `uv.lock`) —
    confirm it resolves cleanly.
 5. Tag the commit (`git tag vX.Y.Z`) once committed.
-6. Build (`uv build`) and publish (see AGENTS.md's exact `uv publish`
-   command and the `write_package_registry`-scoped token requirement).
-7. **Verify, do not trust.** Re-query the registry API directly:
-   ```bash
-   curl -s "https://code.knotgate.com/api/v4/projects/14/packages" \
-       -H "PRIVATE-TOKEN: $TOKEN" \
-       | python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)]"
-   ```
-   Confirm the new version is actually listed before telling anyone the
-   publish succeeded. A `uv publish` / `twine upload` success message alone
-   is not evidence — this mirrors the verification discipline used when this
-   package was originally extracted from cortex (never trust a tool's own
-   "done" message; re-query the source of truth).
-8. Push the tag: `git push origin vX.Y.Z`.
+6. Push the tag (`git push origin vX.Y.Z`) — this IS the publish (no PyPI
+   index; consumers install from GitHub). CI validates the tag pipeline.
+7. **Verify, do not trust.** Check the tag pipeline is green and the tag
+   resolves (`git ls-remote --tags origin | grep vX.Y.Z`) before telling
+   anyone the release succeeded.
 
 ## Known gotchas worth remembering while editing this repo
 
 - `uv sync --group dev` does NOT work here — `dev` is declared under
   `[project.optional-dependencies]`, not `[dependency-groups]`. Use
   `uv sync --extra dev`.
-- `hars_memory/eval/battle.py` has a known parked path bug (`_PROJECT_ROOT`
-  computed from `__file__` depth, breaks once installed via pip/uv). See
-  AGENTS.md "Known parked bug". Do not attempt to fix it as a drive-by inside
-  an unrelated change — it needs its own dedicated fix + regression test,
+- `hars_memory/eval/battle.py` had a known parked path bug (`_PROJECT_ROOT`
+  computed from `__file__` depth, breaks once installed via pip/uv) — fixed in
+  8290698, see AGENTS.md "Fixed (was: known parked bug)". Do not reintroduce
+  the pattern in new code.
   same as the `server/index.py` instance of this bug was fixed in v0.1.3.
 - `mcp>=1.0.0,<2.0.0` is a deliberate upper bound (see the dependency comment
   in `pyproject.toml`) — `mcp` 2.x renamed the `Server.list_tools()`

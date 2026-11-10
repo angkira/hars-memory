@@ -19,23 +19,17 @@ in `pyproject.toml` (`version = "0.5.0"`).
 
 ## Publishing a new version
 
-### PyPI publish via CI (current process)
+### GitHub-tag release (current process)
 
-Publishing runs in GitLab CI: pushing a version tag (e.g. `v0.9.0`) starts a
-pipeline (lint → test → package → `publish-pypi`), and the `publish-pypi` job
-uploads the wheel + sdist to the package registry. It needs two CI/CD
-variables on the GitLab project: `CI_PYPI_PUBLISH_URL` and
-`CI_PYPI_PUBLISH_TOKEN` (token with the `write_package_registry` scope).
-Without them the job fails while lint/test/package still validate the release.
+There is no PyPI index — distribution is GitHub-only by decision. Pushing a
+version tag (e.g. `v0.9.0`) starts a CI pipeline (lint → test → package, plus
+the `publish-container` image job); consumers install straight from the public
+repo (see "Consumers" below, and `docs/integration-guide.md`).
 
 Release checklist (local part, before tagging):
 
-1. **Check current version**: confirm no one else already bumped it:
-   ```bash
-   curl -s "https://code.knotgate.com/api/v4/projects/14/packages" \
-       -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-       | python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)]"
-   ```
+1. **Check current version**: confirm no one else already bumped it
+   (`git tag --list | sort -V | tail -3`, and `CHANGELOG.md` top entry).
 
 2. **Bump version** in `pyproject.toml`:
    ```bash
@@ -63,27 +57,21 @@ Release checklist (local part, before tagging):
    #            dist/hars_longterm_memory-X.Y.Z.tar.gz
    ```
 
-6. **Publish**: pushing the tag (step 8) triggers the CI `publish-pypi` job,
-   which is the primary path. Manual fallback (only when CI variables are absent):
-   ```bash
-   uv publish \
-       --publish-url https://code.knotgate.com/api/v4/projects/14/packages/pypi \
-       --username __token__ \
-       --password "$GITLAB_TOKEN_WITH_write_package_registry_SCOPE"
-   ```
+6. **Publish**: there is no registry upload — pushing the tag (step 8) IS the
+   release. CI validates it (lint → test → package) and builds the container
+   image. (Historical note: a retired `publish-pypi` job once uploaded to a
+   GitLab PyPI registry; do not resurrect it — distribution is GitHub-only
+   by decision.)
 
-   The token needs the `write_package_registry` scope. Store it in a gitignored
-   secrets file — never commit it.
-
-7. **Verify, do not trust**: re-query the registry:
+7. **Verify, do not trust**: after CI goes green, confirm the tag and the
+   package artifacts exist:
    ```bash
-   curl -s "https://code.knotgate.com/api/v4/projects/14/packages" \
-       -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-       | python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)]"
+   git ls-remote --tags origin | grep 'vX.Y.Z'
+   # + check the tag pipeline (lint/test/package green) in CI.
    ```
 
 8. **Push the tag** — this starts the CI release pipeline (lint → test →
-   package → `publish-pypi`):
+   package + container image):
    ```bash
    git push origin vX.Y.Z
    ```
@@ -108,43 +96,31 @@ The `.gitlab-ci.yml` pipeline runs on every branch, MR, and tag:
 | `$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG` | Tag pipelines only |
 | `$CI_REGISTRY_IMAGE:latest` | Default branch only |
 
-**PyPI publishing is automated in CI** via the `publish-pypi` tag job described
-above (requires `CI_PYPI_PUBLISH_URL` / `CI_PYPI_PUBLISH_TOKEN`). The manual
-`uv publish` invocation below remains as a fallback when CI variables are absent.
+There is no PyPI publishing. Consumers install from GitHub (section below).
 
 ---
 
 ## Consumers
 
-### How consumers install from the registry
-
-Consumers add the following to their `pyproject.toml`:
+### How consumers install from GitHub (no registry)
 
 ```toml
+[project]
+dependencies = [
+  "hars-longterm-memory @ git+https://github.com/angkira/hars-memory@vX.Y.Z",
+  "torch>=2.0.0",  # explicit CPU-only override required, see integration guide
+]
+
 [[tool.uv.index]]
-name = "hars-longterm-memory"
-url = "https://code.knotgate.com/api/v4/projects/14/packages/pypi/simple"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[project]
-dependencies = ["hars-longterm-memory>=0.5.0"]
-
 [tool.uv.sources]
-hars-longterm-memory = { index = "hars-longterm-memory" }
+torch = { index = "pytorch-cpu" }
 ```
 
-Authentication is via a deploy token (not a personal token):
-
-```bash
-export UV_INDEX_HARS_LONGTERM_MEMORY_USERNAME="<deploy-token-username>"
-export UV_INDEX_HARS_LONGTERM_MEMORY_PASSWORD="<deploy-token-password>"
-```
-
-### How to create a deploy token
-
-1. Go to `code.knotgate.com/hars/hars-longterm-memory/-/settings/access_tokens`
-2. Create a token with scope `read_package_registry`
-3. Share the username and password securely with the consumer
+See `docs/integration-guide.md` for the full consumer setup.
 
 ### Installing the container image
 
@@ -159,15 +135,17 @@ docker pull registry.gitlab.com/hars/hars-longterm-memory:latest
 
 | Channel | Artifact | Published by | Consumer access |
 |---|---|---|---|
-| GitLab PyPI registry | `hars-longterm-memory` wheel + sdist | Manual (`uv publish`) | Deploy token |
+| GitHub repo (tags) | Source + release tag | `git push origin vX.Y.Z` | Public, anonymous |
 | GitLab Container Registry | Docker image (`Dockerfile.service`) | CI (tags + default branch) | Deploy token or anonymous |
-| Git repo | Source code | `git push` | SSH key |
+| Git repo | Source code | `git push` | SSH key / public HTTPS |
 | `.claude/skills/` | Portable skill for AI agents | Manual copy | File copy |
 
 ## Credential model
 
-| Role | Credential type | Scope | Where stored |
-|---|---|---|---|
-| Publisher | Personal/Project access token | `write_package_registry` | Gitignored secrets file (e.g. `.env.secrets`) |
-| Consumer | Deploy token | `read_package_registry` | Consumer's own secrets file |
-| CI | GitLab CI_REGISTRY_* (short-lived) | GitLab Container Registry | CI/CD variables (auto-injected) |
+No registry credentials are needed: the repo is public and consumers install
+via plain HTTPS git URLs. The only secrets in play are deploy-time ones
+(LLM API keys, access tokens for a deployment's own MCP server) — those live
+in gitignored secrets files on the operator's machine, never in this repo,
+never in a commit message, never in CI config checked into git. CI needs no
+stored tokens: the container job uses auto-injected short-lived
+`CI_REGISTRY_*` credentials.

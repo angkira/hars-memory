@@ -1,49 +1,23 @@
 # Integration guide
 
 How to consume `hars-longterm-memory` from another project — install from the
-GitLab registry, set up the MCP server, configure Qdrant, and use the skill.
+public GitHub repo, set up the MCP server, configure Qdrant, and use the skill.
 
 ## Installation
 
-### 1. Add the GitLab registry
+### 1. Add the dependency (GitHub, no registry)
 
-Add the private GitLab PyPI registry to your project's `pyproject.toml`:
-
-```toml
-[[tool.uv.index]]
-name = "hars-longterm-memory"
-url = "https://code.knotgate.com/api/v4/projects/14/packages/pypi/simple"
-explicit = true
-```
-
-Set up authentication (deploy token):
-
-```bash
-export UV_INDEX_HARS_LONGTERM_MEMORY_USERNAME="<deploy-token-username>"
-export UV_INDEX_HARS_LONGTERM_MEMORY_PASSWORD="<deploy-token-password>"
-```
-
-Store these in a gitignored secrets file, never committed.
-
-### 2. Add the dependency
+The package is not published to any PyPI index — install it straight from the
+public repo, pinned to a release tag:
 
 ```toml
 [project]
 dependencies = [
-    "hars-longterm-memory>=0.5.0",
+  "hars-longterm-memory @ git+https://github.com/angkira/hars-memory@v0.9.0",
+  # torch: explicit CPU-only override required (see below).
+  "torch>=2.0.0",
 ]
 
-[tool.uv.sources]
-hars-longterm-memory = { index = "hars-longterm-memory" }
-```
-
-### 3. CPU-only torch
-
-The package depends on `torch` (CPU-only). Repeat the CPU-only torch index in
-your own `pyproject.toml` — `[tool.uv.sources]` does NOT propagate through a
-built wheel:
-
-```toml
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
@@ -53,7 +27,11 @@ explicit = true
 torch = { index = "pytorch-cpu" }
 ```
 
-### 4. Install
+A built wheel does not propagate its own `[tool.uv.sources]` table, so without
+the explicit `torch` line + `pytorch-cpu` override, torch resolves to the full
+CUDA build from PyPI instead of the CPU-only one.
+
+### 2. Install
 
 ```bash
 uv sync
