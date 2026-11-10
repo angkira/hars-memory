@@ -19,9 +19,16 @@ in `pyproject.toml` (`version = "0.5.0"`).
 
 ## Publishing a new version
 
-### Manual PyPI publish (current process)
+### PyPI publish via CI (current process)
 
-There is no CI job for PyPI publishing yet — it is a manual, local operation:
+Publishing runs in GitLab CI: pushing a version tag (e.g. `v0.9.0`) starts a
+pipeline (lint → test → package → `publish-pypi`), and the `publish-pypi` job
+uploads the wheel + sdist to the package registry. It needs two CI/CD
+variables on the GitLab project: `CI_PYPI_PUBLISH_URL` and
+`CI_PYPI_PUBLISH_TOKEN` (token with the `write_package_registry` scope).
+Without them the job fails while lint/test/package still validate the release.
+
+Release checklist (local part, before tagging):
 
 1. **Check current version**: confirm no one else already bumped it:
    ```bash
@@ -56,7 +63,8 @@ There is no CI job for PyPI publishing yet — it is a manual, local operation:
    #            dist/hars_longterm_memory-X.Y.Z.tar.gz
    ```
 
-6. **Publish to GitLab PyPI registry**:
+6. **Publish**: pushing the tag (step 8) triggers the CI `publish-pypi` job,
+   which is the primary path. Manual fallback (only when CI variables are absent):
    ```bash
    uv publish \
        --publish-url https://code.knotgate.com/api/v4/projects/14/packages/pypi \
@@ -74,7 +82,8 @@ There is no CI job for PyPI publishing yet — it is a manual, local operation:
        | python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)]"
    ```
 
-8. **Push the tag**:
+8. **Push the tag** — this starts the CI release pipeline (lint → test →
+   package → `publish-pypi`):
    ```bash
    git push origin vX.Y.Z
    ```
@@ -99,33 +108,9 @@ The `.gitlab-ci.yml` pipeline runs on every branch, MR, and tag:
 | `$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG` | Tag pipelines only |
 | `$CI_REGISTRY_IMAGE:latest` | Default branch only |
 
-**PyPI publishing is not yet automated in CI.** See "Future: automated PyPI publishing" below.
-
----
-
-## Future: automated PyPI publishing in CI
-
-A `publish-pypi` job can be added to `.gitlab-ci.yml` that runs on tags:
-
-```yaml
-publish-pypi:
-  stage: publish
-  needs:
-    - job: lint
-    - job: test
-    - job: package
-      artifacts: true
-  rules:
-    - if: '$CI_COMMIT_TAG'
-  script:
-    - uv publish --publish-url "$CI_PYPI_PUBLISH_URL" \
-        --username "__token__" \
-        --password "$CI_PYPI_PUBLISH_TOKEN"
-```
-
-The `CI_PYPI_PUBLISH_TOKEN` would need to be a GitLab CI/CD variable with the
-`write_package_registry` scope. This is not yet implemented — the current
-manual process requires a personal token.
+**PyPI publishing is automated in CI** via the `publish-pypi` tag job described
+above (requires `CI_PYPI_PUBLISH_URL` / `CI_PYPI_PUBLISH_TOKEN`). The manual
+`uv publish` invocation below remains as a fallback when CI variables are absent.
 
 ---
 
