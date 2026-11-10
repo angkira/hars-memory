@@ -1,14 +1,14 @@
 # Eval: new md_struct index vs production index
 
 Measured 2026-10-19, read-only, no GPU. Raw artifacts:
-`/mnt/datasets/ft/eval_new_vs_base/` (see `REPORT.md`, `ltr_base.json`,
+`~/ft/eval_new_vs_base/` (see `REPORT.md`, `ltr_base.json`,
 `ltr_new.json`, `comparison.json`, `per_query_*.json`).
 
 ## Indexes
 
 | | BASELINE (production) | NEW (Colab, restored) |
 |---|---|---|
-| Path | `~/.local/share/hars-graphrag/index_compact_20260903_imported` | `/mnt/datasets/ft/index_local/index_full_mdstruct_20261014` |
+| Path | `~/.local/share/hars-graphrag/index_compact_20260903_imported` | `~/ft/index_local/index_full_mdstruct_20261014` |
 | Docs with chunks | 1624 | 989 (strict subset) |
 | Chunks | 2820 | 7561 |
 | Chunks / doc | 1.74 | 7.65 |

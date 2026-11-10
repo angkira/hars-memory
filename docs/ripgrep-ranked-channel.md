@@ -165,7 +165,7 @@ Reproduce (48-query GC-fixed set, live index/embedder):
 ```bash
 cd /home/demo/Project/software/hars-longterm-memory
 set -a; source eval_agentic-data/bench_env.sh; set +a
-export HARS_MEMORY_RIPGREP_ROOTS="/mnt/datasets/graphrag/staging/ingested,/home/demo/Project/software/cortex/.plans,/home/demo/Project/software/cortex/.reports,/home/demo/Project/software/cortex/.session,/home/demo/Project/software/cortex/docs,/home/demo/Project/software/cortex/hypotheses,/home/demo/Project/software/cortex/hypothesis_links"
+export HARS_MEMORY_RIPGREP_ROOTS="~/shared/staging/ingested,/home/demo/Project/software/cortex/.plans,/home/demo/Project/software/cortex/.reports,/home/demo/Project/software/cortex/.session,/home/demo/Project/software/cortex/docs,/home/demo/Project/software/cortex/hypotheses,/home/demo/Project/software/cortex/hypothesis_links"
 uv run --project . python -m hars_memory.eval.ab_bench ab \
   --queries eval_agentic-data/retrieval_queries_current_gcfixed.yaml \
   --configs dense_only hybrid_bm25 hybrid_bm25_ripgrep \

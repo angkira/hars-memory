@@ -54,11 +54,11 @@ Preferred path: keep the base GGUF and apply the adapter at inference time — n
 
 ```bash
 # adapter -> GGUF LoRA
-python /home/angkira/llama.cpp/convert_lora_to_gguf.py <adapter_dir> \
+python ~/llama.cpp/convert_lora_to_gguf.py <adapter_dir> \
     --base ~/models/qwen3.5-9b-fp8 --outfile adapter.gguf
 
 # serve base + LoRA (OpenAI-compatible)
-/mnt/datasets/bin/llama-server \
+llama-server \
     -m ~/models/qwen3.5-9b-gguf/Qwen3.5-9B-Q4_K_M.gguf \
     --lora adapter.gguf --host 127.0.0.1 --port 8084 --jinja
 ```

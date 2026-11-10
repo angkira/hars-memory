@@ -12,8 +12,8 @@ Last updated: 2026-10-19.
 | Teacher SFT pairs (2453) | `eval_agentic/rca/sft_extraction.jsonl` |
 | Split (train 2333 / val 100 / parity 20) | `training/outputs/data/` |
 | LoRA adapters (ep1, ep2, final) | `training/outputs/run_9b_a100_nf4_r32/{checkpoint-ep1,checkpoint-ep2,adapter}` |
-| LoRA converted to GGUF (116 MB) | `/mnt/datasets/ft/extractor-9b-lora.gguf` |
-| Restored Colab index (990 docs, 50 131 nodes / 83 302 edges) | `/mnt/datasets/ft/index_local/index_full_mdstruct_20261014` |
+| LoRA converted to GGUF (116 MB) | `~/ft/extractor-9b-lora.gguf` |
+| Restored Colab index (990 docs, 50 131 nodes / 83 302 edges) | `~/ft/index_local/index_full_mdstruct_20261014` |
 | LLM cache (35 278 teacher responses) | inside the restored index (`kv_store_llm_response_cache.json`) |
 | Base GGUF | `~/models/qwen3.5-9b-gguf/Qwen3.5-9B-Q4_K_M.gguf` |
 
@@ -54,7 +54,7 @@ curl -s http://127.0.0.1:8084/health       # {"status":"ok"}
 
 ```bash
 .venv/bin/python scripts/parity_eval_server.py \
-  --out-dir /mnt/datasets/ft/parity_full --tag lora --limit 0
+  --out-dir ~/ft/parity_full --tag lora --limit 0
 ```
 
 ### 3. Measure the LoRA delta (optional but recommended)
@@ -65,7 +65,7 @@ Serve the **base without LoRA** on a second port and re-run the gate:
 HARS_FT_LORA_GGUF=/dev/null ...   # or: llama-server -m base.gguf --port 8085
 .venv/bin/python scripts/parity_eval_server.py \
   --base-url http://127.0.0.1:8085/v1 --model qwen3.5-9b-extractor \
-  --out-dir /mnt/datasets/ft/parity_base --tag base --limit 20
+  --out-dir ~/ft/parity_base --tag base --limit 20
 ```
 
 If `entity_f1(lora) <= entity_f1(base)`, the adapter adds nothing — do not ship
@@ -110,9 +110,9 @@ export HARS_MEMORY_EXTRACTOR_PROVIDER=openrouter
 export HARS_MEMORY_OPENROUTER_MODEL=openai/gpt-6-luna
 export HARS_MEMORY_BATCH_PROVIDER=openrouter
 export HARS_MEMORY_MAX_GLEANING=0          # measured: first pass already ends with <|COMPLETE|>
-export HARS_MEMORY_INDEX_DIR=/mnt/datasets/ft/index_local/index_full_mdstruct_20261014
-PATHS=(/mnt/datasets/graphrag/recovered_baseline /mnt/datasets/graphrag/staging/ingested \
-       /home/angkira/Project/software/cortex/docs /home/angkira/Project/software/cortex/.plans)
+export HARS_MEMORY_INDEX_DIR=~/ft/index_local/index_full_mdstruct_20261014
+PATHS=(~/graphrag/recovered_baseline ~/graphrag/staging/ingested \
+       ~/projects/cortex/docs ~/projects/cortex/.plans)
 
 .venv/bin/memory index-batch collect --append --paths $PATHS --max-cost 5 \
   --input-price 0.05 --output-price 0.25 --est-output-tokens 900 --dry-run   # estimate only

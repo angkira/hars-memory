@@ -222,30 +222,27 @@ lock file — commit it alongside any `pyproject.toml` dependency change.
 
 ## Publishing a new version
 
-There is no CI pipeline in this repo (no `.gitlab-ci.yml`) — publishing is a
-manual, local operation:
+Releases ship through the `.gitlab-ci.yml` pipeline (stages:
+`lint` → `test` → `package` → `publish`). Every branch and merge request
+runs Ruff, the full pytest suite, and wheel/sdist builds. Publishing itself
+is tag-triggered:
 
-1. Bump `version` in `pyproject.toml` (and `uv.lock` will pick it up on the
-   next `uv sync`/`uv lock`).
-2. Run the test suite; it must pass.
-3. Build: `uv build` (produces `dist/hars_longterm_memory-<version>-py3-none-any.whl`
-   and the matching `.tar.gz` sdist).
-4. Publish via HTTP PUT to the GitLab Package Registry:
-   ```bash
-   uv publish --publish-url https://code.knotgate.com/api/v4/projects/14/packages/pypi \
-       --username __token__ --password "$GITLAB_TOKEN_WITH_write_package_registry_SCOPE"
-   ```
-   (or `twine upload --repository-url ... dist/*` with the same credentials —
-   either works against a GitLab PyPI-compatible registry endpoint). The
-   token needs the `write_package_registry` scope; get a real one from that
-   machine's own gitignored secrets file (e.g. cortex's `.env` /
-   `.env.secrets` — never hardcode one here).
-5. **Never trust the publish command's own success message.** Re-query the
-   registry directly to confirm the new version landed:
-   ```bash
-   curl -s "https://code.knotgate.com/api/v4/projects/14/packages" \
-       -H "PRIVATE-TOKEN: $TOKEN" | python3 -c "import json,sys; [print(p['name'], p['version']) for p in json.load(sys.stdin)]"
-   ```
+1. Bump `version` in `pyproject.toml` (then `uv lock` / `uv sync` so
+   `uv.lock` picks it up) and add a `CHANGELOG.md` entry. Commit to `main`.
+2. Run the test suite; it must pass (`uv run pytest -q`).
+3. Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`
+   (use the `main` branch HEAD; never rewrite history — `main` is protected).
+4. The `publish-pypi` CI job (runs on tags, needs `lint`+`test`+`package`)
+   runs `uv publish --publish-url "$CI_PYPI_PUBLISH_URL"` with
+   `--password "$CI_PYPI_PUBLISH_TOKEN"`. Both are GitLab CI/CD variables —
+   the token needs the `write_package_registry` scope. No publisher token
+   is stored in the repo.
+5. **Never trust the publish job's own success message.** Re-query the
+   registry's packages API directly (same host as `CI_PYPI_PUBLISH_URL`)
+   to confirm the new version landed.
+6. The `publish-container` job (tags + `main`) builds `Dockerfile.service`
+   and pushes to the GitLab Container Registry using GitLab's short-lived
+   `CI_REGISTRY_*` credentials.
 
 ## Credential model
 
