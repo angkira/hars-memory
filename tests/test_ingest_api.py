@@ -2,7 +2,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from lightrag.base import DocProcessingStatus, DocStatus
+from lightrag.base import DocProcessingStatus, DocStatus, DocStatusStorage
 
 from hars_memory.ingest import api as api_module
 from hars_memory.ingest.api import IngestResult, ingest_documents
@@ -40,12 +40,12 @@ def test_ingest_documents_returns_result_with_counts(
 
 def _make_fake_rag(doc_statuses: dict[str, DocStatus] | None = None) -> AsyncMock:
     """Build a fake LightRAG instance, mirroring the real
-    `rag.doc_status.get_docs_by_status(DocStatus)` API `_ingest_documents_async`
+    `rag.doc_status.get_docs_by_statuses([DocStatus])` API `_ingest_documents_async`
     now queries after an insert (see `hars_memory.ingest.api`).
 
     Callers' `_insert_all_batches` replacements must record which doc_ids
     they "inserted" via `rag._known_doc_ids.update(doc_id, ...)` -- the fake
-    `get_docs_by_status` only knows about doc_ids explicitly registered this
+    `get_docs_by_statuses` only knows about doc_ids explicitly registered this
     way, exactly like a real doc_status store only knows about doc_ids it
     has actually seen.
 
@@ -57,13 +57,13 @@ def _make_fake_rag(doc_statuses: dict[str, DocStatus] | None = None) -> AsyncMoc
     overrides = doc_statuses or {}
     known_doc_ids: set[str] = set()
 
-    async def fake_get_docs_by_status(
-        status: DocStatus,
+    async def fake_get_docs_by_statuses(
+        statuses: list[DocStatus], strict: bool = False
     ) -> dict[str, DocProcessingStatus]:
         result: dict[str, DocProcessingStatus] = {}
         for doc_id in known_doc_ids:
             effective_status = overrides.get(doc_id, DocStatus.PROCESSED)
-            if effective_status != status:
+            if effective_status not in statuses:
                 continue
             result[doc_id] = DocProcessingStatus(
                 content_summary="stub",
@@ -79,8 +79,11 @@ def _make_fake_rag(doc_statuses: dict[str, DocStatus] | None = None) -> AsyncMoc
     rag.initialize_storages = AsyncMock(return_value=None)
     rag.finalize_storages = AsyncMock(return_value=None)
     rag.adelete_by_doc_id = AsyncMock(return_value=None)
-    rag.doc_status = AsyncMock()
-    rag.doc_status.get_docs_by_status = AsyncMock(side_effect=fake_get_docs_by_status)
+    # spec= the real ABC: calling a method the pinned lightrag-hku does not
+    # have (e.g. the old ``get_docs_by_status``) raises AttributeError instead
+    # of being silently auto-created by AsyncMock.
+    rag.doc_status = AsyncMock(spec=DocStatusStorage)
+    rag.doc_status.get_docs_by_statuses = AsyncMock(side_effect=fake_get_docs_by_statuses)
     rag._known_doc_ids = known_doc_ids
     return rag
 
@@ -187,7 +190,7 @@ def test_per_doc_failed_status_inside_non_raising_insert_is_not_persisted(
         # completes normally even though the document's own extraction
         # failed internally. Registering the doc_id here mimics LightRAG
         # actually having written a (FAILED) doc_status record for it --
-        # `rag.doc_status.get_docs_by_status` is queried separately below.
+        # `rag.doc_status.get_docs_by_statuses` is queried separately below.
         call_doc_id_batches.append([d.doc_id for d in docs])
         rag._known_doc_ids.update(d.doc_id for d in docs)
 
@@ -201,7 +204,7 @@ def test_per_doc_failed_status_inside_non_raising_insert_is_not_persisted(
     assert first.documents_skipped == 0
     assert first.errors == []
     assert call_doc_id_batches == [["ext:extraction-failed-1"]]
-    fake_rag.doc_status.get_docs_by_status.assert_awaited_once_with(DocStatus.PROCESSED)
+    fake_rag.doc_status.get_docs_by_statuses.assert_awaited_once_with([DocStatus.PROCESSED])
 
     second = ingest_documents([doc], index_dir=tmp_path)
     assert second.errors == []
@@ -367,3 +370,20 @@ def test_source_kind_has_no_postgres_specific_members() -> None:
     assert "POSTGRES_HYPOTHESIS" not in names
     assert "POSTGRES_HYPOTHESIS_LINK" not in names
     assert "EXTERNAL" in names
+
+
+def test_ingest_uses_a_doc_status_method_the_pinned_lightrag_has() -> None:
+    """Regression: api.py called ``get_docs_by_status`` (absent in lightrag-hku
+    1.5.7), so memory_compact returned ok=false and fingerprints were lost.
+    Mocks auto-create any attribute, so pin the real ABC + api.py source."""
+    import inspect
+
+    assert hasattr(DocStatusStorage, "get_docs_by_statuses")
+    assert not hasattr(DocStatusStorage, "get_docs_by_status")
+    code = "\n".join(
+        line
+        for line in inspect.getsource(api_module).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    assert ".get_docs_by_status(" not in code
+    assert "doc_status.get_docs_by_statuses(" in code

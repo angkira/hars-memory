@@ -101,6 +101,22 @@ Its HTTP surface is `/health`, `POST/GET /v1/index-jobs`, job cancellation,
 latest/version descriptors, and checksum-bearing artifact downloads under
 `/v1/indexes/{index_id}/versions/...`.
 
+## Terminal UI
+
+An optional Textual front-end for a running service: service health, recall with a live stage trace,
+a session/compaction/graph browser, projects, and an eval-results viewer. It is a pure HTTP client (no
+LightRAG/torch import) and writes only behind a confirm modal.
+
+```bash
+uv sync --extra tui          # or: pip install 'hars-longterm-memory[tui]'
+memory tui                   # or: memory-tui --url http://memory-host:8099 --screen recall
+```
+
+Keys: `F1`-`F5` (or `1`-`5`) switch Health / Recall / Sessions / Projects / Eval, `?` help, `q` quit.
+Configuration is `HARS_MEMORY_TUI_*` environment variables or flags; the server's own `HARS_MEMORY_MCP_HTTP_*`,
+`HARS_MEMORY_TRACE_*` and `HARS_MEMORY_ACCESS_TOKEN` variables are honoured as defaults. Full reference:
+[docs/tui.md](docs/tui.md).
+
 ## GitLab CI and container registry
 
 Every branch and merge request runs repository-wide Ruff, the complete pytest
@@ -514,3 +530,12 @@ To add a dependency:
 ```bash
 uv add --project tools/memory <package>
 ```
+
+## License and attribution
+
+Licensed under the Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+If you use this software in a product, publication or service, you must keep
+the NOTICE file and cite the project:
+
+    https://github.com/iuriimedvedev-dev/hars-longterm-memory

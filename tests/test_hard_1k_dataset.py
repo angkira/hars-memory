@@ -1,9 +1,10 @@
 """Contract tests for the deterministic hard_1k retrieval gold set.
 
-The dataset itself lives in ``eval_agentic-data/hard_1k``.  These tests are
-split into two layers:
+The dataset itself lives in ``eval_agentic-data/hard_1k``, which is a generated,
+gitignored fixture.  These tests are split into two layers:
 
-* schema / leakage / dedupe checks that run anywhere;
+* schema / leakage / dedupe checks that run wherever the fixture is present
+  (they skip when it is not, e.g. on a clean checkout);
 * corpus-resolution and verbatim-snippet checks that are skipped when the
   production index is not present on the machine.
 """
@@ -25,10 +26,25 @@ INDEX = gen.DEFAULT_INDEX_DIR
 STRATA = set(gen.STRATA)
 
 
+def _require(file_name: str) -> Path:
+    """Path to a dataset file, skipping the test when the fixture is absent.
+
+    ``eval_agentic-data/`` is a generated, gitignored fixture (see
+    ``.gitignore``), so a clean checkout has no dataset and the contract tests
+    below cannot run.
+    """
+    path = DATA / file_name
+    if not path.is_file():
+        pytest.skip(f"hard_1k dataset fixture not present: {path} (generated, gitignored)")
+    return path
+
+
 def _load(name: str) -> dict:
-    path = DATA / name
-    assert path.exists(), f"missing dataset file: {path}"
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    return yaml.safe_load(_require(name).read_text(encoding="utf-8"))
+
+
+def _read_json(name: str) -> dict:
+    return json.loads(_require(name).read_text(encoding="utf-8"))
 
 
 def _queries(name: str) -> list[dict]:
@@ -126,7 +142,7 @@ def test_deduped_against_existing_gold_sets(all_cases: list[dict]) -> None:
 
 
 def test_stratum_and_difficulty_coverage(all_cases: list[dict]) -> None:
-    stats = json.loads((DATA / "stats.json").read_text(encoding="utf-8"))
+    stats = _read_json("stats.json")
     by_stratum = {name: 0 for name in STRATA}
     by_difficulty: dict[str, int] = {}
     hops: dict[str, int] = {}
@@ -144,7 +160,7 @@ def test_stratum_and_difficulty_coverage(all_cases: list[dict]) -> None:
 
 
 def test_gold_paths_manifest_matches_dataset(all_cases: list[dict]) -> None:
-    manifest = json.loads((DATA / "gold_paths.json").read_text(encoding="utf-8"))
+    manifest = _read_json("gold_paths.json")
     paths = set(manifest["paths"])
     gold = {path for case in all_cases for path in case["gold_docs"]}
     assert gold == paths

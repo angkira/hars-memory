@@ -415,6 +415,11 @@ def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
     _explicit_http_model = os.environ.get("HARS_MEMORY_EMBED_HTTP_MODEL", "").strip()
     http_model = _explicit_http_model or model_name
     timeout = float(os.environ.get("HARS_MEMORY_EMBED_HTTP_TIMEOUT", "60"))
+    # Total wall-clock cap per embedding request (httpx's own timeout is per
+    # socket operation). Default 2x; 0 disables.
+    hard_timeout = float(
+        os.environ.get("HARS_MEMORY_EMBED_HTTP_HARD_TIMEOUT", str(2 * timeout))
+    )
     batch_size = max(1, int(batch_size))
     max_inputs_per_request = max(
         1, int(os.environ.get("HARS_MEMORY_EMBED_HTTP_MAX_INPUTS_PER_REQUEST", "128"))
@@ -606,7 +611,21 @@ def _make_http_embedding_func(*, model_name: str, batch_size: int) -> object:
         for attempt in range(1, _HTTP_MAX_ATTEMPTS + 1):
             await _pace()
             try:
-                resp = await client.post(url, json=payload, headers=headers)  # type: ignore[attr-defined]
+                if hard_timeout > 0:
+                    try:
+                        resp = await asyncio.wait_for(
+                            client.post(url, json=payload, headers=headers),  # type: ignore[attr-defined]
+                            timeout=hard_timeout,
+                        )
+                    except (asyncio.TimeoutError, TimeoutError):
+                        # httpx's timeout is per socket op; a stalled/trickling
+                        # endpoint needs this total cap. Treated like any
+                        # transport timeout (retried, then surfaced).
+                        raise httpx.ReadTimeout(
+                            f"embedding request exceeded hard {hard_timeout:.0f}s deadline"
+                        ) from None
+                else:
+                    resp = await client.post(url, json=payload, headers=headers)  # type: ignore[attr-defined]
             except httpx.TransportError as exc:  # timeouts included
                 last_error = exc
                 logger.warning(
@@ -1006,6 +1025,25 @@ _EMBEDDING_DIM_RE = re.compile(r'"embedding_dim"\s*:\s*(\d+)')
 # prefix applied in front of it, so multiple projects can share one Qdrant
 # container without colliding on schema (embedding dimension is a
 # per-collection property, not per-workspace).
+def describe_embedder(local_model: str) -> str:
+    """Human-readable id of the embedder this process actually uses.
+
+    In http mode the vectors come from HARS_MEMORY_EMBED_HTTP_MODEL (falling
+    back to ``local_model``, the same resolution as the http embed func) at
+    HARS_MEMORY_EMBED_BASE_URL — reporting only ``local_model`` there would
+    name a model that never ran.
+    """
+    try:
+        provider = _resolve_provider()
+    except RuntimeError as exc:
+        return f"invalid provider ({exc})"
+    if provider == "http":
+        http_model = os.environ.get("HARS_MEMORY_EMBED_HTTP_MODEL", "").strip() or local_model
+        base_url = os.environ.get("HARS_MEMORY_EMBED_BASE_URL", "").strip().rstrip("/") or "<unset>"
+        return f"{http_model} @ {base_url} (http)"
+    return f"{local_model} (CPU)"
+
+
 def qdrant_collection_names(prefix: str) -> tuple[str, str, str]:
     """Return this project's (chunks, entities, relationships) Qdrant
     collection names, namespaced by `prefix` so multiple projects can

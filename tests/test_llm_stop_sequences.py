@@ -182,3 +182,42 @@ class TestStopSequences:
 
         assert captured["stop"] == [COMPLETE_MARKER]
         assert captured.get("reasoning_effort") == "low"
+
+
+class TestOmitSamplingParams:
+    """HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS: Anthropic's OpenAI-compatible
+    endpoint 400s on ``temperature`` for claude-haiku-5-5 / sonnet-5-5."""
+
+    def test_default_sends_temperature(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured = _patch_client_factory(monkeypatch, None)
+        monkeypatch.delenv("HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS", raising=False)
+        asyncio.run(_make_llm_func_for_test()("x"))  # type: ignore[operator]
+        assert captured["temperature"] == 0.1
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+    def test_switch_omits_temperature_and_top_p(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        captured = _patch_client_factory(monkeypatch, None)
+        monkeypatch.setenv("HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS", value)
+        llm_func = make_llm_func(
+            base_url="http://localhost:8080/v1",
+            model="claude-haiku-5-5",
+            max_tokens=64,
+            temperature=0.1,
+            extra_body={"top_p": 0.9, "reasoning": {"effort": "low"}},
+        )
+        asyncio.run(llm_func("x", temperature=0.5, top_p=0.8))  # type: ignore[operator]
+        assert "temperature" not in captured
+        assert "top_p" not in captured
+        assert captured["reasoning"] == {"effort": "low"}
+        assert captured["max_tokens"] == 64
+
+    @pytest.mark.parametrize("value", ["", "0", "false", "no"])
+    def test_falsy_values_keep_temperature(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        captured = _patch_client_factory(monkeypatch, None)
+        monkeypatch.setenv("HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS", value)
+        asyncio.run(_make_llm_func_for_test()("x"))  # type: ignore[operator]
+        assert captured["temperature"] == 0.1

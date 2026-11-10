@@ -14,6 +14,9 @@ Tool catalogue:
   memory_inspect_entity  — detailed entity inspection: properties, full description, relationships
   memory_related         — N-hop subgraph for a given entity (INTROSPECTION, unstable)
   memory_status          — index health + staleness (GPU-FREE)
+  memory_compact         — persist one session compaction (summary + dropped facts)
+  memory_merge_session   — consolidate a split-mode session into the main graph
+  memory_session_status  — session compaction inventory / merge state (GPU-FREE)
   memory_upsert_document — atomic single-document insert or update into knowledge graph
   memory_delete_document — purge single document and unshared entities by path or doc_id
   memory_sync_status     — fast zero-LLM divergence check between disk sources and index
@@ -90,11 +93,13 @@ from hars_memory.mcp_oauth import (
     required_scope_for_tool,
 )
 from hars_memory.mcp_runtime import EngineOverloaded, run_blocking
+from hars_memory.run_lease import get_lease_registry
 from hars_memory.projects import (
     ProjectMetadata,
     get_default_project_registry,
 )
-from hars_memory.server.embedder import qdrant_collection_names
+from hars_memory.projects.registry import qdrant_workspace_for
+from hars_memory.server.embedder import describe_embedder, qdrant_collection_names
 from hars_memory.server.legacy_env_guard import refuse_if_legacy_env
 from hars_memory.server.logging_setup import log_query_event, log_write_event, setup_logging
 from hars_memory.trace import emit as trace_emit
@@ -169,6 +174,33 @@ HARS_MEMORY_QUERY_MODEL = os.environ.get("HARS_MEMORY_QUERY_MODEL", "Qwen3.5-4B-
 # read path) — a single source of truth for where staged notes accumulate before
 # the next update_kb.sh run merges them into the graph.
 HARS_MEMORY_STAGING_DIR = _require_env("HARS_MEMORY_STAGING_DIR")
+
+# --- Session compaction memory (hars_memory/session_memory.py) --------------
+# An agent session compacts its context repeatedly; each compaction's summary
+# and dropped-context facts are persisted as a document so the knowledge
+# outlives both the compaction and the session. `split` (default) keeps each
+# session in its own LightRAG working dir under HARS_MEMORY_SESSIONS_DIR and
+# merges it into the main index on demand; `subgraph` indexes compactions
+# directly into the main graph. See session_memory.py's module docstring.
+HARS_MEMORY_SESSION_MODE = (
+    os.environ.get("HARS_MEMORY_SESSION_MODE", "split").strip().lower() or "split"
+)
+if HARS_MEMORY_SESSION_MODE not in {"split", "subgraph"}:
+    raise ValueError(
+        "HARS_MEMORY_SESSION_MODE must be 'split' or 'subgraph', "
+        f"got {HARS_MEMORY_SESSION_MODE!r}"
+    )
+# Empty/unset => SessionMemoryStore derives `<HARS_MEMORY_INDEX_DIR>/sessions`.
+HARS_MEMORY_SESSIONS_DIR = os.environ.get("HARS_MEMORY_SESSIONS_DIR", "").strip()
+try:
+    HARS_MEMORY_SESSION_INDEX_BS = int(os.environ.get("HARS_MEMORY_SESSION_INDEX_BS", "25"))
+except ValueError:
+    HARS_MEMORY_SESSION_INDEX_BS = 25
+HARS_MEMORY_SESSION_INDEX_BS = max(1, min(256, HARS_MEMORY_SESSION_INDEX_BS))
+try:
+    HARS_MEMORY_SESSION_MIN_SCORE = float(os.environ.get("HARS_MEMORY_SESSION_MIN_SCORE", "0.2"))
+except ValueError:
+    HARS_MEMORY_SESSION_MIN_SCORE = 0.2
 
 # --- Hybrid (dense + BM25 sparse) retrieval config — see retrieval/ package ---
 # Default derived from HARS_MEMORY_INDEX_DIR (never a separate machine-global
@@ -921,8 +953,24 @@ def schema(properties: dict[str, Any], required: list[str] | None = None) -> dic
     return result
 
 
+#: Write tools that honour the optional cooperative ``run_tag`` (see run_lease.py).
+LEASE_WRITE_TOOLS = frozenset(
+    {"memory_compact", "memory_remember", "memory_merge_session", "memory_upsert_document"}
+)
+
+
 def tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> Tool:
     props = dict(properties)
+    if name in LEASE_WRITE_TOOLS:
+        props.setdefault(
+            "run_tag",
+            {
+                "type": "string",
+                "description": "Optional run label. If a run lease (memory_lease_acquire) is held by a "
+                               "different tag the write still happens but the response carries a "
+                               "`warning`. Never blocks.",
+            },
+        )
     props.setdefault(
         "project",
         {
@@ -977,7 +1025,7 @@ def _index_status(project: ProjectMetadata | None = None) -> dict[str, Any]:
         staging_dir = Path(project.staging_dir) if project.staging_dir else Path(HARS_MEMORY_STAGING_DIR)
         graph_file = _graph_file_path(project)
         prefix = project.qdrant_collection_prefix or HARS_MEMORY_QDRANT_COLLECTION_PREFIX
-        workspace_id = project.qdrant_collection or HARS_MEMORY_QDRANT_COLLECTION
+        workspace_id = qdrant_workspace_for(project)
     else:
         working_dir = Path(HARS_MEMORY_INDEX_DIR)
         project_id = "default"
@@ -1097,7 +1145,7 @@ def _index_status(project: ProjectMetadata | None = None) -> dict[str, Any]:
         "configured_models": {
             "extractor": f"{HARS_MEMORY_EXTRACTOR_MODEL} @ {HARS_MEMORY_EXTRACTOR_BASE_URL}",
             "query": f"{HARS_MEMORY_QUERY_MODEL} @ {HARS_MEMORY_QUERY_BASE_URL}",
-            "embedder": f"{HARS_MEMORY_EMBED_MODEL} (CPU)",
+            "embedder": describe_embedder(HARS_MEMORY_EMBED_MODEL),
         },
         "staging_backlog": _staging_backlog_info(staging_dir),
         "message": (
@@ -1134,6 +1182,41 @@ def _staging_backlog_info(staging_dir: Path | None = None) -> dict[str, Any]:
 
 
 _rag_instance: object | None = None
+
+
+# Opt-in upsert content dedup (see memory_upsert_document). Default off: the
+# exact-content skip changes write semantics, so it must never happen silently.
+# Read once at import like the other HARS_MEMORY_* flags above (the MCP server
+# process picks it up at startup).
+_UPSERT_CONTENT_DEDUP_ENABLED = os.environ.get("HARS_MEMORY_UPSERT_CONTENT_DEDUP", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Opt-in batch queueing of upserts (see memory_upsert_document and
+# hars_memory/ingest/upsert_inbox.py). Default off: "queued_for_batch" defers
+# the document's recall-availability to a later `memory index-batch --source
+# upsert-inbox` run, so it must never happen silently. Read once at import,
+# exactly like the content-dedup flag above.
+_UPSERT_BATCH_QUEUE_ENABLED = os.environ.get("HARS_MEMORY_UPSERT_BATCH_MODE", "").strip().lower() == "queue"
+
+
+async def _doc_processing_state(rag: object, doc_id: str) -> str | None:
+    """LightRAG doc_status of *doc_id* in *rag* ("processed", "pending", "failed", ...), "missing"
+    when the index has no status row for it, or None when it cannot be read (no doc_status store)."""
+    status_store = getattr(rag, "doc_status", None)
+    getter = getattr(status_store, "get_by_id", None)
+    if getter is None:
+        return None
+    try:
+        row = await getter(doc_id)
+    except Exception:  # noqa: BLE001 -- best effort; never fail a write on the check itself
+        return None
+    if row is None or row == {}:
+        return "missing"
+    if not isinstance(row, dict):         # LightRAG returns a dict; anything else is not a status we can trust
+        return None
+    status = row.get("status")
+    return str(getattr(status, "value", status) or "missing").lower()
 
 
 async def _get_rag(project_id: str = "default") -> object:
@@ -1258,9 +1341,9 @@ async def _get_graph(project_id: str = "default") -> tuple[Any, str]:
     Raises FileNotFoundError if the index has not been built yet.
     """
     global _graph_cache, _graph_cache_mtime
-    if _graph_cache is not None:
-        return _graph_cache, "hit"
     if project_id == "default":
+        if _graph_cache is not None:
+            return _graph_cache, "hit"
         graph_file = _graph_file_path()
         if not graph_file.exists():
             raise FileNotFoundError(f"Index not built yet: {graph_file}")
@@ -1287,8 +1370,11 @@ async def _get_graph(project_id: str = "default") -> tuple[Any, str]:
 def _clear_in_memory_graph_cache(project_id: str | None = None) -> None:
     """Reset cached NetworkX graph instance in memory."""
     global _graph_cache, _graph_cache_mtime
-    _graph_cache = None
-    _graph_cache_mtime = None
+    if not project_id or project_id == "default":
+        # the module-level cache belongs to the default project only: a write to a
+        # neighbour project must not evict (and force a rebuild of) its graph
+        _graph_cache = None
+        _graph_cache_mtime = None
     if project_id:
         get_default_project_registry().invalidate_caches(project_id)
     else:
@@ -1308,9 +1394,9 @@ _bm25_lock = asyncio.Lock()
 async def _get_bm25_index(project_id: str = "default") -> tuple[Any, str]:
     """Return (cached BM25SparseIndex, cache_status) for the given project."""
     global _bm25_cache, _bm25_cache_source_mtime
-    if _bm25_cache is not None:
-        return _bm25_cache, "hit"
     if project_id == "default":
+        if _bm25_cache is not None:
+            return _bm25_cache, "hit"
         from hars_memory.retrieval.bm25_index import (
             CHUNKS_FILENAME,
             BM25IndexUnavailableError,
@@ -1338,12 +1424,55 @@ async def _get_bm25_index(project_id: str = "default") -> tuple[Any, str]:
 def _invalidate_bm25_cache(project_id: str | None = None) -> None:
     """Reset cached BM25SparseIndex in memory."""
     global _bm25_cache, _bm25_cache_source_mtime
-    _bm25_cache = None
-    _bm25_cache_source_mtime = None
+    if not project_id or project_id == "default":
+        _bm25_cache = None
+        _bm25_cache_source_mtime = None
     if project_id:
         get_default_project_registry().invalidate_caches(project_id)
     else:
         get_default_project_registry().invalidate_all_caches()
+
+
+# ---------------------------------------------------------------------------
+# Session compaction store (hars_memory/session_memory.py) — cached lazy
+# singleton per project, resolving its index dir exactly like
+# memory_upsert_document does (HARS_MEMORY_INDEX_DIR for the default project,
+# project_meta.index_dir otherwise).
+# ---------------------------------------------------------------------------
+_session_stores: dict[str, Any] = {}
+
+
+def _project_index_dir(project_id: str) -> Path:
+    """Resolve the MAIN index directory for *project_id*."""
+    if project_id == "default":
+        return Path(HARS_MEMORY_INDEX_DIR)
+    project_meta = get_default_project_registry().get_project(project_id)
+    index_dir = getattr(project_meta, "index_dir", "") if project_meta is not None else ""
+    return Path(index_dir) if index_dir else Path(HARS_MEMORY_INDEX_DIR)
+
+
+def _get_session_store(project_id: str = "default") -> Any:
+    """Return the cached SessionMemoryStore for *project_id*.
+
+    Lazy import: `session_memory` pulls in the ingest pipeline, which the
+    query-only path never needs. The mode/batch-size env values are captured
+    once at module import (like every other HARS_MEMORY_* constant in this
+    file) and passed explicitly so a test reloading this module gets the
+    expected store.
+    """
+    store = _session_stores.get(project_id)
+    if store is not None:
+        return store
+    from hars_memory.session_memory import SessionMemoryStore
+
+    store = SessionMemoryStore(
+        index_dir=_project_index_dir(project_id),
+        sessions_dir=HARS_MEMORY_SESSIONS_DIR or None,
+        mode=HARS_MEMORY_SESSION_MODE,
+        index_bs=HARS_MEMORY_SESSION_INDEX_BS,
+    )
+    _session_stores[project_id] = store
+    return store
 
 
 # ---------------------------------------------------------------------------
@@ -1871,7 +2000,8 @@ async def _compute_hybrid_block(
 
         # Location fields (heading_path/start_line/end_line/source_path) are
         # additive: absent for chunks of an index not yet migrated.
-        chunk_wdir = getattr(rag, "working_dir", None)
+        from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+        chunk_wdir = _rag_index_dir(rag)
         if not isinstance(chunk_wdir, (str, os.PathLike)):
             chunk_wdir = HARS_MEMORY_INDEX_DIR if project_id == "default" else None
 
@@ -2590,8 +2720,699 @@ async def _compute_hybrid_block(
 
 
 # ---------------------------------------------------------------------------
-# Entity search matching (normalization, token-AND, tiered ranking, aliases)
+# Session-compaction recall channel (split mode, unmerged sessions)
 # ---------------------------------------------------------------------------
+# An in-progress session's compactions live in an isolated working directory
+# (session_memory.py), so the main dense/BM25/ripgrep channels cannot see them.
+# When the caller passes session_id, one more additive channel scans that
+# session's chunk store and is APPENDED after the fused top_k (never evicting
+# an existing candidate), mirroring the ripgrep channel's presence guarantee.
+# Fully fail-soft: any problem degrades to zero session hits plus a reason in
+# the response's `session` block, and the rest of recall is unaffected. A
+# query-embedding failure is NOT such a problem: lexical scoring needs no
+# embedder, so the channel keeps running and flags `degraded: lexical_only`.
+SESSION_CHANNEL_NAME = "session"
+SESSION_CHUNKS_FILENAME = "kv_store_text_chunks.json"
+SESSION_VDB_FILENAME = "vdb_chunks.json"
+SESSION_MERGED_FILENAME = "merged.json"
+
+_SESSION_TOKEN_RE = re.compile(r"[0-9A-Za-z_]+")
+
+
+def _session_token_set(text: str) -> set[str]:
+    return set(_SESSION_TOKEN_RE.findall(text.casefold()))
+
+
+def _session_lexical_f1(query_tokens: set[str], text: str) -> float:
+    """Case-folded token-set F1 between the query and one chunk."""
+    if not query_tokens:
+        return 0.0
+    text_tokens = _session_token_set(text)
+    if not text_tokens:
+        return 0.0
+    overlap = len(query_tokens & text_tokens)
+    if not overlap:
+        return 0.0
+    precision = overlap / len(query_tokens)
+    recall = overlap / len(text_tokens)
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _session_vectors_from_vdb(vdb: dict[str, Any]) -> tuple[list[str], Any]:
+    """Decode a NanoVectorDB ``vdb_chunks.json`` file into (ids, matrix).
+
+    Accepts both layouts this package can encounter: NanoVectorDB's own
+    ``matrix`` (raw base64 float32, or zlib-compressed float16 as LightRAG's
+    NanoVectorDBStorage writes it) and, when ``matrix`` is unusable, the
+    per-record compressed ``vector`` fields. Rows stay aligned with ``data``.
+    Returns ``([], None)`` when nothing can be decoded.
+    """
+    import base64
+    import zlib
+
+    import numpy as np
+
+    data = vdb.get("data")
+    if not isinstance(data, list) or not data:
+        return [], None
+    ids = [str(record.get("__id__", "")) for record in data if isinstance(record, dict)]
+    dim = int(vdb.get("embedding_dim") or 0)
+
+    def _decode_row(encoded: str, dimension: int) -> Any:
+        blob = base64.b64decode(encoded)
+        try:
+            blob = zlib.decompress(blob)
+        except zlib.error:
+            pass
+        itemsize = len(blob) // max(dimension, 1)
+        dtype = np.float16 if itemsize == 2 else np.float32
+        vector = np.frombuffer(blob, dtype=dtype)
+        if dimension and vector.size != dimension:
+            return None
+        return vector.astype(np.float32)
+
+    matrix = None
+    raw_matrix = vdb.get("matrix")
+    if isinstance(raw_matrix, str) and raw_matrix and dim:
+        try:
+            blob = base64.b64decode(raw_matrix)
+            try:
+                blob = zlib.decompress(blob)
+            except zlib.error:
+                pass
+            row_bytes = len(blob) // len(ids)
+            dtype = np.float16 if row_bytes == dim * 2 else np.float32
+            decoded = np.frombuffer(blob, dtype=dtype).astype(np.float32)
+            if decoded.size == len(ids) * dim:
+                matrix = decoded.reshape(len(ids), dim)
+        except (ValueError, TypeError):  # pragma: no cover - defensive
+            matrix = None
+    if matrix is None:
+        rows = []
+        for record in data:
+            if not isinstance(record, dict):
+                return [], None
+            encoded = record.get("vector")
+            if not isinstance(encoded, str):
+                return [], None
+            try:
+                row = _decode_row(encoded, dim)
+            except (ValueError, TypeError):
+                return [], None
+            if row is None:
+                return [], None
+            rows.append(row)
+        if not rows:
+            return [], None
+        matrix = np.vstack(rows)
+    return ids, matrix
+
+
+async def _compute_session_channel(
+    rag: object,
+    question: str,
+    session_id: str,
+    top_k: int,
+    project_id: str = "default",
+) -> tuple[dict[str, Any], list[Any]]:
+    """Return ``(response session block, appended FusedChunks)``.
+
+    Skips (with an explicit reason) in subgraph mode, for an already-merged
+    session, for an unknown session, or when the session's stores are missing.
+    The channel never raises: every failure becomes ``{"error": ...}`` in the
+    block plus zero hits. A query-embedding failure/timeout does NOT zero the
+    channel: it falls back to lexical F1 scoring and flags
+    ``degraded: "lexical_only"``. ``status`` is one of ``ok``, ``no_hits``,
+    ``degraded``, ``skipped``, ``unknown_session`` or ``error`` so a caller
+    can tell a broken channel from a legitimate empty result.
+    """
+    sid = str(session_id or "").strip()
+    block: dict[str, Any] = {"session_id": sid, "hits": 0, "merged": False}
+    if not sid:
+        return block, []
+    started = time.monotonic()
+
+    try:
+        from hars_memory.session_memory import validate_session_id
+
+        sid = validate_session_id(sid)
+        session_store = _get_session_store(project_id)
+        session_dir = session_store.session_dir(sid)
+    except Exception as exc:  # noqa: BLE001 -- fail-soft by contract
+        logger.warning("Session recall channel unavailable: %s", exc)
+        block["status"] = "error"
+        block["error_kind"] = "channel"
+        block["error"] = str(exc)
+        await trace_emit(
+            "session_hits",
+            enabled=False,
+            skipped=True,
+            reason="channel_unavailable",
+            session_id=sid,
+            latency_ms=None,
+            hits=[],
+        )
+        return block, []
+
+    if session_store.mode != "split":
+        block["status"] = "skipped"
+        block["skipped"] = "subgraph mode indexes compactions directly into the main graph"
+        await trace_emit(
+            "session_hits",
+            enabled=False,
+            skipped=True,
+            reason=block["skipped"],
+            session_id=sid,
+            latency_ms=None,
+            hits=[],
+        )
+        return block, []
+    if not session_dir.is_dir():
+        block["status"] = "unknown_session"
+        block["error"] = "unknown session"
+        await trace_emit(
+            "session_hits",
+            enabled=False,
+            skipped=True,
+            reason="unknown_session",
+            session_id=sid,
+            latency_ms=None,
+            hits=[],
+        )
+        return block, []
+    if (session_dir / SESSION_MERGED_FILENAME).is_file():
+        block["merged"] = True
+        block["status"] = "skipped"
+        block["skipped"] = "session already merged into the main index"
+        await trace_emit(
+            "session_hits",
+            enabled=True,
+            skipped=True,
+            reason="already_merged",
+            session_id=sid,
+            latency_ms=None,
+            hits=[],
+        )
+        return block, []
+
+    # Query embedding is only needed for the cosine half of the score. When the
+    # embedder fails or times out the channel degrades to lexical F1 only and
+    # says so (`degraded: "lexical_only"` + `error`/`error_kind`) instead of
+    # silently returning zero hits.
+    query_vec: Any = None
+    try:
+        import numpy as np
+
+        embed_func = getattr(rag, "embedding_func", None)
+        if embed_func is None:
+            raise RuntimeError("recall embedding function unavailable")
+        embed_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
+        raw_query = await asyncio.wait_for(
+            embed_func([question], context="query"), timeout=embed_timeout
+        )
+        query_vec = np.asarray(raw_query, dtype=np.float32).reshape(-1)
+        query_norm = float(np.linalg.norm(query_vec))
+        if query_norm > 0.0:
+            query_vec = query_vec / query_norm
+    except Exception as exc:  # noqa: BLE001 -- degrade to lexical-only
+        query_vec = None
+        detail = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else repr(exc))
+        logger.warning(
+            "Session recall channel embedding failed (session=%s), lexical-only fallback: %s: %s",
+            sid,
+            type(exc).__name__,
+            detail,
+        )
+        block["degraded"] = "lexical_only"
+        block["error_kind"] = "embedding"
+        block["error"] = f"query embedding failed ({type(exc).__name__}): {detail}"
+
+    def _search() -> tuple[list[Any], dict[str, Any]]:
+        import json
+
+        import numpy as np
+
+        from hars_memory.retrieval.fusion import FusedChunk
+
+        chunks_path = session_dir / SESSION_CHUNKS_FILENAME
+        vdb_path = session_dir / SESSION_VDB_FILENAME
+        try:
+            chunks_raw = json.loads(chunks_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            chunks_raw = {}
+        chunks = {
+            str(key): value
+            for key, value in (chunks_raw.items() if isinstance(chunks_raw, dict) else [])
+            if isinstance(value, dict)
+        }
+        try:
+            vdb_raw = json.loads(vdb_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            vdb_raw = {}
+        vdb = vdb_raw if isinstance(vdb_raw, dict) else {}
+        vector_ids, matrix = _session_vectors_from_vdb(vdb)
+        cosine_by_id: dict[str, float] = {}
+        vector_error: str | None = None
+        if query_vec is not None and matrix is not None and vector_ids:
+            try:
+                norms = np.linalg.norm(matrix, axis=1)
+                norms[norms == 0.0] = 1.0
+                sims = (matrix @ query_vec) / norms
+                for chunk_id, score in zip(vector_ids, sims, strict=False):
+                    cosine_by_id[chunk_id] = float(np.clip(score, -1.0, 1.0))
+            except (ValueError, TypeError) as exc:
+                # e.g. query/vector dimension mismatch: keep the lexical half.
+                cosine_by_id = {}
+                vector_error = f"vector scoring failed ({type(exc).__name__}): {exc}"
+
+        query_tokens = _session_token_set(question)
+        paths_by_id: dict[str, str] = {}
+        for record in vdb.get("data") or []:
+            if isinstance(record, dict):
+                paths_by_id[str(record.get("__id__", ""))] = str(record.get("file_path", ""))
+        scored: list[tuple[float, float, float, str, dict[str, Any]]] = []
+        for chunk_id in set(chunks) | set(cosine_by_id):
+            meta = chunks.get(chunk_id, {})
+            content = str(meta.get("content", ""))
+            file_path = str(meta.get("file_path", "")) or paths_by_id.get(chunk_id, "")
+            cosine = max(0.0, cosine_by_id.get(chunk_id, 0.0))
+            lexical = _session_lexical_f1(query_tokens, content)
+            final = max(cosine, lexical)
+            scored.append((final, cosine, lexical, chunk_id, {
+                "content": content,
+                "file_path": file_path,
+            }))
+        scored.sort(key=lambda item: (-item[0], item[3]))
+        candidates = [item for item in scored if item[0] >= HARS_MEMORY_SESSION_MIN_SCORE]
+        limit = max(1, int(top_k))
+        fused: list[Any] = [
+            FusedChunk(
+                chunk_id=f"{SESSION_CHANNEL_NAME}:{sid}:{chunk_id}",
+                fused_score=final,
+                dense_score=cosine,
+                sparse_score=lexical,
+                dense_norm=cosine,
+                sparse_norm=lexical,
+                content=meta["content"],
+                file_path=meta["file_path"],
+                channel=SESSION_CHANNEL_NAME,
+                session_id=sid,
+            )
+            for final, cosine, lexical, chunk_id, meta in candidates[:limit]
+        ]
+        entities, relations = 0, 0
+        graph_counts = getattr(session_store, "_graph_counts", None)
+        if callable(graph_counts):
+            try:
+                entities, relations = graph_counts(session_dir)
+            except Exception as exc:  # noqa: BLE001 -- stats are fail-soft
+                logger.debug("Session recall channel: graph counts unavailable: %s", exc)
+        stats = {
+            "chunks_indexed": len(chunks),
+            "vectors_indexed": len(vector_ids),
+            "entities": entities,
+            "relations": relations,
+            "scored": len(scored),
+            "below_threshold": max(0, len(scored) - len(candidates)),
+            "min_score": HARS_MEMORY_SESSION_MIN_SCORE,
+        }
+        if vector_error is not None:
+            stats["vector_error"] = vector_error
+        return fused, stats
+
+    try:
+        fused, stats = await run_blocking(_search)
+    except Exception as exc:  # noqa: BLE001 -- reported, never an empty "success"
+        logger.warning("Session recall channel failed (session=%s): %s", sid, exc)
+        block["status"] = "error"
+        block["error_kind"] = "channel"
+        block["error"] = f"session channel failed ({type(exc).__name__}): {exc}"
+        await trace_emit(
+            "session_hits",
+            enabled=True,
+            skipped=True,
+            reason="channel_failed",
+            session_id=sid,
+            latency_ms=None,
+            hits=[],
+        )
+        return block, []
+
+    vector_error = stats.pop("vector_error", None)
+    if vector_error is not None and "degraded" not in block:
+        block["degraded"] = "lexical_only"
+        block["error_kind"] = "vector_scoring"
+        block["error"] = vector_error
+    elapsed_ms = round((time.monotonic() - started) * 1000.0, 2)
+    block.update({
+        "hits": len(fused),
+        "latency_ms": elapsed_ms,
+        **stats,
+    })
+    # `status` separates a degraded-but-working channel from a legitimate
+    # empty result: "ok" (hits), "no_hits" (searched, nothing above the
+    # cutoff or an empty session store), "degraded" (lexical-only scoring).
+    if "degraded" in block:
+        block["status"] = "degraded"
+    else:
+        block["status"] = "ok" if fused else "no_hits"
+    await trace_emit(
+        "session_hits",
+        enabled=True,
+        skipped=False,
+        reason=block.get("degraded"),
+        session_id=sid,
+        latency_ms=elapsed_ms,
+        hits=[
+            {
+                "chunk_id": chunk.chunk_id,
+                "session_score": round(chunk.fused_score, 4),
+                "cosine": round(chunk.dense_score or 0.0, 4),
+                "lexical_f1": round(chunk.sparse_score or 0.0, 4),
+                **_trace_hit_doc_fields(chunk.content, chunk.file_path),
+            }
+            for chunk in fused[:HARS_MEMORY_TRACE_HITS_CAP]
+        ],
+    )
+    return block, fused
+
+
+# ---------------------------------------------------------------------------
+# Session-graph recall (opt-in): query the per-session LightRAG graph
+# ---------------------------------------------------------------------------
+# Plan: .plans/2026-10-26_session-graph-recall.md (Option A). In split mode the
+# compaction documents are extracted into a per-session LightRAG working dir
+# (NanoVectorDB + NetworkX), but the session channel above only reads its CHUNK
+# stores. With `session_graph=true` (or HARS_MEMORY_SESSION_GRAPH=on) recall also
+# runs a hybrid (local+global) `only_need_context` LightRAG query against that
+# session graph and splices its Entity / Relationship sections ABOVE the
+# unchanged chunk section. Default OFF: the payload is then byte-identical to a
+# build without this feature.
+SESSION_GRAPH_ENV = "HARS_MEMORY_SESSION_GRAPH"
+SESSION_GRAPH_MODES = ("hybrid", "local", "global", "mix")
+SESSION_GRAPH_RAG_CACHE_MAX = 8
+SESSION_GRAPH_KEYWORD_CACHE_MAX = 512
+_CONTEXT_RELATION_SECTION_HEADER = "Knowledge Graph Data (Relationship):"
+_SESSION_GRAPH_SIGNATURE_FILES = (
+    "graph_chunk_entity_relation.graphml",
+    "vdb_entities.json",
+    "vdb_relationships.json",
+    "vdb_chunks.json",
+    "kv_store_text_chunks.json",
+    "kv_store_full_entities.json",
+    "kv_store_full_relations.json",
+)
+
+# sid -> (signature, rag). Rebuilt when a compaction rewrites the session files.
+_session_graph_rags: dict[str, tuple[tuple, Any]] = {}
+_session_graph_locks: dict[str, asyncio.Lock] = {}
+# (sid, sha1(question)) -> (ll_keywords, hl_keywords), insertion-ordered.
+_session_graph_keyword_cache: dict[tuple[str, str], tuple[list[str], list[str]]] = {}
+
+_SESSION_GRAPH_KEYWORD_SYSTEM = (
+    "You extract search keywords for a knowledge-graph lookup. Reply with ONE JSON object "
+    "and nothing else: {\"high_level_keywords\": [...], \"low_level_keywords\": [...]}. "
+    "high_level_keywords: overarching themes/concepts the question is about (2-5). "
+    "low_level_keywords: specific entities, names, identifiers, file paths, numbers "
+    "(copy identifiers VERBATIM, 2-8)."
+)
+
+
+def _session_graph_enabled(arg: Any) -> bool:
+    """Per-call `session_graph` wins; absent -> HARS_MEMORY_SESSION_GRAPH (default off)."""
+    if arg is not None:
+        return bool(arg)
+    return os.environ.get(SESSION_GRAPH_ENV, "").strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _session_graph_signature(session_dir: Path) -> tuple:
+    sig = []
+    for name in _SESSION_GRAPH_SIGNATURE_FILES:
+        try:
+            st = (session_dir / name).stat()
+            sig.append((name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append((name, None, None))
+    return tuple(sig)
+
+
+async def _get_session_graph_rag(sid: str, session_dir: Path) -> Any:
+    """Return a LightRAG over *session_dir* (file-backed storages ONLY, never the
+    main Qdrant collections), cached per (sid, file signature). Caller holds the
+    per-session lock."""
+    signature = _session_graph_signature(session_dir)
+    cached = _session_graph_rags.get(sid)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    if cached is not None:
+        _session_graph_rags.pop(sid, None)
+        try:
+            await cached[1].finalize_storages()
+        except Exception:  # noqa: BLE001 -- best effort
+            logger.debug("session graph rag finalize failed (sid=%s)", sid, exc_info=True)
+    from hars_memory.server.lightrag_init import create_lightrag
+    from hars_memory.session_memory import _SESSION_GRAPH_STORAGE, _SESSION_VECTOR_STORAGE
+
+    rag = create_lightrag(
+        working_dir=str(session_dir),
+        vector_storage=_SESSION_VECTOR_STORAGE,
+        graph_storage=_SESSION_GRAPH_STORAGE,
+    )
+    await rag.initialize_storages()  # type: ignore[attr-defined]
+    while len(_session_graph_rags) >= SESSION_GRAPH_RAG_CACHE_MAX:
+        old_sid = next(iter(_session_graph_rags))
+        _, old = _session_graph_rags.pop(old_sid)
+        try:
+            await old.finalize_storages()
+        except Exception:  # noqa: BLE001
+            pass
+    _session_graph_rags[sid] = (signature, rag)
+    return rag
+
+
+def _parse_keyword_json(text: Any) -> tuple[list[str], list[str]]:
+    """Parse the keyword LLM reply -> (ll, hl). Raises ValueError when unusable."""
+    raw = str(text or "")
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        raise ValueError("no JSON object in keyword reply")
+    data = json.loads(raw[start : end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("keyword reply is not a JSON object")
+
+    def _clean(value: Any) -> list[str]:
+        items = value if isinstance(value, list) else []
+        return [s for s in (str(i).strip() for i in items) if s][:12]
+
+    ll = _clean(data.get("low_level_keywords"))
+    hl = _clean(data.get("high_level_keywords"))
+    if not ll and not hl:
+        raise ValueError("keyword reply had no keywords")
+    return ll, hl
+
+
+async def _resolve_session_graph_keywords(
+    rag: Any, question: str, sid: str, ll: list[str], hl: list[str]
+) -> tuple[list[str], list[str], str, dict[str, Any]]:
+    """caller > ONE extractor-model LLM call (cached per question+session) >
+    question text. Returns (ll, hl, keyword_source, extra block fields)."""
+    import hashlib
+
+    if ll or hl:
+        return ll, hl, "caller", {}
+    key = (sid, hashlib.sha1(question.encode("utf-8")).hexdigest())
+    cached = _session_graph_keyword_cache.get(key)
+    if cached is not None:
+        return list(cached[0]), list(cached[1]), "llm", {"keyword_cached": True}
+    started = time.monotonic()
+    extra: dict[str, Any] = {}
+    try:
+        llm = getattr(rag, "llm_model_func", None)
+        if llm is None:
+            raise RuntimeError("session rag has no llm_model_func")
+        timeout = float(os.environ.get("HARS_MEMORY_SESSION_GRAPH_KEYWORD_TIMEOUT_SECONDS", "30"))
+        reply = await asyncio.wait_for(
+            llm(f"Question: {question}", system_prompt=_SESSION_GRAPH_KEYWORD_SYSTEM),
+            timeout=timeout,
+        )
+        k_ll, k_hl = _parse_keyword_json(reply)
+        extra["keyword_latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        while len(_session_graph_keyword_cache) >= SESSION_GRAPH_KEYWORD_CACHE_MAX:
+            _session_graph_keyword_cache.pop(next(iter(_session_graph_keyword_cache)))
+        _session_graph_keyword_cache[key] = (k_ll, k_hl)
+        return k_ll, k_hl, "llm", extra
+    except Exception as exc:  # noqa: BLE001 -- documented fallback
+        detail = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else repr(exc))
+        logger.warning("session graph keyword extraction failed (sid=%s): %s: %s", sid, type(exc).__name__, detail)
+        extra["keyword_latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        extra["keyword_error"] = f"{type(exc).__name__}: {detail}"
+        return [question], [question], "question_fallback", extra
+
+
+def _kg_block_lines(context: str, header: str) -> list[str]:
+    block = _extract_fenced_block(context, header)
+    if block is None:
+        return []
+    return [line for line in block[2].splitlines() if line.strip()]
+
+
+async def _compute_session_graph_context(
+    question: str,
+    session_id: str,
+    *,
+    ll_keywords: list[str],
+    hl_keywords: list[str],
+    mode: str = "hybrid",
+    top_k: int = DEFAULT_QUERY_TOP_K,
+    fetch_top_k: int | None = None,
+    project_id: str = "default",
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Return ``(session_graph block, entity JSON lines, relation JSON lines)``.
+
+    Never raises. ``status``: ok | empty | skipped | unknown_session | error.
+    An empty graph result is ``status="empty", empty=True`` (not an error); any
+    failure is ``status="error"`` with ``error``. Always carries
+    ``keyword_source`` (caller|llm|question_fallback) once keywords were resolved.
+    """
+    started = time.monotonic()
+    block: dict[str, Any] = {"enabled": True, "mode": mode, "session_id": str(session_id or "").strip()}
+
+    def _done(status: str, **fields: Any) -> tuple[dict[str, Any], list[str], list[str]]:
+        block["status"] = status
+        block.update(fields)
+        block["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        return block, [], []
+
+    sid = block["session_id"]
+    if not sid:
+        return _done("skipped", skipped="session_graph needs a session_id")
+    try:
+        from hars_memory.session_memory import validate_session_id
+
+        sid = validate_session_id(sid)
+        block["session_id"] = sid
+        store = _get_session_store(project_id)
+        session_dir = store.session_dir(sid)
+    except Exception as exc:  # noqa: BLE001
+        return _done("error", error=f"session graph unavailable ({type(exc).__name__}): {exc}")
+    if store.mode != "split":
+        return _done("skipped", skipped="subgraph mode indexes compactions directly into the main graph")
+    if not session_dir.is_dir():
+        return _done("unknown_session", error="unknown session")
+    if (session_dir / SESSION_MERGED_FILENAME).is_file():
+        return _done("skipped", skipped="session already merged into the main index", merged=True)
+    if mode not in SESSION_GRAPH_MODES:
+        return _done("error", error=f"session_graph_mode must be one of {', '.join(SESSION_GRAPH_MODES)}")
+
+    lock = _session_graph_locks.setdefault(sid, asyncio.Lock())
+    try:
+        async with lock:
+            rag = await _get_session_graph_rag(sid, session_dir)
+            ll, hl, source, extra = await _resolve_session_graph_keywords(
+                rag, question, sid, ll_keywords, hl_keywords
+            )
+            block.update({"keyword_source": source, "ll_keywords": ll, "hl_keywords": hl, **extra})
+            from lightrag import QueryParam  # type: ignore[import-not-found]
+
+            query_timeout = float(os.environ.get("HARS_MEMORY_QUERY_TIMEOUT_SECONDS", "60"))
+            query_started = time.monotonic()
+            raw = await asyncio.wait_for(
+                rag.aquery(  # type: ignore[attr-defined]
+                    question,
+                    param=QueryParam(
+                        mode=mode,
+                        top_k=top_k,
+                        chunk_top_k=fetch_top_k or top_k,
+                        only_need_context=True,
+                        ll_keywords=ll,
+                        hl_keywords=hl,
+                        enable_rerank=False,
+                        max_entity_tokens=DEFAULT_MAX_ENTITY_CONTEXT_BYTES,
+                        max_relation_tokens=DEFAULT_MAX_RELATION_CONTEXT_BYTES,
+                    ),
+                ),
+                timeout=query_timeout,
+            )
+            block["query_latency_ms"] = round((time.monotonic() - query_started) * 1000, 1)
+    except Exception as exc:  # noqa: BLE001 -- explicit error field, never silent
+        detail = str(exc) or ("timed out" if isinstance(exc, TimeoutError) else repr(exc))
+        logger.warning("memory_recall session graph failed (session=%s): %s: %s", sid, type(exc).__name__, detail)
+        return _done("error", error=f"session graph query failed ({type(exc).__name__}): {detail}")
+
+    text = raw if isinstance(raw, str) else ""
+    entities = _kg_block_lines(text, _CONTEXT_ENTITY_SECTION_HEADER)
+    relations = _kg_block_lines(text, _CONTEXT_RELATION_SECTION_HEADER)
+    block["entities"] = len(entities)
+    block["relations"] = len(relations)
+    if not entities and not relations:
+        _done("empty", empty=True)
+        return block, [], []
+    _done("ok", empty=False)
+    return block, entities, relations
+
+
+def _splice_session_kg(
+    context: str | None, entity_lines: list[str], relation_lines: list[str]
+) -> str | None:
+    """Put the session KG sections ABOVE the chunk section of *context*.
+
+    The chunk / reference sections are left byte-for-byte unchanged. If the
+    context already has KG sections (main graph branch), session lines go first
+    inside them; missing KG sections are inserted before the chunk section. With
+    no context at all a KG-only context is built. Returns the context unchanged
+    when there is nothing to splice.
+    """
+    if not entity_lines and not relation_lines:
+        return context
+
+    def _section(header: str, lines: list[str]) -> str:
+        return header + "\n\n```json\n" + "\n".join(lines) + "\n```\n\n"
+
+    kg_text = _section(_CONTEXT_ENTITY_SECTION_HEADER, entity_lines) + _section(
+        _CONTEXT_RELATION_SECTION_HEADER, relation_lines
+    )
+    if not context or not str(context).strip():
+        return "\n" + kg_text
+    result = context
+    have_entity = _extract_fenced_block(result, _CONTEXT_ENTITY_SECTION_HEADER) is not None
+    have_relation = _extract_fenced_block(result, _CONTEXT_RELATION_SECTION_HEADER) is not None
+    if not have_entity and not have_relation:
+        idx = result.find(_CONTEXT_CHUNK_SECTION_HEADER)
+        if idx == -1:
+            return "\n" + kg_text + result.lstrip("\n")
+        return result[:idx] + kg_text + result[idx:]
+    for header, lines, present in (
+        (_CONTEXT_ENTITY_SECTION_HEADER, entity_lines, have_entity),
+        (_CONTEXT_RELATION_SECTION_HEADER, relation_lines, have_relation),
+    ):
+        if not lines:
+            continue
+        if present:
+            start, end, existing = _extract_fenced_block(result, header)  # type: ignore[misc]
+            merged = "\n".join(lines + ([existing] if existing.strip() else []))
+            result = result[:start] + merged + result[end:]
+        else:
+            idx = result.find(_CONTEXT_CHUNK_SECTION_HEADER)
+            sect = _section(header, lines)
+            result = (result[:idx] + sect + result[idx:]) if idx != -1 else result + "\n" + sect
+    return result
+
+
+def _session_chunk_payload(chunk: Any) -> dict[str, Any]:
+    """Serialise a session-channel FusedChunk into the hybrid fused_chunks shape."""
+    payload = {
+        "chunk_id": chunk.chunk_id,
+        "fused_score": round(chunk.fused_score, 4),
+        "dense_score": chunk.dense_score,
+        "sparse_score": chunk.sparse_score,
+        "file_path": chunk.file_path,
+        "content": chunk.content,
+        "snippet": chunk.content[:HYBRID_SNIPPET_MAX_CHARS],
+        "channel": chunk.channel,
+        "session_id": chunk.session_id,
+    }
+    return payload
+
 _ENTITY_SEPARATOR_RE = re.compile(r"[_\-\s]+")
 
 MATCH_TIER_EXACT_ID = "exact_id"
@@ -2711,7 +3532,7 @@ def _lean_recall_response(
     kept_fields = {
         "ok", "error", "answer", "mode", "lightrag_mode", "mode_fallback", "graph_branch", "top_k",
         "fetch_top_k", "fetch_top_k_source", "question", "last_ingest", "stale_days",
-        "staleness_warning",
+        "staleness_warning", "session", "session_id", "error_kind", "session_graph", "context_cap",
     }
     if not include_answer:
         kept_fields.discard("answer")
@@ -3641,6 +4462,160 @@ def _merge_context_with_fusion(
 
 
 # ---------------------------------------------------------------------------
+# Hard TOTAL cap (memory_recall `max_chars`)
+#
+# The chunk assembly above budgets only the CONTENT of the Document Chunks
+# section; the entity / relation sections of the LightRAG context, the session
+# graph splice, the JSON envelope, the reference list and the section headers
+# were never counted, and the lightrag / merged-not-applied paths returned the
+# context unbounded. When the caller passes `max_chars` (> 0) the RENDERED
+# `context` string must be <= max_chars on EVERY path, so a final pass trims it.
+#
+# Material is cut lowest priority first, always from the tail of its section
+# (every section is already ordered best-first; the session-graph splice puts
+# its lines at the head of the KG sections, so they are cut last within them):
+#   1. relation lines (a section that becomes empty is removed with its header)
+#   2. entity lines (same)
+#   3. document chunks, last (lowest score / rank) first, with their reference
+#      lines; the best chunk is never dropped
+#   4. the best chunk's content, cut at a line boundary with the usual marker
+#   5. last resort (only a budget smaller than the best chunk's envelope): a hard
+#      cut of the string
+# Without `max_chars` (or with 0) nothing here runs and the context is
+# byte-identical to before.
+# ---------------------------------------------------------------------------
+_CONTEXT_CAP_FENCE_CLOSE = "\n```"
+
+
+def _cap_locate_section(ctx: str, header: str) -> tuple[int, int, int, int] | None:
+    """(header_start, content_start, content_end, section_end) of the fenced block
+    after `header`. The closing fence is the one at the START OF A LINE, so a
+    ``` inside a JSON-escaped chunk line cannot end the block early."""
+    h = ctx.find(header)
+    if h == -1:
+        return None
+    fence = ctx.find("```", h)
+    if fence == -1:
+        return None
+    nl = ctx.find("\n", fence)
+    if nl == -1:
+        return None
+    close = ctx.find(_CONTEXT_CAP_FENCE_CLOSE, nl)
+    if close == -1:
+        return None
+    content_start = nl + 1
+    content_end = close if close >= content_start else content_start
+    end = close + len(_CONTEXT_CAP_FENCE_CLOSE)
+    while end < len(ctx) and ctx[end] == "\n":
+        end += 1
+    return h, content_start, content_end, end
+
+
+def _cap_section_lines(ctx: str, header: str) -> list[str] | None:
+    loc = _cap_locate_section(ctx, header)
+    if loc is None:
+        return None
+    _, cs, ce, _ = loc
+    return [ln for ln in ctx[cs:ce].split("\n") if ln.strip()]
+
+
+def _cap_set_section_lines(ctx: str, header: str, lines: list[str]) -> str:
+    """Rewrite a section's lines in place; an empty list removes the whole section."""
+    loc = _cap_locate_section(ctx, header)
+    if loc is None:
+        return ctx
+    h, cs, ce, end = loc
+    if not lines:
+        return ctx[:h] + ctx[end:]
+    return ctx[:cs] + "\n".join(lines) + ctx[ce:]
+
+
+def _cap_drop_tail_lines(ctx: str, header: str, max_chars: int) -> tuple[str, int]:
+    """Drop lines from the tail of one KG section until `ctx` fits or the section is gone."""
+    lines = _cap_section_lines(ctx, header)
+    if not lines:
+        if lines is not None:                       # an empty block: remove the bare header
+            ctx = _cap_set_section_lines(ctx, header, [])
+        return ctx, 0
+    dropped = 0
+    while lines and len(ctx) > max_chars:
+        excess = len(ctx) - max_chars
+        saved = 0
+        while lines and saved < excess:
+            saved += len(lines.pop()) + 1
+            dropped += 1
+        ctx = _cap_set_section_lines(ctx, header, lines)
+    return ctx, dropped
+
+
+def _cap_reference_id(line: str) -> str:
+    try:
+        obj = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    return str(obj.get("reference_id", "")) if isinstance(obj, dict) else ""
+
+
+def _cap_context_total(context: str, max_chars: int) -> tuple[str, dict[str, Any]]:
+    """Bound the TOTAL rendered `context` to <= max_chars (see the section comment).
+
+    Returns (context, report). The report is the response's `context_cap` field:
+    what was cut, so a caller sees that the budget bit and where."""
+    cut = {"relation_lines": 0, "entity_lines": 0, "chunks": 0, "references": 0,
+           "best_chunk_trimmed": False, "hard_cut": False}
+    report: dict[str, Any] = {"max_chars": max_chars, "chars_before": len(context), "chars_after": len(context),
+                              "applied": False, "cut": cut}
+    if max_chars <= 0 or len(context) <= max_chars:
+        return context, report
+    ctx = context
+    ctx, cut["relation_lines"] = _cap_drop_tail_lines(ctx, _CONTEXT_RELATION_SECTION_HEADER, max_chars)
+    if len(ctx) > max_chars:
+        ctx, cut["entity_lines"] = _cap_drop_tail_lines(ctx, _CONTEXT_ENTITY_SECTION_HEADER, max_chars)
+    if len(ctx) > max_chars:
+        chunk_lines = _cap_section_lines(ctx, _CONTEXT_CHUNK_SECTION_HEADER)
+        ref_lines = _cap_section_lines(ctx, _CONTEXT_REFERENCE_SECTION_HEADER)
+        if chunk_lines:
+            has_refs = ref_lines is not None
+            ref_lines = ref_lines or []
+            n_ref0 = len(ref_lines)
+            while len(chunk_lines) > 1 and len(ctx) > max_chars:
+                gone_id = _cap_reference_id(chunk_lines.pop())
+                cut["chunks"] += 1
+                if gone_id and not any(_cap_reference_id(c) == gone_id for c in chunk_lines):
+                    ref_lines = [r for r in ref_lines if not r.startswith(f"[{gone_id}]")]
+                ctx = _cap_set_section_lines(ctx, _CONTEXT_CHUNK_SECTION_HEADER, chunk_lines)
+                if has_refs and ref_lines:
+                    ctx = _cap_set_section_lines(ctx, _CONTEXT_REFERENCE_SECTION_HEADER, ref_lines)
+            cut["references"] = n_ref0 - len(ref_lines)
+            if len(ctx) > max_chars and len(chunk_lines) == 1:
+                try:
+                    obj = json.loads(chunk_lines[0])
+                except (TypeError, json.JSONDecodeError):
+                    obj = None
+                if isinstance(obj, dict) and isinstance(obj.get("content"), str):
+                    orig = obj["content"]
+                    keep = len(orig)
+                    for _ in range(12):
+                        excess = len(ctx) - max_chars
+                        if excess <= 0:
+                            break
+                        keep -= excess + 4                # JSON escaping can cost more than raw chars: the loop corrects
+                        if keep <= len(CONTEXT_TRUNCATION_MARKER):
+                            break
+                        obj["content"] = _truncate_on_line_boundary(orig, keep)
+                        ctx = _cap_set_section_lines(
+                            ctx, _CONTEXT_CHUNK_SECTION_HEADER, [json.dumps(obj, ensure_ascii=False)]
+                        )
+                        cut["best_chunk_trimmed"] = True
+    if len(ctx) > max_chars:                         # only a budget below the best chunk's own envelope gets here
+        cut["hard_cut"] = True
+        mk = CONTEXT_TRUNCATION_MARKER
+        ctx = (ctx[: max_chars - len(mk)] + mk) if max_chars > 2 * len(mk) else ctx[:max_chars]
+    report.update({"applied": True, "chars_after": len(ctx)})
+    return ctx, report
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -3783,7 +4758,12 @@ async def list_tools() -> list[Tool]:
                         "HARS_MEMORY_CONTEXT_MAX_DOC_CHARS chars (default 6000, line-boundary "
                         "truncation with a '…[truncated]' marker). "
                         "Omit to use the server default (HARS_MEMORY_CONTEXT_MAX_CHARS, default 15000 — "
-                        "the documented consumer window); pass 0 to disable the total cap."
+                        "the documented consumer window); pass 0 to disable the total cap. "
+                        "A positive value is also a HARD cap on the whole rendered `context` string on every "
+                        "path (entity / relation sections, session-graph lines, JSON envelope, reference "
+                        "list and headers included): relation lines are cut first, then entity lines, then "
+                        "the lowest-ranked chunks, then the best chunk's tail; the response carries "
+                        "`context_cap` (chars before / after and what was cut)."
                     ),
                 },
                 "context_priority": {
@@ -3832,6 +4812,40 @@ async def list_tools() -> list[Tool]:
                         "Re-request with `view='full'` for omitted sections."
                     ),
                 },
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional agent-session id. When supplied and the session is unmerged in "
+                        "split mode, an additional appended-never-evicting channel ranks that "
+                        "session's compaction chunks (cosine over its vector store + lexical F1) "
+                        "and returns them as `session:<sid>:<chunk_id>` entries in "
+                        "`hybrid.fused_chunks`, with a top-level `session` status block. "
+                        "Merged/unknown sessions and subgraph mode return a `session` block with "
+                        "the reason and zero hits; recall itself is unaffected."
+                    ),
+                },
+                "session_graph": {
+                    "type": "boolean",
+                    "description": (
+                        "Opt-in (default: env HARS_MEMORY_SESSION_GRAPH, itself off). With a "
+                        "`session_id` (split mode, unmerged) also query that session's own "
+                        "LightRAG graph (hybrid local+global, context only) and put its "
+                        "`Knowledge Graph Data (Entity/Relationship)` sections ABOVE the unchanged "
+                        "chunk section of `context`. Keywords: caller `ll_keywords`/`hl_keywords` "
+                        "if given, else one extractor-model LLM call (cached per question+session), "
+                        "else the question text. Reported in a top-level `session_graph` block "
+                        "(`status` ok|empty|skipped|unknown_session|error, `keyword_source` "
+                        "caller|llm|question_fallback, entities, relations, latency_ms); an empty "
+                        "result is `empty: true`, a failure is `status: error` + `error`. Absent/off: "
+                        "the response is byte-identical to before. Requires context_only=true."
+                    ),
+                },
+                "session_graph_mode": {
+                    "type": "string",
+                    "enum": list(SESSION_GRAPH_MODES),
+                    "default": "hybrid",
+                    "description": "LightRAG query mode for the session graph (default hybrid = local+global).",
+                },
                 "debug": {
                     "type": "boolean",
                     "default": False,
@@ -3842,6 +4856,119 @@ async def list_tools() -> list[Tool]:
                 },
             },
             ["question"],
+        ),
+        tool(
+            "memory_compact",
+            (
+                "Persist one agent-session compaction: the summary plus the facts from the "
+                "dropped context, stored as a LightRAG document so they survive the next "
+                "compaction. "
+                "In split mode (HARS_MEMORY_SESSION_MODE=split, default) each session gets an "
+                "isolated working dir under HARS_MEMORY_SESSIONS_DIR; in subgraph mode the "
+                "document is indexed directly into the main graph. "
+                "Omit `seq` to auto-allocate the next sequence number; pass it to rewrite a "
+                "known compaction (identical content is a fingerprint no-op). "
+                "Use memory_merge_session to consolidate a split-mode session into the main "
+                "index once the session is done. "
+                "Writes to the index and may call the extractor LLM, like memory_consolidate."
+            ),
+            {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session identifier: 1-128 chars from [A-Za-z0-9._-].",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "The compaction summary — what the session retains in context.",
+                },
+                "dropped_context": {
+                    "type": ["array", "string"],
+                    "items": {"type": "string"},
+                    "description": "Facts from the context this compaction dropped. An array of "
+                                   "strings (one fact each) or a single newline-separated string.",
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Optional small JSON object stored as one Metadata line.",
+                },
+                "seq": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional explicit sequence number. Omit to auto-allocate.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional project id (default: 'default').",
+                },
+            },
+            ["session_id", "summary"],
+        ),
+        tool(
+            "memory_merge_session",
+            (
+                "Consolidate a split-mode session into the MAIN knowledge graph. Builds ONE "
+                "chronological document from every compaction in the session, adds "
+                "session-graph -> main-graph entity alias hints, and re-ingests it so "
+                "LightRAG's own extraction performs entity resolution. "
+                "Idempotent: a merged session reports already_merged and is not re-ingested. "
+                "Subgraph mode has nothing to merge (compactions are already in the main graph)."
+            ),
+            {
+                "session_id": {
+                    "type": "string",
+                    "description": "Session identifier: 1-128 chars from [A-Za-z0-9._-].",
+                },
+                "delete_source": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Remove the session working directory after a successful merge.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional project id (default: 'default').",
+                },
+            },
+            ["session_id"],
+        ),
+        tool(
+            "memory_session_status",
+            (
+                "Report session compaction inventory. Without session_id: every session under "
+                "HARS_MEMORY_SESSIONS_DIR with compaction count, merge state, graph entity/"
+                "relation counts, chunks_indexed/vectors_indexed and index dir. With "
+                "session_id: just that session. "
+                "GPU-free, no LLM calls; corrupt/missing files read as zeros."
+            ),
+            {
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session identifier; omit to list all sessions.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Optional project id (default: 'default').",
+                },
+            },
+        ),
+        tool(
+            "memory_lease_acquire",
+            (
+                "Take the optional cooperative run lease so two eval/benchmark clients do not silently "
+                "share one index. Returns ok=false with held_by/expires_at if a DIFFERENT unexpired tag "
+                "holds it; the same tag renews. Does not block any tool: writes that pass a differing "
+                "`run_tag` just get a `warning`. In-memory, expires after ttl_s."
+            ),
+            {
+                "tag": {"type": "string", "description": "Run label, e.g. 'nc-eval-2026-10-27-a'."},
+                "ttl_s": {"type": "number", "default": 3600, "description": "Lease lifetime in seconds (1..604800)."},
+            },
+            ["tag"],
+        ),
+        tool(
+            "memory_lease_release",
+            "Release the run lease held by `tag` (only the holder can release; no-op if none is held).",
+            {"tag": {"type": "string", "description": "The tag the lease was acquired with."}},
+            ["tag"],
         ),
         tool(
             "memory_remember",
@@ -4111,7 +5238,31 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
 
 async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
-    """Execute one MCP tool in this process (the engine's real body)."""
+    """Execute one MCP tool in this process (the engine's real body).
+
+    Thin wrapper over :func:`_execute_tool_inner` that adds the cooperative
+    run-lease ``warning`` (run_lease.py) to write-tool responses.
+    """
+    result = await _execute_tool_inner(name, arguments)
+    if name in LEASE_WRITE_TOOLS and isinstance(arguments, dict) and arguments.get("run_tag"):
+        warning = get_lease_registry().check_write(arguments.get("run_tag"), name)
+        if warning and result:
+            try:
+                body = json.loads(result[0].text)
+            except (ValueError, AttributeError):
+                body = None
+            if isinstance(body, dict):
+                body["warning"] = warning
+                return json_text(body)
+    return result
+
+
+def _error_kind(exc: BaseException) -> dict[str, str]:
+    kind = getattr(exc, "error_kind", None)
+    return {"error_kind": str(kind)} if kind else {}
+
+
+async def _execute_tool_inner(name: str, arguments: Any) -> list[TextContent]:
     args: dict[str, Any] = arguments if isinstance(arguments, dict) else {}
     project_id = str(args.get("project") or "default").strip()
     raw_token = str(args.get("access_token") or os.environ.get("HARS_MEMORY_ACCESS_TOKEN", "")).strip()
@@ -4171,7 +5322,12 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
             "memory_related": "read",
             "memory_inspect_entity": "read",
             "memory_sync_status": "read",
+            "memory_session_status": "read",
             "memory_remember": "write",
+            "memory_lease_acquire": "write",
+            "memory_lease_release": "write",
+            "memory_compact": "write",
+            "memory_merge_session": "write",
             "memory_upsert_document": "write",
             "memory_delete_document": "admin",
             "memory_forget": "admin",
@@ -4189,6 +5345,11 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 "error_type": "ForbiddenError" if token_context else "UnauthorizedError",
                 "code": 403 if token_context else 401,
             })
+
+        if name == "memory_lease_acquire":
+            return json_text(get_lease_registry().acquire(args.get("tag"), args.get("ttl_s")))
+        if name == "memory_lease_release":
+            return json_text(get_lease_registry().release(args.get("tag")))
 
         # ------------------------------------------------------------------ #
         # memory_status — always GPU-free                                    #
@@ -4314,6 +5475,64 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 hybrid_block = await _compute_hybrid_block(
                     rag, question, top_k, ll_keywords, fetch_top_k=fetch_top_k,
                 )
+
+            # Optional session-compaction channel (split mode, unmerged session).
+            # Appended after the fused candidates, never evicting one; absent
+            # `session_id` leaves the response byte-identical to before.
+            session_id_arg = str(args.get("session_id") or "").strip()
+            session_block: dict[str, Any] | None = None
+            if session_id_arg:
+                try:
+                    session_block, session_chunks = await _compute_session_channel(
+                        rag, question, session_id_arg, fetch_top_k, project_id=project_id
+                    )
+                except Exception as exc:  # noqa: BLE001 -- additive channel, fail-soft
+                    logger.warning(
+                        "memory_recall session channel failed (session=%r): %s",
+                        session_id_arg,
+                        exc,
+                    )
+                    session_block, session_chunks = (
+                        {
+                            "session_id": session_id_arg,
+                            "hits": 0,
+                            "status": "error",
+                            "error_kind": "channel",
+                            "error": f"session channel failed ({type(exc).__name__}): {exc}",
+                        },
+                        [],
+                    )
+                if session_chunks:
+                    hybrid_block["fused_chunks"] = [
+                        *(hybrid_block.get("fused_chunks") or []),
+                        *(_session_chunk_payload(chunk) for chunk in session_chunks),
+                    ]
+                hybrid_block["session"] = session_block
+
+            # Optional session-graph channel (opt-in; absent/off adds nothing).
+            session_graph_block: dict[str, Any] | None = None
+            sg_entity_lines: list[str] = []
+            sg_relation_lines: list[str] = []
+            if _session_graph_enabled(args.get("session_graph")):
+                if not context_only:
+                    session_graph_block = {
+                        "enabled": True,
+                        "status": "skipped",
+                        "skipped": "session_graph requires context_only=true",
+                    }
+                else:
+                    session_graph_block, sg_entity_lines, sg_relation_lines = (
+                        await _compute_session_graph_context(
+                            question,
+                            session_id_arg,
+                            ll_keywords=ll_keywords,
+                            hl_keywords=hl_keywords,
+                            mode=str(args.get("session_graph_mode") or "hybrid"),
+                            top_k=top_k,
+                            fetch_top_k=fetch_top_k,
+                            project_id=project_id,
+                        )
+                    )
 
             # Usage-tracking envelope shared by every return path below (success or
             # failure) — see logging_setup.log_query_event. graph_channel_ms is
@@ -4446,6 +5665,25 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                         )
                         if context_for_response is not None:
                             context_priority_applied = CONTEXT_PRIORITY_FUSION_ONLY
+                    if sg_entity_lines or sg_relation_lines:
+                        context_for_response = _splice_session_kg(
+                            context_for_response if isinstance(context_for_response, str) else None,
+                            sg_entity_lines,
+                            sg_relation_lines,
+                        )
+                    # Hard TOTAL cap: every path above (lightrag, merged, merged-not-
+                    # applied, fusion-only, the session-graph splice) ends here, so
+                    # `max_chars` bounds the whole rendered context. Not set (or 0):
+                    # untouched, byte-identical to before.
+                    context_cap_report: dict[str, Any] | None = None
+                    if max_chars_arg:
+                        if isinstance(context_for_response, str):
+                            context_for_response, context_cap_report = _cap_context_total(
+                                context_for_response, max_chars_arg
+                            )
+                        else:
+                            context_cap_report = {"max_chars": max_chars_arg, "applied": False,
+                                                  "reason": "context is not a string"}
                     has_context = bool(
                         context_for_response and str(context_for_response).strip()
                     )
@@ -4465,6 +5703,19 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                         logger.warning("memory_recall: %s", recall_error)
                     else:
                         recall_error = "no context retrieved for this question"
+                    # Never an unexplained empty failure when a session was
+                    # requested: say whether the session channel itself broke
+                    # (`error_kind: session_channel`) or simply found nothing
+                    # (`no_hits`), and carry the channel's own error text.
+                    recall_error_kind: str | None = None
+                    if recall_error is not None:
+                        recall_error_kind = "no_hits"
+                        if session_block is not None and session_block.get("error"):
+                            if session_block.get("status") == "error":
+                                recall_error_kind = "session_channel"
+                            recall_error = (
+                                f"{recall_error}; session channel: {session_block['error']}"
+                            )
                     # Live trace (SSE): graph pass + assembled context. The
                     # entity/relation/source rows are *derived* by parsing the
                     # rendered context (the only place they exist on this path);
@@ -4563,6 +5814,15 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                         "hybrid": hybrid_block,
                         **staleness_fields,
                     }
+                    if context_cap_report is not None:
+                        response["context_cap"] = context_cap_report
+                    if session_block is not None:
+                        response["session_id"] = session_id_arg
+                        response["session"] = session_block
+                        if recall_error_kind is not None:
+                            response["error_kind"] = recall_error_kind
+                    if session_graph_block is not None:
+                        response["session_graph"] = session_graph_block
                     if debug:
                         fused = hybrid_block.get("fused_chunks") or []
                         response["debug"] = {
@@ -4677,6 +5937,9 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                     "hybrid": hybrid_block,
                     **staleness_fields,
                 }
+                if session_block is not None:
+                    response["session_id"] = session_id_arg
+                    response["session"] = session_block
                 if debug:
                     fused = hybrid_block.get("fused_chunks") or []
                     response["debug"] = {
@@ -4710,17 +5973,25 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 _emit_recall_event(
                     ok=False, results=[], graph_channel_ms=None, context_priority_applied=None,
                 )
-                return json_text({
+                failure: dict[str, Any] = {
                     "ok": False,
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": str(exc) or type(exc).__name__,
                     "hint": (
                         "Ensure the index is built and the embedding backend is reachable "
                         "(context_only path uses no LLM)."
                         if context_only
                         else "Ensure the query LLM is running and the index is built."
                     ),
-                })
+                }
+                if session_block is not None:
+                    # Keep the session channel's own state visible: a graph/LLM
+                    # failure here says nothing about whether the session
+                    # channel found anything.
+                    failure["error_kind"] = "recall_exception"
+                    failure["session_id"] = session_id_arg
+                    failure["session"] = session_block
+                return json_text(failure)
 
         # ------------------------------------------------------------------ #
         # memory_remember                                                     #
@@ -4756,6 +6027,109 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 "pending_notes": pending,
                 "note": "Will be merged into the graph by the next update_kb.sh run.",
             })
+
+        # ------------------------------------------------------------------ #
+        # memory_compact                                                      #
+        # ------------------------------------------------------------------ #
+        if name == "memory_compact":
+            session_id = str(args.get("session_id", "")).strip()
+            summary = str(args.get("summary", "")).strip()
+            if not session_id:
+                return json_text({"ok": False, "error": "session_id is required"})
+            if not summary:
+                return json_text({"ok": False, "error": "summary is required"})
+            metadata = args.get("metadata")
+            if metadata is not None and not isinstance(metadata, dict):
+                return json_text({"ok": False, "error": "metadata must be a JSON object"})
+            seq_arg = args.get("seq")
+            if seq_arg is None:
+                seq: int | None = None
+            elif isinstance(seq_arg, bool) or not isinstance(seq_arg, int):
+                return json_text({"ok": False, "error": "seq must be an integer"})
+            else:
+                seq = seq_arg
+            try:
+                session_store = _get_session_store(project_id)
+                # The ingest pipeline is synchronous (asyncio.run inside
+                # ingest_documents), so it must never run on the event loop.
+                payload = await run_blocking(
+                    session_store.store_compaction,
+                    session_id,
+                    summary,
+                    dropped_context=args.get("dropped_context"),
+                    metadata=metadata,
+                    seq=seq,
+                )
+            except Exception as exc:  # noqa: BLE001 -- reported as ok:false below
+                logger.warning("memory_compact failed for session=%r: %s", session_id, exc)
+                return json_text({
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    **_error_kind(exc),
+                })
+            log_write_event(
+                tool="memory_compact",
+                ok=True,
+                detail={
+                    "session_id": payload.get("session_id"),
+                    "seq": payload.get("seq"),
+                    "doc_id": payload.get("doc_id"),
+                    "mode": payload.get("mode"),
+                },
+            )
+            return json_text(payload)
+
+        # ------------------------------------------------------------------ #
+        # memory_merge_session                                                #
+        # ------------------------------------------------------------------ #
+        if name == "memory_merge_session":
+            session_id = str(args.get("session_id", "")).strip()
+            if not session_id:
+                return json_text({"ok": False, "error": "session_id is required"})
+            delete_source = bool(args.get("delete_source", False))
+            try:
+                session_store = _get_session_store(project_id)
+                payload = await run_blocking(
+                    session_store.merge_session, session_id, delete_source=delete_source
+                )
+            except Exception as exc:  # noqa: BLE001 -- reported as ok:false below
+                logger.warning("memory_merge_session failed for session=%r: %s", session_id, exc)
+                return json_text({
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    **_error_kind(exc),
+                })
+            log_write_event(
+                tool="memory_merge_session",
+                ok=True,
+                detail={
+                    "session_id": session_id,
+                    "merged": payload.get("merged"),
+                    "already_merged": payload.get("already_merged", False),
+                    "delete_source": delete_source,
+                },
+            )
+            return json_text(payload)
+
+        # ------------------------------------------------------------------ #
+        # memory_session_status                                              #
+        # ------------------------------------------------------------------ #
+        if name == "memory_session_status":
+            session_id_arg = args.get("session_id")
+            session_id = str(session_id_arg).strip() if session_id_arg else None
+            try:
+                session_store = _get_session_store(project_id)
+                payload = await run_blocking(session_store.session_status, session_id)
+            except Exception as exc:  # noqa: BLE001 -- read tool, fail-soft shape
+                logger.warning("memory_session_status failed: %s", exc)
+                return json_text({
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                })
+            return json_text({"ok": True, **payload})
 
         # ------------------------------------------------------------------ #
         # memory_entities                                                    #
@@ -5326,6 +6700,21 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
             stored_fp = store.get(doc.doc_id)
 
             if stored_fp == current_fp:
+                # Bookkeeping-only: make already-indexed documents visible to
+                # the opt-in content dedup without changing the fast path's
+                # answer or touching the index.
+                if _UPSERT_CONTENT_DEDUP_ENABLED:
+                    from hars_memory.ingest.change_detection import (
+                        ContentDedupStore,
+                        default_content_dedup_store_path,
+                    )
+
+                    dedup_store = ContentDedupStore.load(
+                        default_content_dedup_store_path(idx_dir)
+                    )
+                    if dedup_store.lookup(current_fp) != doc.doc_id:
+                        dedup_store.set(current_fp, doc.doc_id)
+                        dedup_store.save()
                 return json_text({
                     "ok": True,
                     "action": "unchanged",
@@ -5335,16 +6724,134 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                     "note": "Document content is identical to stored fingerprint; skipped.",
                 })
 
+            # Opt-in batch queue (HARS_MEMORY_UPSERT_BATCH_MODE=queue): store the
+            # FINAL document — the source header is already applied in doc.content,
+            # exactly what the synchronous path below would insert — in the
+            # index-dir inbox sidecar instead of extracting now. `memory
+            # index-batch --source upsert-inbox` (collect -> submit -> apply) later
+            # indexes it at batch prices. Contract kept identical to the sync path:
+            # NO fingerprint is recorded and nothing is purged until apply really
+            # processed the document, so a retry re-queues instead of answering
+            # "unchanged". Default (flag unset): this branch is dead code and the
+            # behaviour is byte-for-byte the synchronous path.
+            if _UPSERT_BATCH_QUEUE_ENABLED:
+                from hars_memory.ingest.upsert_inbox import (
+                    UpsertInboxStore,
+                    default_upsert_inbox_path,
+                )
+
+                inbox = UpsertInboxStore.load(default_upsert_inbox_path(idx_dir))
+                entry_id = inbox.put_document(doc, fingerprint=current_fp)
+                inbox.save()
+                log_write_event(
+                    tool="memory_upsert_document",
+                    ok=True,
+                    detail={
+                        "doc_id": doc.doc_id,
+                        "file_path": str(path),
+                        "action": "queued_for_batch",
+                    },
+                )
+                return json_text({
+                    "ok": True,
+                    "action": "queued_for_batch",
+                    "doc_id": doc.doc_id,
+                    "entry_id": entry_id,
+                    "file_path": str(path),
+                    "fingerprint": current_fp,
+                    "note": (
+                        "HARS_MEMORY_UPSERT_BATCH_MODE=queue: document stored in the upsert inbox "
+                        "(no extraction ran, it is NOT visible to recall yet). Run `memory index-batch "
+                        "--source upsert-inbox` (collect -> submit -> apply) to index it at batch prices; "
+                        "apply records the fingerprint and drains the inbox entry."
+                    ),
+                })
+
             rag = await _get_rag(project_id)
+
+            # Opt-in content dedup (HARS_MEMORY_UPSERT_CONTENT_DEDUP): if this
+            # EXACT content was already indexed under a different path, skip the
+            # insert entirely. Placed BEFORE the stale-chunk purge so a dedup hit
+            # never performs a destructive action; a mapping whose target doc is
+            # no longer "processed" is ignored (falls through to a normal insert,
+            # which then re-records the mapping). Default: off, byte-identical to
+            # the pre-flag behaviour.
+            dedup_store = None
+            if _UPSERT_CONTENT_DEDUP_ENABLED:
+                from hars_memory.ingest.change_detection import (
+                    ContentDedupStore,
+                    default_content_dedup_store_path,
+                )
+
+                dedup_store = ContentDedupStore.load(
+                    default_content_dedup_store_path(idx_dir)
+                )
+                existing_doc_id = dedup_store.lookup(current_fp)
+                if existing_doc_id and existing_doc_id != doc.doc_id:
+                    existing_state = await _doc_processing_state(rag, existing_doc_id)
+                    if existing_state == "processed":
+                        log_write_event(
+                            tool="memory_upsert_document",
+                            ok=True,
+                            detail={
+                                "doc_id": doc.doc_id,
+                                "file_path": str(path),
+                                "action": "skipped_duplicate_of_existing",
+                                "existing_doc_id": existing_doc_id,
+                            },
+                        )
+                        return json_text({
+                            "ok": True,
+                            "action": "skipped_duplicate_of_existing",
+                            "doc_id": doc.doc_id,
+                            "existing_doc_id": existing_doc_id,
+                            "file_path": str(path),
+                            "fingerprint": current_fp,
+                            "note": (
+                                "Content identical to an already-processed document "
+                                f"({existing_doc_id}); no insert performed (HARS_MEMORY_UPSERT_CONTENT_DEDUP). "
+                                "The source document at this file_path was not purged or modified."
+                            ),
+                        })
 
             if stored_fp is not None:
                 logger.info("Purging stale chunks for modified doc %s before upsert", doc.doc_id)
                 await rag.adelete_by_doc_id(doc.doc_id)
 
-            await _insert_all_batches(rag, [doc], batch_size=1)
+            # Extractor LLM cost of THIS insert (calls, prompt / completion tokens from the provider's
+            # `usage`; an estimate is flagged). A context variable scopes it to this call, so concurrent
+            # upserts do not mix; `process_delta` (the process-global counter over the same window) is the
+            # cross-check and also includes any concurrent insert.
+            from hars_memory.server import lightrag_init as _li
+
+            _proc0 = dict(_li.LLM_USAGE)
+            with _li.track_extract_usage() as _extract_usage:
+                await _insert_all_batches(rag, [doc], batch_size=1)
+            extract_usage = _extract_usage.to_dict()
+            extract_usage["scope"] = "this_call"
+            extract_usage["process_delta"] = {k: _li.LLM_USAGE[k] - _proc0[k] for k in _proc0}
+
+            # Record the fingerprint only once THIS index really processed the document. LightRAG's
+            # ainsert can return with the document merely enqueued (pipeline busy) or failed; a fingerprint
+            # saved then makes every retry answer "unchanged" and the document never gets extracted.
+            doc_state = await _doc_processing_state(rag, doc.doc_id)
+            if doc_state not in (None, "processed"):
+                return json_text({
+                    "ok": False,
+                    "error_kind": "not_processed",
+                    "error": f"document {doc.doc_id} is '{doc_state}' after insert, not 'processed'; "
+                             "the fingerprint was not recorded, so a retry re-runs the extraction",
+                    "doc_id": doc.doc_id,
+                    "file_path": str(path),
+                    "extract_usage": extract_usage,
+                })
 
             store.set(doc.doc_id, current_fp)
             store.save()
+
+            if dedup_store is not None:
+                dedup_store.set(current_fp, doc.doc_id)
+                dedup_store.save()
 
             _clear_in_memory_graph_cache(project_id)
             _invalidate_bm25_cache(project_id)
@@ -5365,6 +6872,7 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 "doc_id": doc.doc_id,
                 "file_path": str(path),
                 "fingerprint": current_fp,
+                "extract_usage": extract_usage,
             })
 
         # ------------------------------------------------------------------ #
@@ -5416,6 +6924,22 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
             store = FingerprintStore.load(store_path)
             store.discard(target_doc_id)
             store.save()
+
+            # Keep the opt-in content-dedup store consistent: any mapping that
+            # pointed at the deleted doc_id would otherwise make a re-upsert of
+            # that content skip (the mapping is also ignored at lookup time when
+            # the target doc is not "processed", so this is belt-and-braces).
+            if _UPSERT_CONTENT_DEDUP_ENABLED:
+                from hars_memory.ingest.change_detection import (
+                    ContentDedupStore,
+                    default_content_dedup_store_path,
+                )
+
+                dedup_store = ContentDedupStore.load(
+                    default_content_dedup_store_path(idx_dir)
+                )
+                if dedup_store.discard_doc_id(target_doc_id):
+                    dedup_store.save()
 
             _clear_in_memory_graph_cache(project_id)
             _invalidate_bm25_cache(project_id)
@@ -5528,7 +7052,8 @@ async def execute_tool(name: str, arguments: Any) -> list[TextContent]:
                 "hars-memory-qdrant container: `docker ps --filter name=hars-memory-qdrant` "
                 "/ restart with `docker compose -f docker-compose.dev.yml up -d hars-memory-qdrant`."
             )
-        return json_text({"ok": False, "error_type": error_type, "error": error_message})
+        return json_text({"ok": False, "error_type": error_type, "error": error_message,
+                          **_error_kind(exc)})
 
 
 # ---------------------------------------------------------------------------

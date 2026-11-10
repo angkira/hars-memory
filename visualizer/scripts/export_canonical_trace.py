@@ -52,16 +52,17 @@ def parse_context(ctx):
 
 
 def main():
-    out_path = Path(args.out).resolve()
-    if DATA.resolve() in out_path.parents:
-        raise SystemExit("refusing to write into app/public/data: the demo trace is synthetic")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--question", required=True)
     ap.add_argument("--keywords", default="")
     ap.add_argument("--out", required=True, help="output path (must be outside app/public/data)")
     ap.add_argument("--base", default="http://127.0.0.1:8098")
     args = ap.parse_args()
+
+    out_path = Path(args.out).resolve()
+    if DATA.resolve() in out_path.parents:
+        raise SystemExit("refusing to write into app/public/data: the demo trace is synthetic")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     question = args.question
     kws = args.keywords or ",".join(w for w in re.findall(r"[A-Za-z0-9]{4,}", question.lower()))[:120]
     url = f"{args.base}/trace?question={urllib.parse.quote(question)}&ll_keywords={urllib.parse.quote(kws)}&mode=hybrid&top_k=6&format=json"

@@ -1,0 +1,17 @@
+{"type": "session", "version": 3, "id": "s1", "cwd": "/w"}
+{"type": "agent_start"}
+{"type": "turn_start"}
+{"type": "message_start", "message": {"role": "user", "content": [{"type": "text", "text": "Where is the config?"}]}}
+{"type": "message_end", "message": {"role": "user", "content": [{"type": "text", "text": "Where is the config?"}]}}
+{"type": "message_start", "message": {"role": "assistant", "content": [], "api": "anthropic-messages", "provider": "anthropic", "model": "claude-haiku-5-5", "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": {"total": 0.001}}, "stopReason": "pending"}}
+{"type": "message_update", "usage": {"input": 4, "output": 30, "cacheRead": 0, "cacheWrite": 2657, "totalTokens": 2691, "cost": {"total": 0.001}}, "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": "Checking."}}
+{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "let me look"}, {"type": "text", "text": "Checking."}, {"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "ls"}}], "api": "anthropic-messages", "provider": "anthropic", "model": "claude-haiku-5-5", "usage": {"input": 4, "output": 30, "cacheRead": 0, "cacheWrite": 2657, "totalTokens": 2691, "cost": {"total": 0.001}}, "stopReason": "toolUse"}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "let me look"}, {"type": "text", "text": "Checking."}, {"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "ls"}}], "api": "anthropic-messages", "provider": "anthropic", "model": "claude-haiku-5-5", "usage": {"input": 4, "output": 30, "cacheRead": 0, "cacheWrite": 2657, "totalTokens": 2691, "cost": {"total": 0.001}}, "stopReason": "toolUse"}, "toolResults": []}
+{"type": "turn_start"}
+{"type": "message_end", "message": {"role": "toolResult", "toolCallId": "t1", "content": [{"type": "text", "text": "a.txt"}]}}
+{"type": "compaction_start", "reason": "threshold"}
+{"type": "compaction_end", "reason": "threshold", "result": {"summary": "S", "tokensBefore": 900}, "aborted": false, "willRetry": false}
+{"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "The config is "}, {"type": "text", "text": "in a.txt."}], "api": "anthropic-messages", "provider": "anthropic", "model": "claude-haiku-5-5", "usage": {"input": 7, "output": 12, "cacheRead": 2657, "cacheWrite": 431, "totalTokens": 3107, "cost": {"total": 0.001}}, "stopReason": "stop"}}
+{"type": "turn_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "The config is "}, {"type": "text", "text": "in a.txt."}], "api": "anthropic-messages", "provider": "anthropic", "model": "claude-haiku-5-5", "usage": {"input": 7, "output": 12, "cacheRead": 2657, "cacheWrite": 431, "totalTokens": 3107, "cost": {"total": 0.001}}, "stopReason": "stop"}, "toolResults": []}
+{"type": "agent_end", "messages": []}
+{"type": "agent_settled", "aborted": false}

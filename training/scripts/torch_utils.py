@@ -63,12 +63,12 @@ def chunked_ce_loss(model, input_ids, attention_mask, labels, chunk: int = 512):
     T = shift_h.shape[1]
     for s in range(0, T, chunk):
         h = shift_h[:, s : s + chunk]
-        l = shift_l[:, s : s + chunk]
-        if (l != -100).sum() == 0:
+        y = shift_l[:, s : s + chunk]
+        if (y != -100).sum() == 0:
             continue
         logits = lm_head(h).float()
         loss_sum = loss_sum + F.cross_entropy(
-            logits.transpose(1, 2), l, ignore_index=-100, reduction="sum"
+            logits.transpose(1, 2), y, ignore_index=-100, reduction="sum"
         )
     return loss_sum, n_items
 

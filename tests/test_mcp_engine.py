@@ -11,7 +11,6 @@ import base64
 import hashlib
 import json
 import secrets
-from pathlib import Path
 from typing import Any
 
 import pytest

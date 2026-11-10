@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hars_memory.retrieval.tokenizer import tokenize_identifiers
+from hars_memory.retrieval.tokenizer import sparse_stemmer_mode, tokenize_identifiers
 
 try:
     import fcntl
@@ -140,6 +140,11 @@ class BM25SparseIndex:
     chunk_ids: list[str]
     chunk_meta: dict[str, dict[str, str]]
     source_mtime: float
+    # `HARS_MEMORY_SPARSE_STEMMER` mode the tokenization was built with
+    # (retrieval/tokenizer.py). Defaults to "off" — the shipped default and
+    # the value of every cache sidecar written before this field existed —
+    # so old caches and old call sites stay valid unchanged.
+    stemmer_mode: str = "off"
 
     @property
     def chunk_count(self) -> int:
@@ -257,6 +262,7 @@ def build_index(working_dir: str) -> tuple[BM25SparseIndex, float]:
         chunk_ids=chunk_ids,
         chunk_meta=chunk_meta,
         source_mtime=source_mtime,
+        stemmer_mode=sparse_stemmer_mode(),
     )
     logger.info(
         "Built BM25 index: %d chunks in %.3fs (source=%s)",
@@ -298,6 +304,7 @@ def save_index(index: BM25SparseIndex, cache_dir: str) -> None:
             "chunk_ids": index.chunk_ids,
             "chunk_meta": index.chunk_meta,
             "source_mtime": index.source_mtime,
+            "stemmer_mode": index.stemmer_mode,
         }
         _meta_path(staging_dir).write_text(json.dumps(meta), encoding="utf-8")
 
@@ -353,6 +360,9 @@ def _load_index_once(out_dir: Path) -> BM25SparseIndex | None:
         chunk_ids=list(meta["chunk_ids"]),
         chunk_meta=dict(meta["chunk_meta"]),
         source_mtime=float(meta["source_mtime"]),
+        # Sidecars written before the stemmer mode existed were built with
+        # the shipped default ("off").
+        stemmer_mode=str(meta.get("stemmer_mode", "off")),
     )
 
 
@@ -402,7 +412,16 @@ def get_or_build_index(working_dir: str, cache_dir: str) -> tuple[BM25SparseInde
     current_mtime = chunks_file.stat().st_mtime
 
     cached = load_index(cache_dir)
-    if cached is not None and cached.source_mtime == current_mtime:
+    # A cache built under a different `HARS_MEMORY_SPARSE_STEMMER` mode holds
+    # tokens from a DIFFERENT tokenizer than live queries would use — bm25s
+    # matches literal token strings, so serving it would yield empty matches
+    # rather than an error. Treat a mode change exactly like an mtime change:
+    # rebuild (CPU-only, no LLM).
+    if (
+        cached is not None
+        and cached.source_mtime == current_mtime
+        and cached.stemmer_mode == sparse_stemmer_mode()
+    ):
         return cached, BM25BuildStats(
             chunk_count=cached.chunk_count,
             build_seconds=0.0,

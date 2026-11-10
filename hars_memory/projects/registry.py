@@ -23,6 +23,23 @@ PROJECTS_CONFIG_ENV: Final[str] = "HARS_MEMORY_PROJECTS_CONFIG"
 PROJECTS_DIR_ENV: Final[str] = "HARS_MEMORY_PROJECTS_DIR"
 
 
+def qdrant_workspace_for(project: ProjectMetadata) -> str:
+    """Qdrant collection (LightRAG workspace) that holds *project*'s vectors.
+
+    Single source of truth for the read path (``ProjectRegistry.get_rag``), the
+    write path (``SessionMemoryStore`` subgraph compaction via
+    ``_get_session_store``) and ``memory_status``: an explicit
+    ``project.qdrant_collection`` wins, the ``default`` project uses the base
+    ``HARS_MEMORY_QDRANT_COLLECTION``, every other project ``<base>_<project_id>``.
+    """
+    base_coll = os.environ.get("HARS_MEMORY_QDRANT_COLLECTION", "hars_longterm_memory")
+    if project.qdrant_collection:
+        return project.qdrant_collection
+    if project.project_id == "default":
+        return base_coll
+    return f"{base_coll}_{project.project_id}"
+
+
 class ProjectRegistry:
     """Manages project definitions, isolation boundaries, and RAG/Graph pools."""
 
@@ -212,13 +229,7 @@ class ProjectRegistry:
             if project is None:
                 raise ValueError(f"Project '{p_id}' is not registered")
 
-            base_coll = os.environ.get("HARS_MEMORY_QDRANT_COLLECTION", "hars_longterm_memory")
-            if project.qdrant_collection:
-                coll = project.qdrant_collection
-            elif project.project_id == "default":
-                coll = base_coll
-            else:
-                coll = f"{base_coll}_{project.project_id}"
+            coll = qdrant_workspace_for(project)
 
             from hars_memory.server.lightrag_init import create_lightrag
 

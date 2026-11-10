@@ -209,7 +209,7 @@ def collate(batch):
 
 def load_rows(name: str) -> list[dict]:
     with (DATA_DIR / name).open() as f:
-        return [json.loads(l) for l in f]
+        return [json.loads(line) for line in f]
 
 
 # ----------------------------- model ----------------------------------------

@@ -174,7 +174,6 @@ def entities_by_section() -> dict[int, list[str]]:
 def build_graph(rnd: random.Random):
     """320 nodes: the 16 demo-story entities in a compact cluster + filler ring."""
     nodes, xy, xyz = [], [], []
-    hars_ids = [demo_id(slug) for slug, *_ in HARS_ENTITIES]
     for idx, (slug, _name, etype, desc, _section) in enumerate(HARS_ENTITIES):
         ang = 2 * math.pi * idx / len(HARS_ENTITIES)
         x = 0.30 + 0.09 * math.cos(ang)

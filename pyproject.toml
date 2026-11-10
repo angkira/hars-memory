@@ -4,10 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hars-longterm-memory"
-version = "0.8.1"
+version = "0.9.0"
 description = "Local, model-agnostic long-term memory service for the HARS/Cortex corpus"
 requires-python = ">=3.13"
 readme = "README.md"
+license = { text = "Apache-2.0" }
 
 dependencies = [
   # Core LightRAG (graph+vector) retrieval engine — one channel of memory_recall.
@@ -97,6 +98,8 @@ dev = [
   "psycopg[binary]>=3.2.0",
   "boto3>=1.35.0",
   "grpcio-tools>=1.60.0",
+  # TUI pilot tests (tests/test_tui_app.py); same pin as the [tui] extra.
+  "textual>=8.2,<9",
 ]
 server = [
   "fastapi>=0.115.0",
@@ -106,11 +109,22 @@ server = [
   "psycopg[binary]>=3.2.0",
 ]
 s3 = ["boto3>=1.35.0"]
+# Terminal UI (`memory tui` / `memory-tui`). Textual 8.x has breaking changes across majors, hence the
+# pin; httpx and mcp are already core dependencies. Verified on PyPI 2026-10-26: textual 8.2.8.
+# pytest-textual-snapshot is deliberately NOT used: 1.1.0 forces pytest<9.
+tui = ["textual>=8.2,<9"]
 # Learned channel-fusion ranker (hars_memory/ranking/*). Training and the
 # LightGBM artifact backend need lightgbm; INFERENCE over the shipped artifact
 # does not (the loader fails soft to the hand-tuned fusion when lightgbm is
 # absent, and the MLP artifact format is pure numpy).
 ltr = ["lightgbm>=4.0"]
+# Optional Snowball stemmers for the BM25 sparse channel
+# (retrieval/tokenizer.py, HARS_MEMORY_SPARSE_STEMMER=ru|en). Imported lazily;
+# the default mode ("off") never touches it. PyPI distribution name is
+# "PyStemmer" (import name "Stemmer") — the bare PyPI name "stemmer" resolves
+# to an unrelated package (verified 2026-11-01), so spell the dependency
+# exactly "PyStemmer".
+sparse-stem = ["PyStemmer>=2.2"]
 
 [project.scripts]
 memory-index = "hars_memory.cli:index_main"
@@ -118,6 +132,7 @@ memory-mcp   = "hars_memory.mcp_server:main"
 hars-longterm-memory-mcp = "hars_memory.mcp_server:main"
 memory-eval-battle = "hars_memory.cli:eval_battle_main"
 memory = "hars_memory.cli:main"
+memory-tui = "hars_memory.tui.cli:main"
 hars-longterm-memory-server = "hars_memory.service.server:main"
 hars-longterm-memory-mcp-https = "hars_memory.http_server:main"
 hars-longterm-memory-mcp-engine = "hars_memory.mcp_engine:main"

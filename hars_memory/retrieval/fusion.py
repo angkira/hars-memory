@@ -575,6 +575,13 @@ class FusedChunk:
     # below — `fuse()` itself never touches this field, same convention as
     # `ripgrep_score` above.
     flat_dense_score: float | None = None
+    # Optional channel provenance for candidates that do NOT come from the
+    # dense+sparse pool — currently the appended session-compaction channel
+    # (`channel="session"`, `session_id=<sid>`). Both default to None, so
+    # every pre-existing construction site (positional or keyword) stays
+    # valid and serialises exactly as before.
+    channel: str | None = None
+    session_id: str | None = None
 
 
 def _min_max_normalize(scores: dict[str, float]) -> dict[str, float]:

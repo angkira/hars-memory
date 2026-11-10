@@ -1,0 +1,4619 @@
+#!/usr/bin/env python3
+"""home_run.py - ONE entry point for the owner's home runs of the neurocompact eval.
+
+Why a Python orchestrator (not a shell script): the work is a DAG of ~25 existing scripts with
+state (what is done, what is spent, which batch failed), cost arithmetic that reuses
+providers.py / longsession.py / qtypes, JSON parsing of their outputs, a redaction scan and a
+tar bundle. All of that is testable offline in Python; in bash it would be untestable glue.
+Every paid step is a subprocess of an existing script with its own hard --budget-usd; this file
+adds NO new LLM call except the cents-level liveness pings of `doctor`.
+
+  python3 home_run.py [--config home_run.toml] <subcommand> [options]
+
+  doctor     checks (HARS healthz + embedder id from memory_status - a hash shim is a FAIL, extractor
+             and model liveness, keys for the profile, native token counting, disk, tiktoken; pi 1.4.x
+             and node only with --legacy-replay) and prints the `providers.py hars-env` snippet.
+             --deep also runs one tiny memory_compact end to end.
+  hars-env   the full HARS server env block (profile LLMs + session-mode/engine settings + embedder
+             placeholders) to start the server for these runs.
+  dry-run    all tracks, ZERO spend: cost / wall-clock estimate per phase (gen, run, judge) vs the caps.
+  smoke      1 OpenHands chain + 1 tiny synthetic long session, a few cents to tens of cents (own campaign).
+  calibrate  Amendment C.6: a cheap parity CHECK of the OH track on the run_longsession path over k sessions
+             (default 1): compaction + two fixed probe asks, CLIP-free + ask-time memory ratio of nc-chunks and
+             nc-graph vs baseline in [0.80, 1.05] -> calibration.json. No cap iteration, nothing tuned, no
+             decision-set question asked, nothing excluded. `--legacy-replay` = the C.4 baseline-cap
+             calibration through the pi replay (run_chainreplay --calibrate).
+  oh         OpenHands track (Amendment C.6): chains.jsonl -> chains_to_longsession.py -> parity check ->
+             run_longsession (baseline, nc-chunks, nc-graph, nc-note-only; B=1536, sweep opt-in) ->
+             export_longsession_judge -> judge_v2 -> metrics_v2 --track longsession --end-only -> funnel.
+             `--legacy-replay` = the pre-C.6 pi replay (batches, retries, merge_runs, C.4 caps).
+  beam       BEAM: import selected chats, run_longsession, export, judge, metrics (--end-only, C.2 L-family).
+  cc         the owner's Claude Code JSONL: import (redaction ON), QA generation, run, judge, metrics.
+  bundle     tar.gz of everything the analyst needs (no raw transcripts / session stores unless
+             --include-raw), redaction-scanned, report + path + size printed.
+
+Artifacts (CLAUDE.md "never lose a run"): everything lives in ONE campaign dir
+`<artifact_root>/<UTC>-homerun-<name>/` (default root /mnt/datasets/ft/artifacts; never /tmp) with
+campaign.json, MANIFEST.json, ledger.json (spend), steps/<step>.json (done markers), logs/<step>.log
+(stdout+stderr of every step), scripts/cmdlines.txt (the exact command of every step), and per track
+oh/ beam/ cc/ holding the run dirs (samples/records/summary/run.log/inputs/scripts/MANIFEST.json of
+the underlying runners). Resumable and idempotent: re-running a subcommand skips finished steps
+(`--force-step NAME` redoes one), unfinished runs are resumed (`run_longsession --resume`) or moved
+aside (`*.failed-<UTC>`, never deleted). NO implicit resume: a command that needs a campaign creates a NEW one
+(its path is printed); `--resume` = the newest by CREATION time (campaign.json created_utc, printed loudly),
+`--resume ID|PATH` = that one; `bundle` and `status` are read-only and require a target. One client per HARS:
+every step that writes to HARS takes `~/.cache/nc-eval/locks/<sha1(mcp url)>.lock` (`--force-shared-hars` to override).
+Paid steps refuse on a campaign made under another EVAL-VERSION or with a void calibration/caps.
+
+Caps (USD, hard): `[caps]` gen / run / judge in home_run.toml (placeholders 0 = unset; per track
+override in `[caps.oh]`, `[caps.beam]`, `[caps.cc]`) or --gen-cap/--run-cap/--judge-cap. A paid step
+without its cap REFUSES to start; each invocation passes `cap - already spent` (ledger) as the
+script's --budget-usd. gen = QA generation (cc), run = replay/compaction/answers + the flagged
+estimate of HARS extraction, judge = the blind judge. See HOME-RUNBOOK.md.
+"""
+from __future__ import annotations
+
+import argparse
+import atexit
+import calendar
+import glob
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.request
+
+try:                                    # python >= 3.11 (the repo requires 3.13)
+    import tomllib
+except ImportError:                     # pragma: no cover
+    tomllib = None
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE)
+import cc_discover  # noqa: E402
+import chains_to_longsession as C2L  # noqa: E402  (Amendment C.6: OH chains -> longsession/1)
+import ls_redact  # noqa: E402
+import providers as P  # noqa: E402
+import tokcount  # noqa: E402  (Amendment C.5: native token counting)
+
+DEFAULT_ROOT = "/mnt/datasets/ft/artifacts"
+PI_VERSION_PREFIX = "1.4."
+BEAM_EXPECTED = {"100K": 20, "500K": 35, "1M": 35, "10M": 10}       # BEAM dataset description
+JUDGE_IN_TOK, JUDGE_OUT_TOK = 1300, 80          # per judged item (prompt + excerpt window + answer / JSON verdict)
+LLM_S_PER_SUMMARY, LLM_S_PER_ASK = 20.0, 8.0    # rough wall-clock model for run_longsession (summariser / ask)
+TRACKS = ("oh", "beam", "cc")
+PHASES = ("gen", "run", "judge")
+CAL_FILE = "calibration.json"                   # campaign-level baseline-cap calibration (Amendment C.4)
+PARITY_LO, PARITY_HI = 0.80, 1.05               # == run_chainreplay.PARITY_LO/HI (protocol window)
+PLACEHOLDER_CAP = 0.0
+HOME_RUN_VERSION = "2026-10-28.c10"     # must equal ../EVAL-VERSION (doctor warns on a stale copy)
+# Amendment C.7: `oh-probe` / `oh-enrich` may spend on a campaign made under one of these versions (only those,
+# only for those two commands). Why that is valid is written in REPORT-PROTOCOL.md Amendment C.7: the reused HARS
+# sessions, notes, baseline / nc-note-only rows and judge verdicts are artifacts of code that C.7 did not change.
+# Amendment C.8: the same exception covers a campaign stamped c7 and the two new commands (provision / ingest) of the
+# project layout; nothing older, no other command.
+# Amendment C.9: oh-workspaces / oh-agentic accept the same campaigns (C.6 / C.7 / C.8 stamped); the agentic track reuses the
+# finished C.6 baseline / note rows, the C.8 projects and judge model, and changes no part of them.
+# Amendment C.10: the same list plus the c9 stamp (the owner's campaign was stamped by the c9 code); oh-agentic --controls /
+# --reuse-agentic-run and oh-ingest-measure may spend on such a campaign. They reuse the finished C.9 agentic run (rows, verdicts), the
+# C.8 projects and the C.6 baseline / note rows, and change none of them.
+REUSE_COMPATIBLE_FROM = ("2026-10-27.c6", "2026-10-28.c7", "2026-10-28.c8", "2026-10-28.c9")
+REUSE_CMDS = ("oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic", "oh-ingest-measure")
+DEFAULT_PROJECTS_DIR = "~/.local/share/hars-longterm-memory/projects"    # hars_memory/projects/registry.py default
+EXPECTED_DEFAULT_MODEL = "claude-haiku-5-5"
+HAIKU_ROLES = ("agent", "answer", "summarizer", "extractor", "keyword")
+BUDGET_TOTAL_DEFAULT = 30.0
+CC_TYPICAL = {"gen": 2.0, "run": 1.5, "judge": 0.7}      # USD for one ~7-boundary Claude Code session (runbook section 0)
+
+DEFAULT_CONFIG: dict = {
+    "general": {"profile": "anthropic", "mcp": "http://127.0.0.1:8307/mcp", "artifact_root": DEFAULT_ROOT,
+                "name": "home", "campaign_dir": "", "embedder_id": "", "python": "", "key_env": "",
+                "min_free_gb": 30.0, "http_timeout_s": 10},
+    # USD hard caps; 0 = placeholder the owner has not filled in yet (paid steps then refuse)
+    # gen/run/judge are campaign-wide per phase (summed over tracks) unless a [caps.<track>] override exists;
+    # `total` (0 = unchecked) is the hard ceiling over everything (Amendment C.3-3: USD 30)
+    "caps": {"gen": PLACEHOLDER_CAP, "run": PLACEHOLDER_CAP, "judge": PLACEHOLDER_CAP, "total": 0.0,
+             "oh": {}, "beam": {}, "cc": {}},
+    # small by default (Amendment C.3-2): 14 OH chains at B=1536; BEAM-1M N=10 seeded chats at B=1536; sweeps opt-in
+    "oh": {"artifact_dir": "", "batch_chains": 4, "retries": 1, "budgets": [1536],
+           "graph_store": "",
+           # Amendment C.4: baseline cap = calibrated parity parameter. baseline_cap "1536:2010,1024:1340" (or a
+           # table {1536 = 2010}) / baseline_cap_scale (cap(B) = round(B*scale); 0 = unset) are EXPLICIT values:
+           # the start of `calibrate`, and accepted by `oh` without a calibration.
+           "baseline_cap": "", "baseline_cap_scale": 0.0,
+           "calibration_max_iterations": 2, "calibration_seed": 20261026,
+           # Amendment C.5 (legacy replay): calibrate on k chains (first k of the seeded order; ALL excluded from the
+           # decision set). Amendment C.6: the SAME key is the number of sessions of the cheap parity CHECK (default 1);
+           # the check asks only fixed probe questions, so its sessions are NOT excluded from the decision set.
+           "calibration_chains": 1,
+           # Amendment C.6: the OH track runs through run_longsession (no pi). session_concurrency / extra_args go to it.
+           "session_concurrency": 1, "extra_args": []},
+    "beam": {"repo": "", "size": "1M", "chats": "sample", "n_chats": 10, "seed": 20261026, "limit": 0,
+             "checkpoints": "end", "budgets": [1536], "session_concurrency": 1, "extra_args": []},
+    "cc": {"paths": [], "root": "~/.claude/projects", "min_tokens": 0, "limit": 0, "n_single": 40, "n_multihop": 10,
+           "n_unanswerable": 4,   # gen_longsession_qa menu-mode defaults (window-targeted); ~$0.3 on Sonnet per session
+           "session_budget_usd": 2.5, "checkpoints": "every:3", "budgets": [1536], "max_questions": 0, "extra_args": []},
+    "smoke": {"run_cap_oh": 0.90, "run_cap_ls": 0.25, "judge_cap": 0.25},
+    "hars": {"data_dir": "", "port": 8307, "projects_dir": ""},     # projects_dir: where the owner's server discovers projects (C.8)
+}
+
+
+class HomeRunError(RuntimeError):
+    """A refusal or failed step with a clear instruction; main() prints it and exits 2."""
+
+
+# =============================================================================
+# small helpers
+# =============================================================================
+def utc_stamp() -> str:
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+
+def utc_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
+def fmt_usd(x: float | None) -> str:
+    if x is None:
+        return "n/a"
+    return f"${x:,.4f}" if x < 100 else f"${x:,.2f}"
+
+
+def read_jsonl(path: str) -> list[dict]:
+    if not os.path.isfile(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                out.append(json.loads(line))
+    return out
+
+
+def write_json(path: str, obj) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1, ensure_ascii=False, default=str)
+    os.replace(tmp, path)
+
+
+def read_json(path: str, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def deep_merge(base: dict, over: dict) -> dict:
+    out = json.loads(json.dumps(base))
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def git_head() -> str:
+    try:
+        return subprocess.run(["git", "-C", BASE, "rev-parse", "HEAD"], capture_output=True, text=True,
+                              timeout=10).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# =============================================================================
+# configuration
+# =============================================================================
+def load_config(path: str | None, overrides: dict | None = None) -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if path:
+        if not os.path.isfile(path):
+            raise HomeRunError(f"config file not found: {path} (copy home_run.toml.example)")
+        if tomllib is None:
+            raise HomeRunError("tomllib is not available (python >= 3.11 needed)")
+        with open(path, "rb") as f:
+            cfg = deep_merge(cfg, tomllib.load(f))
+    cfg = deep_merge(cfg, overrides or {})
+    ex = os.path.expanduser
+    cfg["general"]["artifact_root"] = ex(cfg["general"]["artifact_root"])
+    for sec, key in (("oh", "artifact_dir"), ("oh", "graph_store"), ("beam", "repo"), ("hars", "data_dir")):
+        if cfg[sec].get(key):
+            cfg[sec][key] = ex(cfg[sec][key])
+    cfg["cc"]["paths"] = [ex(p) for p in (cfg["cc"].get("paths") or [])]
+    cfg["cc"]["root"] = ex(cfg["cc"].get("root") or "~/.claude/projects")
+    oh = cfg["oh"].get("artifact_dir")
+    if not oh or not os.path.isfile(os.path.join(oh, "chains.jsonl")):
+        found = find_oh_dir(cfg["general"]["artifact_root"])
+        if found:
+            cfg["oh"]["artifact_dir"] = found
+            cfg["oh"]["_autodetected"] = True
+    cfg["_config_path"] = os.path.abspath(path) if path else None
+    return cfg
+
+
+OH_TAR_DEFAULT = "oh-multihop-qa-20261026T144511Z.tar.gz"
+
+
+def find_oh_dir(root: str) -> str | None:
+    """Newest `<root>/*-oh-multihop-qa` directory that holds chains.jsonl (the unpacked OH dataset)."""
+    cands = sorted(d for d in glob.glob(os.path.join(root, "*-oh-multihop-qa")) if os.path.isfile(os.path.join(d, "chains.jsonl")))
+    return cands[-1] if cands else None
+
+
+def extract_oh_tar(tar_path: str, root: str) -> str:
+    """Unpack the OpenHands dataset tarball into the artifacts root (safe: no absolute / `..` members,
+    no links) and return the `<root>/<UTC>-oh-multihop-qa` directory that holds chains.jsonl."""
+    tar_path = os.path.expanduser(tar_path)
+    if not os.path.isfile(tar_path):
+        raise HomeRunError(f"OH tarball not found: {tar_path} (expected {OH_TAR_DEFAULT})")
+    os.makedirs(root, exist_ok=True)
+    with tarfile.open(tar_path, "r:*") as tf:
+        for m in tf.getmembers():
+            n = os.path.normpath(m.name)
+            if n.startswith(("/", "..")) or ".." in n.split(os.sep) or m.issym() or m.islnk() or m.isdev():
+                raise HomeRunError(f"refusing unsafe tar member {m.name!r}")
+        tf.extractall(root, filter="data")
+    found = find_oh_dir(root)
+    if not found:
+        raise HomeRunError(f"{tar_path} unpacked into {root} but no *-oh-multihop-qa/chains.jsonl was found")
+    return found
+
+
+def cap_for(cfg: dict, track: str, phase: str) -> float:
+    """Hard cap (USD) of a phase on a track: [caps.<track>].<phase> overrides [caps].<phase>."""
+    t = (cfg["caps"].get(track) or {}).get(phase)
+    v = t if t not in (None, "") else cfg["caps"].get(phase)
+    try:
+        return float(v or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def has_track_cap(cfg: dict, track: str, phase: str) -> bool:
+    t = (cfg["caps"].get(track) or {}).get(phase)
+    return t not in (None, "")
+
+
+def need_cap(cfg: dict, track: str, phase: str) -> float:
+    c = cap_for(cfg, track, phase)
+    if c <= 0:
+        raise HomeRunError(
+            f"no {phase} cap for track '{track}': set [caps] {phase} (or [caps.{track}] {phase}) in "
+            f"home_run.toml, or pass --{phase}-cap USD. Every paid step needs a hard cap "
+            "(Amendment C.1-5). `dry-run` prints the estimate to pick it from.")
+    return c
+
+
+# =============================================================================
+# campaign: directory, steps, ledger, subprocess runner
+# =============================================================================
+def subprocess_runner(argv: list[str], env: dict, cwd: str | None, log_path: str, echo: bool = True):
+    """Run argv, tee combined stdout+stderr into log_path (and the console). Returns (rc, tail_text)."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    tail: list[str] = []
+    size = 0
+    with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
+        lf.write(f"\n### {utc_iso()} $ {' '.join(shell_quote(a) for a in argv)}\n")
+        lf.flush()
+        p = subprocess.Popen(argv, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, errors="replace", bufsize=1)
+        assert p.stdout is not None
+        for line in p.stdout:
+            lf.write(line)
+            if echo:
+                sys.stdout.write("  | " + line)
+                sys.stdout.flush()
+            tail.append(line)
+            size += len(line)
+            while size > 400_000 and len(tail) > 1:
+                size -= len(tail.pop(0))
+        rc = p.wait()
+        lf.write(f"### exit {rc}\n")
+    return rc, "".join(tail)
+
+
+def shell_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'" if re.search(r"[^\w@%+=:,./-]", s) else s
+
+
+class Campaign:
+    """One campaign dir with step markers, a spend ledger and a logged subprocess runner."""
+
+    def __init__(self, path: str, cfg: dict, runner=None, echo: bool = True):
+        self.path = os.path.abspath(path)
+        self.cfg = cfg
+        self.runner = runner or subprocess_runner
+        self.echo = echo
+        self.force_steps: set[str] = set()
+        self.kind = ""
+        self.reuse_ok = False                   # oh-probe / oh-enrich: accept a REUSE_COMPATIBLE_FROM campaign (C.7)
+        # guards (version/void check before paid steps, HARS lock + lease) run only with the real subprocess runner;
+        # tests inject a fake runner and switch them on explicitly
+        self.guards_enabled = runner is None or runner is subprocess_runner
+        self.lease_fn = None                    # tests: fake (tool, args) -> dict
+        self.lease: dict | None = None
+        self.python = cfg["general"].get("python") or sys.executable
+        for d in ("steps", "logs", "scripts", "inputs"):
+            os.makedirs(os.path.join(self.path, d), exist_ok=True)
+
+    # ---- paths
+    def p(self, *parts: str) -> str:
+        return os.path.join(self.path, *parts)
+
+    # ---- manifest
+    def init_files(self, argv: list[str], kind: str = "") -> None:
+        cj = self.p("campaign.json")
+        data = read_json(cj, None)
+        if data is None:
+            data = {"created_utc": utc_iso(), "name": self.cfg["general"]["name"], "git_head": git_head(),
+                    "python": sys.version.split()[0], "invocations": [], "kind": kind or self.kind,
+                    "eval_version": HOME_RUN_VERSION}
+        data.setdefault("invocations", [])
+        data["profile"] = self.cfg["general"]["profile"]
+        data["mcp"] = self.cfg["general"]["mcp"]
+        data["invocations"].append({"ts": utc_iso(), "argv": argv})
+        data["config"] = {k: v for k, v in self.cfg.items() if not k.startswith("_")}
+        write_json(cj, data)
+        if self.cfg.get("_config_path") and os.path.isfile(self.cfg["_config_path"]):
+            shutil.copy2(self.cfg["_config_path"], self.p("inputs", "home_run.toml"))
+        for fn in ("home_run.py", "providers.py", "run_chainreplay.py", "run_longsession.py", "longsession.py",
+                   "metrics_v2.py", "judge_v2.py", "merge_runs.py", "funnel_chains.py", "export_judge_input.py",
+                   "export_longsession_judge.py", "import_beam.py", "import_claude_code.py",
+                   "gen_longsession_qa.py", "ls_redact.py", "qtypes.py", "chains_to_longsession.py", "tokcount.py",
+                   "run_agentic.py", "metrics_agentic.py", "anchors.py", "oh_workspaces.py"):
+            src = os.path.join(BASE, fn)
+            dst = self.p("scripts", fn)
+            if os.path.isfile(src) and not os.path.exists(dst):
+                shutil.copy2(src, dst)
+        prof = os.path.join(os.path.dirname(BASE), "profiles", f"{self.cfg['general']['profile']}.json")
+        if os.path.isfile(prof) and not os.path.exists(self.p("inputs", "profile.json")):
+            shutil.copy2(prof, self.p("inputs", "profile.json"))
+        with open(self.p("scripts", "cmdlines.txt"), "a") as f:
+            f.write(f"# {utc_iso()} {' '.join(shell_quote(a) for a in [sys.executable] + argv)}\n")
+
+    def write_manifest(self) -> None:
+        led = self.ledger()
+        man = {"campaign": os.path.basename(self.path), "updated_utc": utc_iso(), "git_head": git_head(),
+               "machine": {"python": sys.version.split()[0], "platform": sys.platform, "cpus": os.cpu_count()},
+               "profile": self.cfg["general"]["profile"], "mcp": self.cfg["general"]["mcp"],
+               "steps_done": sorted(f[:-5] for f in os.listdir(self.p("steps")) if f.endswith(".json")),
+               "spend_usd": led["totals"], "cost_usd": round(sum(led["totals"].values()), 6)}
+        write_json(self.p("MANIFEST.json"), man)
+        write_json(self.p("summary.json"), {"campaign": os.path.basename(self.path), "spend_usd": led["totals"],
+                                            "steps_done": len(man["steps_done"])})
+
+    # ---- steps
+    def marker(self, step: str) -> str:
+        return self.p("steps", f"{step}.json")
+
+    def is_done(self, step: str) -> bool:
+        return os.path.isfile(self.marker(step)) and step not in self.force_steps
+
+    def step(self, name: str, fn, *, skip_msg: str = "") -> dict | None:
+        if self.is_done(name):
+            m = read_json(self.marker(name), {})
+            print(f"[skip] {name} (done {m.get('ts')}){' ' + skip_msg if skip_msg else ''}")
+            return m
+        print(f"\n=== {name} ===")
+        t0 = time.time()
+        res = fn() or {}
+        write_json(self.marker(name), {"step": name, "ts": utc_iso(), "seconds": round(time.time() - t0, 1), **res})
+        return res
+
+    # ---- ledger
+    def ledger(self) -> dict:
+        led = read_json(self.p("ledger.json"), {"entries": []})
+        totals: dict[str, float] = {}
+        for e in led["entries"]:
+            k = f"{e['track']}.{e['phase']}"
+            totals[k] = round(totals.get(k, 0.0) + float(e["usd"]), 6)
+        led["totals"] = totals
+        return led
+
+    def spent(self, track: str, phase: str) -> float:
+        return self.ledger()["totals"].get(f"{track}.{phase}", 0.0)
+
+    def spent_for_cap(self, track: str, phase: str) -> float:
+        """What counts against the cap of (track, phase): that track's own spend when it has a
+        [caps.<track>] override, else the phase spend of ALL tracks (campaign-wide cap)."""
+        if has_track_cap(self.cfg, track, phase):
+            return self.spent(track, phase)
+        return sum(v for k, v in self.ledger()["totals"].items() if k.endswith("." + phase))
+
+    def charge(self, track: str, phase: str, step: str, usd: float, source: str, note: str = "") -> None:
+        led = read_json(self.p("ledger.json"), {"entries": []})
+        # idempotent per (step, source): a re-parse of the same artifact replaces its entry
+        led["entries"] = [e for e in led["entries"] if not (e["step"] == step and e["source"] == source)]
+        led["entries"].append({"ts": utc_iso(), "track": track, "phase": phase, "step": step,
+                               "usd": round(float(usd), 6), "source": source, "note": note})
+        write_json(self.p("ledger.json"), {"entries": led["entries"]})
+        self.write_manifest()
+
+    def remaining(self, track: str, phase: str) -> float:
+        cap = need_cap(self.cfg, track, phase)
+        sp = self.spent_for_cap(track, phase)
+        rem = cap - sp
+        if rem < 0.0005:
+            raise HomeRunError(f"{track}.{phase} cap ${cap:.2f} is spent (${sp:.4f}); "
+                               "raise the cap in home_run.toml to continue (the step resumes).")
+        total = float(self.cfg["caps"].get("total") or 0.0)
+        if total > 0:
+            all_spent = sum(self.ledger()["totals"].values())
+            if total - all_spent < 0.0005:
+                raise HomeRunError(f"total budget ${total:.2f} is spent (${all_spent:.4f} over all tracks); raise "
+                                   "[caps] total in home_run.toml to continue (the step resumes).")
+            rem = min(rem, total - all_spent)
+        return round(rem, 4)
+
+    # ---- subprocess
+    def run(self, step: str, argv: list[str], *, env: dict | None = None, isolated: bool = False,
+            check: bool = True, cwd: str | None = None) -> tuple[int, str]:
+        script = os.path.basename(argv[0]) if argv else ""
+        dry = "--dry-run" in argv
+        offline = bool(self.cfg["general"].get("_offline")) or "--fake-hars" in argv
+        if script in PAID_SCRIPTS and not dry:
+            guard_spend(self, f"step {step}")                       # EVAL-VERSION / void calibration or caps
+        if self.guards_enabled and script in HARS_WRITER_SCRIPTS and not dry and not offline:
+            argv = self.hars_guard(argv)                            # one client per HARS (+ lease/run_tag)
+        full = [self.python] + (["-I"] if isolated else []) + argv
+        e = dict(os.environ)
+        e.update(env or {})
+        with open(self.p("scripts", "cmdlines.txt"), "a") as f:
+            f.write(f"[{step}] {' '.join(shell_quote(a) for a in full)}\n")
+        rc, text = self.runner(full, e, cwd, self.p("logs", f"{step}.log"), self.echo)
+        if check and rc != 0:
+            raise HomeRunError(f"step '{step}' failed (exit {rc}); log: {self.p('logs', step + '.log')}. "
+                               "Fix the cause and re-run the same subcommand: finished steps are skipped.")
+        return rc, text
+
+    def hars_guard(self, argv: list[str]) -> list[str]:
+        """Lock this HARS endpoint for this process (refuses when another home_run holds it), try the server lease once
+        and hand run_longsession the lease tag as --run-tag."""
+        url = self.cfg["general"]["mcp"]
+        tag = os.path.basename(self.path)
+        GUARD_CTX["campaign"] = tag
+        acquire_hars_lock(url, tag)
+        if self.lease is None:
+            self.lease = try_server_lease(url, tag, call=self.lease_fn, force=GUARD_CTX["force_shared"])
+            print(f"[hars-lease] {self.lease['note']}")
+        if self.lease.get("active") and os.path.basename(argv[0]) == "run_longsession.py" and "--run-tag" not in argv:
+            argv = argv + ["--run-tag", self.lease["tag"]]
+        return argv
+
+    def script(self, name: str) -> str:
+        return os.path.join(BASE, name)
+
+    def quarantine(self, path: str) -> str | None:
+        """Move an unfinished/failed output dir aside (never delete a run)."""
+        if os.path.exists(path):
+            dst = f"{path}.failed-{utc_stamp()}"
+            os.replace(path, dst)
+            print(f"  moved unfinished {path} -> {dst}")
+            return dst
+        return None
+
+
+# ---------------------------------------------------------------------------
+# campaign selection (owner bug 2): NEVER an implicit resume
+# ---------------------------------------------------------------------------
+READ_ONLY_CMDS = ("bundle", "status", "oh-provision", "oh-ingest", "oh-probe", "oh-enrich", "oh-workspaces", "oh-agentic",
+                  "oh-ingest-measure")   # need an explicit target (--resume [ID|PATH])
+NOT_RESUMABLE_KINDS = ("smoke", "dry-run")      # `--resume` (newest) skips these throw-away campaigns
+_STAMP_RE = re.compile(r"^(\d{8}T\d{6}Z)-homerun-")
+
+
+def _parse_ts(s) -> float | None:
+    if not isinstance(s, str) or not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y%m%dT%H%M%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            return calendar.timegm(time.strptime(s, fmt)) if "%f" not in fmt else \
+                calendar.timegm(time.strptime(s.split(".")[0] + "Z", "%Y-%m-%dT%H:%M:%SZ"))
+        except ValueError:
+            continue
+    return None
+
+
+def campaign_created(path: str) -> float:
+    """Creation time of a campaign: campaign.json `created_utc`, else the UTC stamp in the dir name. NEVER mtime
+    (hand-touching an old campaign must not make it the newest)."""
+    ts = _parse_ts((read_json(os.path.join(path, "campaign.json"), None) or {}).get("created_utc"))
+    if ts is None:
+        m = _STAMP_RE.match(os.path.basename(path.rstrip("/")))
+        ts = _parse_ts(m.group(1)) if m else None
+    return ts if ts is not None else 0.0
+
+
+def list_campaigns(root: str) -> list[dict]:
+    """Campaign dirs under root (those holding campaign.json), newest CREATION first."""
+    out = []
+    if os.path.isdir(root):
+        for n in os.listdir(root):
+            pth = os.path.join(root, n)
+            cj = os.path.join(pth, "campaign.json")
+            if os.path.isdir(pth) and os.path.isfile(cj):
+                d = read_json(cj, {}) or {}
+                out.append({"path": pth, "name": n, "created": campaign_created(pth), "kind": d.get("kind") or "",
+                            "created_utc": d.get("created_utc") or ""})
+    out.sort(key=lambda c: (c["created"], c["name"]), reverse=True)
+    return out
+
+
+def fmt_campaigns(cs: list[dict], limit: int = 5) -> str:
+    return "\n".join(f"    {c['name']}  (created {c['created_utc'] or '?'}{', ' + c['kind'] if c['kind'] else ''})"
+                     for c in cs[:limit]) or "    (none)"
+
+
+def resolve_campaign(root: str, spec: str) -> str:
+    """`--resume` spec -> campaign dir. ''/'newest'/'latest' = newest by creation time (campaign.json created_utc,
+    throw-away smoke / dry-run campaigns skipped); otherwise a path, a name under root, or a unique name fragment."""
+    spec = (spec or "").strip()
+    cs = list_campaigns(root)
+    if spec in ("", "newest", "latest"):
+        cand = [c for c in cs if c["kind"] not in NOT_RESUMABLE_KINDS]
+        if not cand:
+            raise HomeRunError(f"--resume: no campaign to resume under {root}. Start one by running the command without "
+                               "--resume (it creates a new campaign and prints its path).")
+        return cand[0]["path"]
+    for cand in (spec, os.path.join(root, spec)):
+        if os.path.isdir(cand):
+            return os.path.abspath(cand)
+    hits = [c for c in cs if spec in c["name"]]
+    if len(hits) == 1:
+        return hits[0]["path"]
+    raise HomeRunError(f"--resume {spec!r}: " + ("matches several campaigns:\n" + fmt_campaigns(hits, 10) if hits
+                                                else f"no campaign dir {spec!r} (as a path or under {root}).\n  newest:\n"
+                                                + fmt_campaigns(cs)))
+
+
+def eval_version_file() -> str | None:
+    p = os.path.join(os.path.dirname(BASE), "EVAL-VERSION")
+    try:
+        with open(p) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def open_campaign(cfg: dict, args, kind: str, runner=None, echo: bool = True) -> Campaign:
+    """Pick the campaign. Rules (owner bug 2, no implicit resume):
+      * `--resume` / `--resume newest`  = the newest campaign by CREATION time (loud message);
+      * `--resume ID|PATH`              = that campaign (also [general] campaign_dir);
+      * nothing                         = a NEW campaign (its path is printed) - except the read-only commands
+                                          (bundle, status), which refuse without an explicit target;
+      * `--new`                         = a new campaign even with --resume."""
+    root = cfg["general"]["artifact_root"]
+    os.makedirs(root, exist_ok=True)
+    ptr = os.path.join(root, ".homerun-current")
+    spec = getattr(args, "resume", None)
+    if spec is None:
+        spec = cfg["general"].get("campaign_dir") or None
+    new = bool(getattr(args, "new", False))
+    path = ""
+    if spec is not None and not new:
+        path = resolve_campaign(root, spec)
+        if not os.path.isdir(path):
+            raise HomeRunError(f"campaign dir not found: {path}")
+        if spec in ("", "newest", "latest"):
+            cj = read_json(os.path.join(path, "campaign.json"), {}) or {}
+            print("\n" + "!" * 78 + f"\n[campaign] RESUMING the NEWEST campaign by creation time: {path}\n"
+                  f"            created {cj.get('created_utc', '?')} (not by modification time). Pass --resume <ID|PATH> to be explicit, "
+                  "--new to start fresh.\n" + "!" * 78)
+        else:
+            print(f"[campaign] resuming {path}")
+    elif kind in READ_ONLY_CMDS:
+        raise HomeRunError(f"`{kind}` {'works on an EXISTING campaign' if kind in REUSE_CMDS else 'is read-only'} and never guesses a campaign: name one. "
+                           f"--resume (newest by creation time) or --resume ID|PATH.\n  newest campaigns under {root}:\n"
+                           + fmt_campaigns(list_campaigns(root)))
+    else:
+        prev = [c for c in list_campaigns(root) if c["kind"] not in NOT_RESUMABLE_KINDS]
+        suffix = "-smoke" if kind == "smoke" else ""
+        base = os.path.join(root, f"{utc_stamp()}-homerun-{cfg['general']['name']}{suffix}")
+        path, n = base, 1
+        while os.path.exists(path):                 # two campaigns within one second
+            n += 1
+            path = f"{base}-{n}"
+        os.makedirs(path)
+        print(f"[campaign] NEW campaign {path}  (nothing is resumed implicitly)")
+        if prev and kind != "smoke":
+            print(f"[campaign] to continue an earlier one instead, re-run with --resume (newest: {prev[0]['name']}) "
+                  "or --resume ID|PATH")
+    camp = Campaign(path, cfg, runner=runner, echo=echo)
+    camp.kind = kind
+    camp.force_steps = set(getattr(args, "force_step", None) or [])
+    if kind != "smoke":
+        with open(ptr, "w") as f:                   # informational only: never read back by open_campaign
+            f.write(camp.path)
+    camp.init_files(sys.argv[1:] if sys.argv[1:] else [], kind=kind)
+    return camp
+
+
+# ---------------------------------------------------------------------------
+# paid-step guard (owner bug 5): a campaign made under another EVAL-VERSION, or with a void calibration/caps, never spends
+# ---------------------------------------------------------------------------
+PAID_SCRIPTS = ("run_longsession.py", "run_chainreplay.py", "judge_v2.py", "gen_longsession_qa.py", "run_agentic.py")
+HARS_WRITER_SCRIPTS = ("run_longsession.py", "run_chainreplay.py", "run_agentic.py")   # run_agentic only READS HARS; it takes the same per-endpoint lock / lease
+
+
+def campaign_eval_version(camp_path: str) -> str | None:
+    """EVAL-VERSION the campaign was made under: campaign.json `eval_version`; campaigns created before that field
+    existed fall back to the HOME_RUN_VERSION of their own scripts/home_run.py copy."""
+    d = read_json(os.path.join(camp_path, "campaign.json"), {}) or {}
+    if d.get("eval_version"):
+        return str(d["eval_version"])
+    try:
+        with open(os.path.join(camp_path, "scripts", "home_run.py")) as f:
+            m = re.search(r'^HOME_RUN_VERSION\s*=\s*"([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def spend_blockers(camp: "Campaign") -> list[str]:
+    """Why this campaign must not spend (empty = fine). Pure reads."""
+    why: list[str] = []
+    code = HOME_RUN_VERSION
+    marker = eval_version_file()
+    if marker and marker != code:
+        why.append(f"this checkout is inconsistent: EVAL-VERSION {marker!r} != home_run.py {code!r} (stale/mixed copy)")
+    made = campaign_eval_version(camp.path)
+    reuse_ok = bool(getattr(camp, "reuse_ok", False)) and made in REUSE_COMPATIBLE_FROM
+    if made != code and not reuse_ok:
+        why.append(f"the campaign was made under EVAL-VERSION {made or '(unknown)'!r}, the code is {code!r}: its "
+                   "calibration, caps and records belong to another protocol version"
+                   + (f" (only {'/'.join(REUSE_CMDS)} may reuse a {'/'.join(REUSE_COMPATIBLE_FROM)} campaign, Amendments C.7 / C.8)"
+                      if made in REUSE_COMPATIBLE_FROM else ""))
+    cal = read_json(camp.p(CAL_FILE), None)
+    if cal:
+        want = "C.5" if getattr(camp, "legacy_replay", False) else "C.6"
+        if cal.get("void") is True or cal.get("status") == "void":
+            why.append(f"{CAL_FILE} is marked VOID ({cal.get('void_reason') or 'no reason recorded'})")
+        elif cal.get("amendment") != want:
+            why.append(f"{CAL_FILE} is from Amendment {cal.get('amendment') or '(none)'}, this "
+                       f"{'legacy ' if want == 'C.5' else ''}run needs {want} (a pre-{want} calibration counted other tokens "
+                       "or capped differently and is VOID)")
+        elif cal.get("eval_version") and cal["eval_version"] != code and not (reuse_ok and cal["eval_version"] in REUSE_COMPATIBLE_FROM):
+            why.append(f"{CAL_FILE} was written under EVAL-VERSION {cal['eval_version']!r}, the code is {code!r}")
+    caps = read_json(camp.p("oh", "caps.json"), None)
+    if caps:
+        if caps.get("void") is True:
+            why.append("oh/caps.json is marked VOID")
+        elif caps.get("origin") == "calibration" and cal and cal.get("amendment") != "C.5" and getattr(camp, "legacy_replay", False):
+            why.append("oh/caps.json was frozen from a void (pre-C.5) calibration")
+    return why
+
+
+def guard_spend(camp: "Campaign", what: str) -> None:
+    why = spend_blockers(camp)
+    if why:
+        raise HomeRunError(f"refusing to spend on {what}: campaign {os.path.basename(camp.path)} is not valid for this code.\n  - "
+                           + "\n  - ".join(why) + "\n  Start a new campaign (run the command WITHOUT --resume, or add --new) "
+                                                 "after updating the checkout. Nothing was spent.")
+
+
+# ---------------------------------------------------------------------------
+# one client per HARS (owner bug 4): advisory lock file + optional server lease
+# ---------------------------------------------------------------------------
+def lock_dir() -> str:
+    return os.environ.get("NC_EVAL_LOCK_DIR") or os.path.expanduser("~/.cache/nc-eval/locks")
+
+
+def norm_mcp_url(url: str) -> str:
+    u = (url or "").strip().rstrip("/").lower()
+    return re.sub(r"//(localhost|\[::1\]|0\.0\.0\.0)(?=[:/])", "//127.0.0.1", u)
+
+
+def lock_path(url: str) -> str:
+    return os.path.join(lock_dir(), hashlib.sha1(norm_mcp_url(url).encode()).hexdigest() + ".lock")
+
+
+def pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+GUARD_CTX = {"force_shared": False, "campaign": ""}         # set by main(): --force-shared-hars, the campaign id
+_HELD_LOCKS: dict[str, dict] = {}
+
+
+def acquire_hars_lock(url: str, campaign: str = "", force: bool | None = None, argv: list[str] | None = None) -> str:
+    """Take the advisory lock of this HARS endpoint on this host. Re-entrant in-process; a dead holder's file is
+    stale and replaced; a live holder refuses (HomeRunError with its details) unless --force-shared-hars."""
+    force = GUARD_CTX["force_shared"] if force is None else force
+    campaign = campaign or GUARD_CTX["campaign"]
+    path = lock_path(url)
+    if path in _HELD_LOCKS:
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    info = {"pid": os.getpid(), "campaign": campaign, "started_at": utc_iso(), "mcp": url,
+            "argv": list(argv if argv is not None else sys.argv[1:])[:12]}
+    for _ in range(5):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            holder = read_json(path, None) or {}
+            if holder.get("pid") == os.getpid():
+                break
+            if not pid_alive(holder.get("pid")):
+                print(f"[hars-lock] stale lock of dead pid {holder.get('pid')} (campaign {holder.get('campaign')}) removed")
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            if force:
+                print(f"[hars-lock] --force-shared-hars: ignoring the lock held by pid {holder.get('pid')} "
+                      f"(campaign {holder.get('campaign')}, since {holder.get('started_at')}); two clients on one HARS "
+                      "can corrupt both runs (1 engine thread, queue 32, OOM history)", file=sys.stderr)
+                _HELD_LOCKS[path] = {**info, "forced": True}
+                return path
+            raise HomeRunError(
+                f"another home_run is already using this HARS ({url}): pid {holder.get('pid')}, campaign "
+                f"{holder.get('campaign') or '?'}, since {holder.get('started_at') or '?'}, command {holder.get('argv')}.\n"
+                f"  Two clients on one HARS corrupt both runs. Wait for it, or stop it, or (at your own risk) pass "
+                f"--force-shared-hars.  lock file: {path}")
+        else:
+            with os.fdopen(fd, "w") as f:
+                json.dump(info, f)
+            break
+    _HELD_LOCKS[path] = info
+    return path
+
+
+def release_hars_locks() -> None:
+    while _ACTIVE_LEASES:
+        url, tag, call = _ACTIVE_LEASES.pop()
+        release_server_lease(url, tag, call)
+    for path, info in list(_HELD_LOCKS.items()):
+        try:
+            if not info.get("forced") and (read_json(path, None) or {}).get("pid") == os.getpid():
+                os.remove(path)
+        except OSError:
+            pass
+        _HELD_LOCKS.pop(path, None)
+
+
+atexit.register(release_hars_locks)
+
+LEASE_TTL_S = 259200                                   # 3 days (server clamps to 1..604800); released on exit
+_ACTIVE_LEASES: list = []
+_LEASE_ABSENT = ("unknown tool", "no such tool", "not found", "unsupported", "not implemented", "method not found",
+                 "invalid tool", "tool not")
+
+
+def try_server_lease(url: str, tag: str, call=None, force: bool = False) -> dict:
+    """If the server exposes memory_lease_acquire, take a lease tagged with the campaign id. Tolerates its absence
+    (any transport/unknown-tool error = no lease, run goes on without run_tag). A live lease held by someone else
+    refuses unless --force-shared-hars. Returns {"active": bool, "tag": tag|None, "note": str}."""
+    if call is None:
+        def call(tool, args):
+            import run_chainreplay as rc  # noqa: PLC0415
+            return rc.mcp_call(url, tool, args, timeout=30)
+    try:
+        r = call("memory_lease_acquire", {"tag": tag, "ttl_s": LEASE_TTL_S})
+    except Exception as e:  # noqa: BLE001  (absent tool, server down, old server: all tolerated)
+        return {"active": False, "tag": None, "note": f"no server lease ({type(e).__name__}: {str(e)[:80]})"}
+    if not isinstance(r, dict):
+        return {"active": False, "tag": None, "note": "no server lease (unexpected reply)"}
+    err = str(r.get("error") or "").lower()
+    if r.get("error_kind") == "lease_held" or r.get("ok") is False or r.get("acquired") is False:
+        if err and any(s in err for s in _LEASE_ABSENT):
+            return {"active": False, "tag": None, "note": f"no server lease ({err[:80]})"}
+        holder = r.get("held_by") or r.get("holder") or err[:120]
+        if force:
+            return {"active": False, "tag": None, "note": f"server lease held by {holder}; forced past it"}
+        raise HomeRunError(f"the HARS server lease is held by another client (tag {holder}, expires {r.get('expires_at') or '?'}); "
+                           "wait for it or pass --force-shared-hars")
+    _ACTIVE_LEASES.append((url, tag, call))
+    return {"active": True, "tag": tag, "note": f"server lease taken (run_tag {tag}, ttl {LEASE_TTL_S}s)"}
+
+
+def release_server_lease(url: str, tag: str, call=None) -> None:
+    try:
+        if call is None:
+            import run_chainreplay as rc  # noqa: PLC0415
+            rc.mcp_call(url, "memory_lease_release", {"tag": tag}, timeout=30)
+        else:
+            call("memory_lease_release", {"tag": tag})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# =============================================================================
+# doctor
+# =============================================================================
+class Probes:
+    """Everything `doctor` touches outside the process; replaced by a fake in the tests."""
+
+    def http_json(self, url: str, timeout: float = 10.0):
+        base = url
+        op = urllib.request.build_opener(urllib.request.ProxyHandler({})) if re.match(
+            r"https?://(127\.0\.0\.1|localhost|\[::1\])", url) else None
+        req = urllib.request.Request(base)
+        with (op.open(req, timeout=timeout) if op else urllib.request.urlopen(req, timeout=timeout)) as r:
+            body = r.read().decode("utf-8", "replace")
+        try:
+            return json.loads(body or "{}")
+        except ValueError:
+            return {"_raw": body[:200]}
+
+    def mcp(self, url: str, tool: str, args: dict, timeout: float = 60.0) -> dict:
+        import run_chainreplay as rc  # noqa: PLC0415  (its MCP client: loopback proxy bypass included)
+        return rc.mcp_call(url, tool, args, timeout=int(timeout))
+
+    def cmd(self, argv: list[str], timeout: float = 20.0) -> tuple[int, str]:
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            return p.returncode, (p.stdout + p.stderr).strip()
+        except FileNotFoundError:
+            return 127, ""
+        except Exception as e:  # noqa: BLE001
+            return 1, f"{type(e).__name__}: {e}"
+
+    def disk_free_gb(self, path: str) -> float:
+        p = path
+        while p and not os.path.exists(p):
+            p = os.path.dirname(p)
+        return shutil.disk_usage(p or "/").free / 1e9
+
+    def chat_ping(self, profile, role: str, model: str, key_env: str | None) -> str:
+        res = P.chat(role, [{"role": "user", "content": "Reply with the single word: ok"}], profile=profile,
+                     model=model, max_tokens=16, temperature=0, budget=P.Budget(0.02), key_env=key_env,
+                     timeout=60, retries=2, soft_extra_body=P.thinking_soft_extra(profile, "disabled"))
+        return f"{res.text.strip()[:20]!r} ${res.cost_usd or 0:.5f}"
+
+    def native_count(self, profile, model: str, key_env: str | None) -> str:
+        """Amendment C.5 liveness: one NATIVE count of a code-ish sample (count_tokens is free). Returns a
+        one-line description; raises when the counter is not reachable."""
+        import tokcount  # noqa: PLC0415
+        prov = tokcount.provider_of_profile(profile.name)
+        if prov not in tokcount.NATIVE_PROVIDERS:
+            raise RuntimeError(f"profile {profile.name} has no native token counter (cl100k fallback, native=False)")
+        key = P.resolve_key(profile, key_env)
+        ctr = tokcount.Counter(prov, model, mode="native", key=key, cache_path="")
+        sample = "def f(x):\n    return {'k': [x, x+1], 'id': 'a1b2c3'}\n" * 12
+        n = ctr.count(sample)
+        return (f"{ctr.tokenizer_id}: {n} tok for {len(sample)} chars (native/{tokcount.FAST_ID} = "
+                f"{n / max(1, tokcount.fast_count(sample)):.2f}); framing overhead {ctr.manifest()['overhead_subtracted']} subtracted")
+
+    def tiktoken_info(self) -> tuple[bool, str]:
+        try:
+            import tiktoken  # noqa: PLC0415
+            tiktoken.get_encoding("cl100k_base")
+            return True, "tiktoken cl100k_base loaded (cache/network OK)"
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {str(e)[:120]}"
+
+
+HASH_MARKERS = ("hash", "shim", "bagofwords", "bag-of-words", "bow", "dummy", "fake", "mock", "random")
+
+
+def embedder_verdict(eid) -> tuple[str, str]:
+    if not eid:
+        return "FAIL", "the server reports no embedder id (memory_status.configured_models.embedder)"
+    low = str(eid).lower()
+    if any(m in low for m in HASH_MARKERS):
+        return "FAIL", (f"embedder {eid!r} is a hash/shim debugging embedder: retrieval is lexical and "
+                        "nc-chunks recall can be empty. NOT a decision-grade configuration "
+                        "(C.1-3); start HARS with your real embedder (HARS_MEMORY_EMBED_*)")
+    return "OK", f"embedder {eid!r} (server-reported)"
+
+
+def check_row(name: str, status: str, detail: str, scope: str = "all") -> dict:
+    return {"check": name, "status": status, "detail": detail, "scope": scope}
+
+
+def stale_copy_rows(probes: Probes, base: str | None = None) -> list[dict]:
+    """Is this the current checkout of the eval, or an obsolete copy (e.g. /tmp/opencode/nc-eval:
+    old runner, OpenRouter-only judge/extractor, Haiku 4.5 defaults, 5-session dataset)?"""
+    base = base or BASE
+    ev = os.path.dirname(base)
+    rows: list[dict] = []
+    must = [os.path.join(base, "providers.py"), os.path.join(base, "cc_discover.py"),
+            os.path.join(base, "run_longsession.py"), os.path.join(ev, "profiles", "anthropic.json"),
+            os.path.join(ev, "pi-agent", "extensions", "neurocompact.ts"), os.path.join(ev, "REPORT-PROTOCOL.md")]
+    missing = [os.path.relpath(p, ev) for p in must if not os.path.isfile(p)]
+    verfile = os.path.join(ev, "EVAL-VERSION")
+    try:
+        ver = open(verfile).read().strip()
+    except OSError:
+        ver = ""
+    proto = ""
+    try:
+        proto = open(os.path.join(ev, "REPORT-PROTOCOL.md"), encoding="utf-8").read()
+    except OSError:
+        pass
+    real = os.path.realpath(base)
+    suspicious = any(m in real for m in ("/tmp/", "opencode", "/nc-eval/"))
+    rc, top = probes.cmd(["git", "-C", base, "rev-parse", "--show-toplevel"])
+    in_git = rc == 0 and bool(top.strip())
+    rc2, branch = probes.cmd(["git", "-C", base, "rev-parse", "--abbrev-ref", "HEAD"]) if in_git else (1, "")
+    bad = []
+    if missing:
+        bad.append("missing " + ", ".join(missing))
+    if ver != HOME_RUN_VERSION:
+        bad.append(f"version marker {ver or '(none)'!r} != {HOME_RUN_VERSION!r} (EVAL-VERSION)")
+    if proto and "Amendment C.3" not in proto and "AMENDMENT C.3" not in proto:
+        bad.append("REPORT-PROTOCOL.md has no Amendment C.3")
+    if bad:
+        rows.append(check_row("stale_copy", "FAIL",
+                              f"THIS IS A STALE OR INCOMPLETE COPY of the eval ({'; '.join(bad)}). Use "
+                              "experiments/neurocompact-eval/ of a fresh checkout of branch "
+                              "claude/youthful-thompson-yv6xqd; the old /tmp/opencode/nc-eval copy is obsolete "
+                              "(old runner, OpenRouter-only judge/extractor, Haiku 4.5 defaults, 5-session dataset)."))
+    elif suspicious or not in_git:
+        rows.append(check_row("stale_copy", "WARN",
+                              f"running from {real}: " + ("not inside a git checkout " if not in_git else "")
+                              + ("path looks like a scratch/obsolete copy (/tmp, opencode, nc-eval) "
+                                 if suspicious else "")
+                              + "- run from experiments/neurocompact-eval/ of the repo checkout "
+                                "(branch claude/youthful-thompson-yv6xqd)"))
+    else:
+        rows.append(check_row("stale_copy", "OK", f"eval {ver} from {real} (git {top.strip()}, branch "
+                                                  f"{branch.strip() or '?'})"))
+    return rows
+
+
+def role_model_table(cfg: dict) -> tuple[list[str], list[dict]]:
+    """Resolved role -> model table (profile defaults + prices) and WARN rows for stale defaults."""
+    prof = P.load_profile(cfg["general"]["profile"])
+    models = P.resolve_models(prof, {})
+    lines = [f"role -> model (profile {prof.name}, prompt cache {'ON' if prof.cache_enabled else 'off'})",
+             f"  {'role':<13} {'model':<26} {'in/out USD per MTok':<22} {'cache read/write':<18} price status"]
+    rows = []
+    for r in P.ROLES:
+        m = models.get(r)
+        e = prof.price(m) if m else None
+        lines.append(f"  {r:<13} {str(m):<26} "
+                     + ((f"{e['in']}/{e['out']}".ljust(22) + f"{e.get('cache_read', '-')}/{e.get('cache_write', '-')}".ljust(18)
+                         + e["status"]) if e else "no price"))
+        if prof.name == "anthropic" and r in HAIKU_ROLES and m != EXPECTED_DEFAULT_MODEL:
+            rows.append(check_row(f"model.default.{r}", "WARN",
+                                  f"{r} resolves to {m!r}, the frozen decision-set default is {EXPECTED_DEFAULT_MODEL}"))
+    return lines, rows
+
+
+def doctor_checks(cfg: dict, probes: Probes, *, live: bool = True, deep: bool = False,
+                  tracks=TRACKS, offline: bool = False, legacy_replay: bool = False) -> list[dict]:
+    g = cfg["general"]
+    rows: list[dict] = []
+    add = lambda *a, **k: rows.append(check_row(*a, **k))  # noqa: E731
+    # python / repo
+    ok = sys.version_info >= (3, 13)
+    add("python", "OK" if ok else "FAIL", f"{sys.version.split()[0]} (the repo needs >= 3.13; run via `uv run`)")
+    head = git_head()
+    rc, dirty = probes.cmd(["git", "-C", BASE, "status", "--porcelain", "--", "."])
+    add("repo", "OK" if head and not dirty.strip() else "WARN",
+        f"git {head[:10] or 'unknown'}" + (" (uncommitted changes under the eval dir: recorded runs are not "
+                                          "reproducible from the sha alone)" if dirty.strip() else ""))
+    rows.extend(stale_copy_rows(probes))
+    # profile + models + prices
+    try:
+        prof = P.load_profile(g["profile"])
+    except P.ProviderError as e:
+        add("profile", "FAIL", str(e))
+        return rows
+    models = P.resolve_models(prof, {})
+    rows.extend(role_model_table(cfg)[1])
+    unconf = [f"{r}:{models[r]}" for r in P.ROLES if models.get(r)
+              and (prof.price(models[r]) or {}).get("status") != "confirmed"]
+    add("profile", "WARN" if unconf else "OK",
+        f"{prof.name}: " + ", ".join(f"{r}={models[r]}" for r in ("agent", "summarizer", "extractor", "keyword",
+                                                                  "qa_generator", "judge"))
+        + (f" | prices not 'confirmed': {unconf}" if unconf else " | all prices confirmed"))
+    # keys
+    kenv = g.get("key_env") or None
+    kp = P.key_problem(prof, kenv) if not offline else None
+    add("keys", "FAIL" if kp else "OK",
+        kp or f"{P.key_env_name(prof, kenv)} is set (value not shown)"
+              + (f"; pi reads it as {prof.pi.get('key_env')} (legacy replay only)" if legacy_replay else "")
+              + "; the HARS server process needs the same key as HARS_MEMORY_LLM_API_KEY")
+    # HARS
+    url = g["mcp"]
+    hbase = url.rsplit("/mcp", 1)[0]
+    if offline:
+        add("hars", "WARN", "offline self-test: HARS not checked")
+    else:
+        try:
+            h = probes.http_json(hbase + "/healthz", float(g.get("http_timeout_s", 10)))
+            add("hars.healthz", "OK", f"{hbase}/healthz -> {str(h)[:100]}")
+        except Exception as e:  # noqa: BLE001
+            add("hars.healthz", "FAIL", f"{hbase}/healthz unreachable: {type(e).__name__}: {str(e)[:100]} "
+                                       "(start the HARS server, see `hars-env`)")
+        try:
+            st = probes.mcp(url, "memory_status", {}, 60)
+            cm = (st or {}).get("configured_models") or {}
+            status, detail = embedder_verdict(cm.get("embedder"))
+            decl = g.get("embedder_id")
+            if decl and status == "OK" and P.norm_model(decl) not in P.norm_model(str(cm.get("embedder"))):
+                status, detail = "WARN", (f"server reports {cm.get('embedder')!r} but [general] embedder_id declares "
+                                          f"{decl!r}")
+            elif status == "OK":
+                detail += ("; NOTE memory_status reports HARS_MEMORY_EMBED_MODEL even when "
+                           "HARS_MEMORY_EMBED_PROVIDER=http serves another model: run `doctor --deep` for the "
+                           "behavioural check")
+            add("hars.embedder", status, detail)
+            for role, key in (("extractor", "extractor"), ("keyword", "query")):
+                got, want = cm.get(key) or cm.get(role), models.get(role)
+                if got is None:
+                    add(f"hars.{role}_model", "WARN", "the server does not report it in memory_status")
+                else:
+                    gm, _, gurl = str(got).partition(" @ ")
+                    same = P.norm_model(gm) == P.norm_model(want)
+                    purl = (prof.base_url or "").rstrip("/")
+                    url_ok = (not gurl) or gurl.rstrip("/") == purl
+                    add(f"hars.{role}_model", "OK" if same and url_ok else "WARN",
+                        f"server {got!r} vs profile {want!r} @ {purl}"
+                        + ("" if same and url_ok else " (differs; the run manifest records the server's)"))
+        except Exception as e:  # noqa: BLE001
+            add("hars.embedder", "FAIL", f"memory_status failed: {type(e).__name__}: {str(e)[:120]}")
+    # extractor / models liveness (client side) and, with --deep, the server's whole ingest path
+    if offline:
+        pass
+    elif not live:
+        add("extractor.reachable", "WARN", "skipped (--no-live)")
+    else:
+        seen = set()
+        for role in ("extractor", "keyword", "agent", "qa_generator", "judge"):
+            m = models.get(role)
+            if not m or m in seen:
+                continue
+            seen.add(m)
+            try:
+                add(f"model.{role}", "OK", f"{m}: {probes.chat_ping(prof, role, m, kenv)}",
+                    scope="oh,beam,cc" if role != "qa_generator" else "cc")
+            except Exception as e:  # noqa: BLE001
+                add(f"model.{role}", "FAIL", f"{m} via {prof.name} not reachable: {str(e)[:160]}")
+        if not any(r["check"].startswith("model.extractor") for r in rows):
+            pass
+        # Amendment C.5: parity and every budget are counted in the answering model's NATIVE tokens
+        am = models.get("answer") or models.get("agent")
+        try:
+            add("tokcount.native", "OK", probes.native_count(prof, am, kenv), scope="oh,beam,cc")
+        except Exception as e:  # noqa: BLE001
+            add("tokcount.native", "FAIL", f"native token counting for {am} via {prof.name} is not available: "
+                f"{str(e)[:160]} (Amendment C.5: a run would be refused; count_tokens is free - check the key / "
+                "network / model id)", scope="oh,beam,cc")
+    if deep and not offline:
+        rows.extend(deep_ingest_check(cfg, probes))
+    # pi / node: Amendment C.6 - only the LEGACY pi replay (`oh --legacy-replay`) needs them; the default OH track
+    # runs through run_longsession (built-in client) like beam and cc
+    if legacy_replay and "oh" in tracks:
+        rc, out = probes.cmd(["pi", "--version"])
+        ver = re.search(r"\d+\.\d+\.\d+", out or "")
+        if rc != 0 or not ver:
+            add("pi", "FAIL", "pi not found: `npm i -g @earendil-works/pi-coding-agent@1.4.0` (needed by "
+                              "`oh --legacy-replay` only)", scope="oh")
+        else:
+            v = ver.group(0)
+            add("pi", "OK" if v.startswith(PI_VERSION_PREFIX) else "FAIL",
+                f"pi {v}" + ("" if v.startswith(PI_VERSION_PREFIX) else
+                             f" (the harness/events parser is pinned to {PI_VERSION_PREFIX}x)"), scope="oh")
+        rc, out = probes.cmd(["node", "--version"])
+        m = re.search(r"v?(\d+)", out or "")
+        add("node", "OK" if rc == 0 and m and int(m.group(1)) >= 20 else "FAIL",
+            out if rc == 0 else "node not found (pi needs Node >= 20)", scope="oh")
+    # disk
+    root = g["artifact_root"]
+    free = probes.disk_free_gb(root)
+    mn = float(g.get("min_free_gb", 30))
+    add("disk", "OK" if free >= mn else ("WARN" if free >= 5 else "FAIL"),
+        f"{free:.1f} GB free at {root} (want >= {mn:.0f}: BEAM-10M sessions, run dirs, HARS stores)")
+    okt, info = probes.tiktoken_info()
+    add("tiktoken", "OK" if okt else "WARN",
+        (info if okt else f"{info} -> the FAST estimator falls back to chars/3.6") +
+        " (only the packer's inner loop / non-native providers; budgets use the native counter, Amendment C.5)")
+    # inputs
+    oh = cfg["oh"].get("artifact_dir")
+    add("input.oh", "OK" if oh and os.path.isfile(os.path.join(oh, "chains.jsonl")) else "WARN",
+        f"{oh or '(unset)'}: chains.jsonl " + ("found" if oh and os.path.isfile(os.path.join(oh, 'chains.jsonl'))
+                                              else "missing - copy the OH artifact dir, set [oh] artifact_dir"),
+        scope="oh")
+    br = cfg["beam"].get("repo")
+    add("input.beam", "OK" if br and os.path.isdir(os.path.join(br, "chats")) else "WARN",
+        f"{br or '(unset)'}: chats/ " + ("found" if br and os.path.isdir(os.path.join(br, "chats"))
+                                        else "missing - git clone https://github.com/mohammadtavakoli78/BEAM, set [beam] repo"),
+        scope="beam")
+    ccp = [p for p in cfg["cc"].get("paths") or [] if os.path.exists(os.path.expanduser(p))]
+    nfiles = len(cc_discover.list_files(cfg["cc"].get("root") or cc_discover.DEFAULT_ROOT))
+    add("input.cc", "OK" if (ccp or nfiles) else "WARN",
+        f"{len(ccp)} path(s) exist of {len(cfg['cc'].get('paths') or [])} configured" if cfg["cc"].get("paths")
+        else (f"{nfiles} transcript(s) under {cfg['cc'].get('root')}: pick one with `home_run.py cc --find \"<title>\"` "
+              "or `cc --list`" if nfiles else f"no transcripts under {cfg['cc'].get('root')}: set [cc] root or "
+              "[cc] paths, or pass --projects-root"), scope="cc")
+    # writable root
+    try:
+        os.makedirs(root, exist_ok=True)
+        tf = os.path.join(root, f".doctor-{os.getpid()}")
+        open(tf, "w").close()
+        os.remove(tf)
+        add("artifact_root", "OK", f"{root} is writable (never /tmp: it is swept)")
+    except OSError as e:
+        add("artifact_root", "FAIL", f"{root} not writable: {e}")
+    return rows
+
+
+# (document, query, expected substring): the query shares NOT ONE word with its document (stopwords
+# included), so a lexical / hash bag-of-words embedder scores 0 and the recall comes back empty
+# Each probe document is a realistic, self-contained note of ~300-400 tokens (well above the server's 200-token
+# chunk minimum, so the chunker keeps it as its OWN chunk; three short sentences used to be merged into one
+# sub-minimum chunk that min_score 0.2 then dropped, so the probe reported 1/3 on a healthy embedder).
+# (document, query sharing no content word with the marker sentence, marker the recalled context must contain)
+SEMANTIC_PROBES = (
+    ("Postmortem: payments-ledger outage of 14 March. At 02:10 UTC the primary PostgreSQL volume reached 100 percent "
+     "utilisation and the service stopped accepting new transactions. The on-call engineer was paged at 02:14 by the "
+     "disk-usage alert, confirmed that the data directory had grown by 380 GB in nine days and traced the growth to "
+     "the write-ahead log archive job, which had been failing silently since 5 March because the credentials of the "
+     "object-storage bucket had been rotated without updating the job. Segments piled up locally instead of being "
+     "shipped away, so the volume filled. Mitigation: at 02:41 the team extended the volume by 500 GB, fixed the "
+     "credentials and let the archiver drain the backlog; the ledger accepted writes again at 02:52 and no committed "
+     "transaction was lost. Contributing factors: the archiver exit code was never monitored, the disk alert fired at "
+     "95 percent instead of 80, and the runbook did not mention the bucket credentials. Follow-ups: alert on archive "
+     "lag in minutes, lower the disk threshold to 80 percent, add the credential rotation to the secrets checklist, "
+     "and rehearse a full-disk recovery during the next game day. Owner of the follow-ups is the storage team, due "
+     "before the end of the quarter, with a status review at the next reliability meeting. Customer impact was limited "
+     "to 38 minutes of failed card payments; support sent a status note to the 212 affected merchants and finance "
+     "reconciled the retried transactions the same morning, without any manual refunds.",
+     "Why did the main database stop taking payments overnight, and which broken housekeeping task caused it?",
+     "write-ahead log archive job"),
+    ("Orchard notes, Elstar apple block, harvest week. The lower terrace of the orchard sits in a frost pocket: cold "
+     "air drains down the slope on clear still nights and collects between the windbreak hedge and the stone wall, so "
+     "the blossom there was scorched twice this spring while the upper rows were untouched. Fruit set on the lower "
+     "terrace was about a third of the upper terrace. The picking crew started at 07:00 on the upper rows, where the "
+     "sugar reading was 13.8 Brix and the starch iodine test showed an even pattern, and moved down only after lunch. "
+     "Bruising was kept low by using shallow crates and lining them with foam; pickers were told to roll the fruit "
+     "off the spur instead of pulling it. Pollination was helped by two hives of bees placed beside the crab apple "
+     "pollinator trees, which flower at the same time as Elstar. For next year the owner wants to prune the lower "
+     "rows more openly so that air moves through the canopy, plant a late-flowering cultivar in the frost pocket, and "
+     "test a wind machine, because covering the whole terrace with frost fleece costs too much labour. Storage: "
+     "the crop goes into the cold room at 1 degree Celsius with a controlled atmosphere for the winter market. The "
+     "packing shed grades the fruit by size and colour, sends the smallest apples to the juice press and keeps a "
+     "sample box from every row so that next season's pruning can be compared with the measured yield per tree.",
+     "Where on the farm do the flowers get killed by cold nights, and how did that change the crop?",
+     "frost pocket"),
+    ("Quarterly business review, EMEA region, third quarter. Revenue increased twelve percent compared with the same "
+     "quarter last year, reaching 41.6 million euros, driven mostly by Germany and the Nordics where two large "
+     "multi-year contracts started billing in July. The United Kingdom was flat after a pricing change delayed "
+     "renewals by about six weeks. Gross margin improved by 1.4 points to 68.2 percent because the hosting costs per "
+     "customer fell after the migration to the new data center. Net revenue retention was 112 percent, logo churn "
+     "was 2.1 percent, and the average deal size grew from 54 thousand to 61 thousand euros. The pipeline for the "
+     "next quarter stands at 3.1 times the target, with the strongest coverage in financial services and public "
+     "sector accounts. Risks: two public sector tenders have slipped into the following year, a currency swing of "
+     "five percent would remove roughly 0.8 million euros from reported revenue, and hiring for the support team is "
+     "three people behind plan. Decisions requested from leadership: approve four additional account executives for "
+     "the DACH market, confirm the discount policy for renewals above 100 thousand euros, and sign off the revised "
+     "forecast for the board meeting at the end of the month. The customer success team also reported "
+     "that onboarding time fell from 41 to 29 days after the template library was introduced, and that the partner "
+     "channel now sources roughly a fifth of all new logos in the region.",
+     "By how much did sales grow in the European territory during the latest three-month period?",
+     "twelve percent"),
+)
+SEMANTIC_MIN_HITS = 2
+
+
+def _scores_of(rec) -> list[float]:
+    """Best-effort retrieval scores from a memory_recall payload (any nesting; keys containing 'score')."""
+    out: list[float] = []
+
+    def walk(x, depth=0):
+        if depth > 6:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if "score" in str(k) and isinstance(v, (int, float)) and not isinstance(v, bool) \
+                        and not str(k).startswith("min_"):
+                    out.append(round(float(v), 3))
+                else:
+                    walk(v, depth + 1)
+        elif isinstance(x, list):
+            for v in x[:50]:
+                walk(v, depth + 1)
+    walk(rec)
+    return sorted(set(out), reverse=True)[:3]
+
+
+def deep_ingest_check(cfg: dict, probes: Probes) -> list[dict]:
+    """A throwaway session (`doctor-probe-<utc>`) gets THREE separate memory_compact documents of realistic length;
+    then (1) entities > 0 (the :8305 trap: ok=true compactions with an empty graph) and (2) a semantic recall
+    probe: per document, a paraphrase sharing no content word with the marker sentence must still retrieve it.
+    memory_status does NOT identify the embedder reliably (it reports HARS_MEMORY_EMBED_MODEL even when
+    HARS_MEMORY_EMBED_PROVIDER=http serves another model, e.g. a hash shim), so this behavioural probe is the real
+    shim detector. Isolation: the probe only ever writes to its own session id. In HARS_MEMORY_SESSION_MODE=split
+    (the generated env) that is a separate store under sessions/; in `subgraph` mode a compaction is indexed into
+    the MAIN graph, which the compact result reports (`mode`) and this check turns into a FAIL row."""
+    url = cfg["general"]["mcp"]
+    acquire_hars_lock(url)                      # the probe writes to HARS: one client per endpoint
+    sid = f"doctor-probe-{utc_stamp()}"
+    rows: list[dict] = []
+    try:
+        modes = set()
+        for i, (doc, _, _) in enumerate(SEMANTIC_PROBES, 1):
+            r = probes.mcp(url, "memory_compact", {"session_id": sid, "summary": doc, "seq": i,
+                                                   "metadata": {"source": "doctor-probe", "probe_doc": i}}, 900)
+            if isinstance(r, dict) and r.get("ok") is False:
+                raise RuntimeError(f"memory_compact doc {i} ok=false: {str(r)[:160]}")
+            if isinstance(r, dict) and r.get("mode"):
+                modes.add(str(r["mode"]))
+        if "subgraph" in modes:
+            rows.append(check_row("hars.probe_isolation", "FAIL",
+                                  f"the server is in session mode 'subgraph': the doctor probe session {sid} was indexed "
+                                  "into the MAIN graph (doc ids session:" + sid + ":c1..c3). Remove them and run the "
+                                  "eval against a throwaway data dir with HARS_MEMORY_SESSION_MODE=split"))
+        else:
+            rows.append(check_row("hars.probe_isolation", "OK" if "split" in modes else "WARN",
+                                  f"probe session {sid} only (session mode {','.join(sorted(modes)) or 'not reported'}: "
+                                  "split = its own store under sessions/, the main index is untouched)"))
+        st = probes.mcp(url, "memory_session_status", {"session_id": sid}, 60)
+        ent = int((st or {}).get("entities") or 0)
+        vec = (st or {}).get("vectors_indexed")
+        if ent > 0 and (vec is None or int(vec) > 0):
+            rows.append(check_row("hars.deep_ingest", "OK", f"entities={ent} vectors_indexed={vec} for {sid}"))
+        else:
+            rows.append(check_row("hars.deep_ingest", "FAIL", f"compact ok but entities={ent} vectors_indexed={vec}: the "
+                                  "server's extractor/embedder path is dead (empty graph) - check HARS_MEMORY_EXTRACTOR_*"))
+        hits, detail = 0, []
+        for i, (_, q, want) in enumerate(SEMANTIC_PROBES, 1):
+            rec = probes.mcp(url, "memory_recall", {"session_id": sid, "question": q, "top_k": 4}, 120)
+            ok = want in str((rec or {}).get("context") or "")
+            hits += ok
+            detail.append(f"doc{i} {'hit' if ok else 'MISS'} {want!r} scores={_scores_of(rec)}")
+        if hits >= SEMANTIC_MIN_HITS:
+            rows.append(check_row("hars.semantic_probe", "OK", f"{hits}/{len(SEMANTIC_PROBES)} zero-overlap paraphrase queries "
+                                  f"retrieved their document: the embedder is semantic ({'; '.join(detail)})"))
+        else:
+            rows.append(check_row("hars.semantic_probe", "FAIL",
+                                  f"only {hits}/{len(SEMANTIC_PROBES)} zero-overlap paraphrase queries retrieved their "
+                                  f"document ({'; '.join(detail)}): the embedder is lexical/hash-like (a shim?) or broken. NOT "
+                                  "decision-grade; start HARS with the real embedder (HARS_MEMORY_EMBED_*)"))
+    except Exception as e:  # noqa: BLE001
+        rows.append(check_row("hars.deep_ingest", "FAIL", f"{type(e).__name__}: {str(e)[:160]}"))
+    return rows
+
+
+def print_doctor(rows: list[dict]) -> int:
+    width = max(len(r["check"]) for r in rows)
+    for r in rows:
+        print(f"[{r['status']:4s}] {r['check']:<{width}}  {r['detail']}")
+    n = {s: sum(1 for r in rows if r["status"] == s) for s in ("OK", "WARN", "FAIL")}
+    print(f"\ndoctor: {n['OK']} ok, {n['WARN']} warn, {n['FAIL']} FAIL")
+    return 1 if n["FAIL"] else 0
+
+
+def hars_env_block(cfg: dict) -> list[str]:
+    prof = P.load_profile(cfg["general"]["profile"])
+    lines = P.hars_env(prof, P.resolve_models(prof, {}), cfg["general"].get("key_env") or None)
+    h = cfg["hars"]
+    root = h.get("data_dir") or "<HARS_DATA_DIR>"
+    lines += ["",
+              "# --- session-mode / engine settings of these runs (same as the build container's :8307 server) ---",
+              f"export HARS_MEMORY_INDEX_DIR={root}/index HARS_MEMORY_STAGING_DIR={root}/staging",
+              f"export HARS_MEMORY_SESSION_MODE=split HARS_MEMORY_SESSIONS_DIR={root}/sessions HARS_MEMORY_SESSION_INDEX_BS=25",
+              "export HARS_MEMORY_VECTOR_STORAGE=NanoVectorDBStorage HARS_MEMORY_GRAPH_STORAGE=NetworkXStorage",
+              "export HARS_MEMORY_RERANK_BACKEND=off HARS_MEMORY_AUTH_ENABLED=0",
+              f"export HARS_MEMORY_MCP_HTTP_HOST=127.0.0.1 HARS_MEMORY_MCP_HTTP_PORT={h.get('port', 8307)} HARS_MEMORY_MCP_HTTP_JSON_RESPONSE=1",
+              "export HARS_MEMORY_MCP_ENGINE_THREADS=1 HARS_MEMORY_MCP_ENGINE_QUEUE=32 HARS_MEMORY_MCP_ENGINE_QUEUE_TIMEOUT_MS=600000",
+              "# the REAL embedder (C.1-3), e.g. local sentence-transformers or an HTTP embedding server:",
+              "#   export HARS_MEMORY_EMBED_MODEL=intfloat/e5-large-v2 HARS_MEMORY_EMBED_LOCAL_FILES_ONLY=1   # config/.env.example",
+              "# then:  uv run hars-longterm-memory-mcp-https      # and `home_run.py doctor` must show a non-shim embedder id"]
+    return lines
+
+
+# =============================================================================
+# shared argument builders
+# =============================================================================
+def profile_args(cfg: dict) -> list[str]:
+    if cfg["general"].get("_offline"):
+        return ["--provider", "mock"]
+    a = ["--profile", cfg["general"]["profile"]]
+    if cfg["general"].get("key_env"):
+        a += ["--key-env", cfg["general"]["key_env"]]
+    return a
+
+
+def judge_unit_usd(cfg: dict) -> float:
+    prof = P.load_profile(cfg["general"]["profile"])
+    m = P.resolve_models(prof, {})["judge"]
+    c = prof.cost_usd(m, JUDGE_IN_TOK, JUDGE_OUT_TOK)
+    return c if c is not None else 0.0
+
+
+def budgets_arg(budgets) -> str:
+    return ",".join(str(int(b)) for b in budgets)
+
+
+# =============================================================================
+# estimates (dry-run), parsers of the underlying scripts' dry-run output
+# =============================================================================
+def parse_chainreplay_dry(text: str) -> dict:
+    m = re.search(r"TOTAL over the sweep: (\d+) compactions, (\d+) asks, ~([\d.]+) min, ~\$([\d.]+)", text)
+    if not m:
+        m = re.search(r"TOTAL projected: (\d+) compactions, (\d+) asks, ~([\d.]+) min, \$([\d.]+)", text)
+    if not m:
+        raise HomeRunError("could not find the TOTAL projected line in run_chainreplay --dry-run output")
+    per_chain = {}
+    for blk in re.split(r"(?m)^== ", text)[1:]:
+        cid = blk.split("\n", 1)[0].strip()
+        pm = re.search(r"projected cost: .*?= \$([\d.]+)", blk)
+        if pm:
+            per_chain[cid] = float(pm.group(1))
+    cm = re.search(r"prompt cache (ON|off): projected saving vs uncached \$([\d.]+)", text)
+    return {"compactions": int(m.group(1)), "asks": int(m.group(2)), "minutes": float(m.group(3)),
+            "usd": float(m.group(4)), "per_chain_usd_single_b": per_chain,
+            "cache_on": bool(cm and cm.group(1) == "ON"), "cache_saving_single_b": float(cm.group(2)) if cm else 0.0}
+
+
+def parse_gen_dry(text: str) -> float:
+    m = re.search(r"DRY RUN total estimate \$([\d,.]+)", text)
+    return float(m.group(1).replace(",", "")) if m else 0.0
+
+
+def ls_dry_summary(res: dict, n_budgets: int, judge_unit: float, only_arm: str | None = None, reused: bool = False) -> dict:
+    """run_longsession --dry-run --json -> run usd, judged items, wall-clock model. only_arm: count the asks (= judge
+    items) of that arm only (Amendment C.7 reuse: the other arms' rows exist already); reused: no ingest, no summaries."""
+    asks = 0
+    boundaries = 0
+    ingest_h = 0.0
+    for s in res.get("sessions", []):
+        boundaries += int(s.get("boundaries") or 0)
+        ingest_h += float((s.get("hars") or {}).get("est_ingest_hours") or 0.0)
+        for B, d in (s.get("per_budget") or {}).items():
+            asks += sum(int(v) for k, v in (d.get("asks") or {}).items() if only_arm is None or k == only_arm)
+    llm_h = ((boundaries * 30.0 if reused else boundaries * n_budgets * 2 * LLM_S_PER_SUMMARY) + asks * LLM_S_PER_ASK) / 3600.0
+    return {"run_usd": float(res.get("grand_total_usd") or 0.0), "sessions": len(res.get("sessions", [])),
+            "boundaries": boundaries, "asks": asks, "judged_items": asks, "judge_usd": asks * judge_unit,
+            "wall_hours": ingest_h + llm_h, "ingest_hours": ingest_h,
+            "cache_saving_usd": float(res.get("grand_cache_saving_usd") or 0.0),
+            "unpriced_models": res.get("unpriced_models", [])}
+
+
+def placeholder_session(session: dict, n_q: int) -> dict:
+    """Dry-run only: give a question-less session n_q placeholder questions spread over its first
+    80% so the cost estimate has asks to count."""
+    s = json.loads(json.dumps(session))
+    n = len(s["messages"])
+    s["questions"] = []
+    for k in range(n_q):
+        i = int((k + 0.5) * 0.8 * n / max(1, n_q))
+        s["questions"].append({"qid": f"{s['sid']}_ph{k}", "qtype": "single", "answerable": True,
+                               "question": f"Which value did the step at message {i} report for the "
+                                           "identifier named in that step?",
+                               "answer": "x", "evidence": [{"msg_idx": min(i, n - 1)}]})
+    return s
+
+
+def oh_exclusions(camp: Campaign) -> list[str]:
+    """Chain ids kept OUT of the decision set: the calibration chain(s) (Amendment C.4)."""
+    cal = read_json(camp.p(CAL_FILE), None) or {}
+    return list(cal.get("excluded_from_decision_set") or [])
+
+
+def oh_all_chains(camp: Campaign) -> list[dict]:
+    oh_inputs(camp)
+    return read_jsonl(camp.p("oh", "inputs", "chains.all.jsonl"))
+
+
+def oh_inputs(camp: Campaign) -> str:
+    """Copy chains.jsonl (+ manifests) of the OH artifact dir into the campaign; returns the DECISION-SET
+    chains path (`oh/inputs/chains.jsonl` = chains.all.jsonl minus the calibration chain, Amendment C.4)."""
+    dst = camp.p("oh", "inputs", "chains.jsonl")
+    allp = camp.p("oh", "inputs", "chains.all.jsonl")
+    if not os.path.isfile(allp) and os.path.isfile(dst):         # campaign from before C.4
+        shutil.copy2(dst, allp)
+    if not os.path.isfile(allp):
+        src_dir = camp.cfg["oh"].get("artifact_dir")
+        if not src_dir or not os.path.isfile(os.path.join(src_dir, "chains.jsonl")):
+            raise HomeRunError("[oh] artifact_dir (or --oh-dir) must be the copied OpenHands artifact dir holding "
+                               "chains.jsonl (HOME-RUNBOOK.md step 4)")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        chains = read_jsonl(os.path.join(src_dir, "chains.jsonl"))
+        if not chains:
+            raise HomeRunError(f"{src_dir}/chains.jsonl is empty")
+        for fn in ("chains.jsonl", "chains-manifest.json", "verify-report.md", "MANIFEST.json", "dataset_stats.md"):
+            s_ = os.path.join(src_dir, fn)
+            if os.path.isfile(s_):
+                shutil.copy2(s_, os.path.join(os.path.dirname(dst), fn))
+        shutil.copy2(dst, allp)
+        types: dict[str, int] = {}
+        for c in chains:
+            for q in c.get("qa", []):
+                k = ("unanswerable" if not q.get("answerable", True) else (q.get("qtype") or "single"))
+                types[k] = types.get(k, 0) + 1
+        write_json(camp.p("inputs", "oh_inputs.json"), {
+            "source_dir": os.path.abspath(src_dir), "chains": len(chains), "qa_by_type": types,
+            "sha256": {"chains.jsonl": sha256_file(allp)},
+            "note": "stored qtype 'multihop' is analysed as xspan_locator (Amendment C.2)"})
+        print(f"  OH inputs: {len(chains)} chains, qa by stored type {types}, sha256 {sha256_file(allp)[:12]}")
+    excl = set(oh_exclusions(camp))
+    allc = read_jsonl(allp)
+    want = [c for c in allc if c["chain_id"] not in excl]
+    have = [c["chain_id"] for c in read_jsonl(dst)] if os.path.isfile(dst) else None
+    if have != [c["chain_id"] for c in want]:
+        with open(dst, "w") as f:
+            for c in want:
+                f.write(json.dumps(c, ensure_ascii=False) + "\n")
+        meta = read_json(camp.p("inputs", "oh_inputs.json"), {}) or {}
+        meta.update({"decision_set_chains": len(want), "excluded_from_decision_set": sorted(excl),
+                     "sha256_decision_set": sha256_file(dst)})
+        write_json(camp.p("inputs", "oh_inputs.json"), meta)
+        if excl:
+            print(f"  OH decision set: {len(want)} of {len(allc)} chains (calibration chain {sorted(excl)} excluded)")
+    if not want:
+        raise HomeRunError("no chains left in the OH decision set after excluding the calibration chain "
+                           f"{sorted(excl)}")
+    return dst
+
+
+def beam_selection(cfg: dict) -> dict | None:
+    """Deterministic, seeded N-chat sample of BEAM (Amendment C.3-2); None when chats != "sample".
+    Population = the numeric chat dirs under chats/<size>/, sorted; random.Random("<seed>:<size>").sample;
+    the result is sorted and recorded BEFORE any run (beam/selection.json)."""
+    b = cfg["beam"]
+    if str(b.get("chats") or "all") != "sample":
+        return None
+    size = str(b["size"])
+    d = os.path.join(b.get("repo") or "", "chats", size)
+    if not os.path.isdir(d):
+        raise HomeRunError(f"BEAM chats dir not found: {d} ([beam] repo must be a BEAM checkout)")
+    pop = sorted(int(x) for x in os.listdir(d) if x.isdigit() and os.path.isdir(os.path.join(d, x)))
+    n = int(b.get("n_chats") or 10)
+    seed = b.get("seed", 20261026)
+    sel = sorted(random.Random(f"{seed}:{size}").sample(pop, n)) if n < len(pop) else list(pop)
+    return {"method": 'sorted(random.Random(f"{seed}:{size}").sample(sorted(population), n))', "seed": seed,
+            "size": size, "n": n, "population": pop, "selected": sel, "protocol": "Amendment C.3-2"}
+
+
+def beam_import(camp: Campaign, step: str = "beam.import") -> str:
+    b = camp.cfg["beam"]
+    data = camp.p("beam", "data")
+
+    def go():
+        if not b.get("repo") or not os.path.isdir(os.path.join(b["repo"], "chats")):
+            raise HomeRunError("[beam] repo must be a BEAM checkout (git clone "
+                               "https://github.com/mohammadtavakoli78/BEAM) containing chats/")
+        if os.path.isdir(data) and os.listdir(data):
+            camp.quarantine(data)
+        sel = beam_selection(camp.cfg)
+        if sel:
+            write_json(camp.p("beam", "selection.json"), sel)
+            print(f"  BEAM sample (seed {sel['seed']}): {len(sel['selected'])} of {len(sel['population'])} chats "
+                  f"{sel['selected']} -> beam/selection.json")
+        argv = [camp.script("import_beam.py"), "--repo", b["repo"], "--size", str(b["size"]), "--out", data,
+                "--chats", ",".join(str(x) for x in sel["selected"]) if sel else str(b.get("chats") or "all")]
+        if int(b.get("limit") or 0):
+            argv += ["--limit", str(int(b["limit"]))]
+        camp.run(step, argv, isolated=True)
+        n = len([f for f in os.listdir(data) if f.endswith((".json", ".jsonl"))]) if os.path.isdir(data) else 0
+        exp = BEAM_EXPECTED.get(str(b["size"]))
+        warn = ""
+        if exp and not sel and str(b.get("chats") or "all") == "all" and not int(b.get("limit") or 0) and n != exp:
+            warn = f"BEAM {b['size']} has {exp} chats per the dataset description, the import found {n}"
+            print("  WARNING " + warn)
+        return {"sessions": n, "expected": exp, "warning": warn}
+    camp.step(step, go)
+    return data
+
+
+def cc_import(camp: Campaign, step: str = "cc.import") -> str:
+    c = camp.cfg["cc"]
+    data = camp.p("cc", "data")
+
+    def go():
+        paths = [os.path.expanduser(p) for p in (c.get("paths") or [])]
+        if not paths or not all(os.path.exists(p) for p in paths):
+            raise HomeRunError("[cc] paths must list existing Claude Code transcript files/dirs "
+                               "(e.g. ~/.claude/projects/<proj>); redaction stays ON")
+        if os.path.isdir(data) and os.listdir(data):
+            camp.quarantine(data)
+        argv = [camp.script("import_claude_code.py"), *paths, "--out", data,
+                "--min-tokens", str(int(c.get("min_tokens") or 0))]
+        if int(c.get("limit") or 0):
+            argv += ["--limit", str(int(c["limit"]))]
+        rc, text = camp.run(step, argv, isolated=True, check=False)
+        red = re.findall(r"redaction: .*", text)
+        if rc != 0:
+            skipped = re.findall(r"\[skip\] .*", text)
+            raise HomeRunError(f"no Claude Code session survived the import (exit {rc}): {skipped[:4] or 'see the log'}. "
+                               f"Lower [cc] min_tokens (now {c.get('min_tokens')}) or point [cc] paths at longer sessions; "
+                               "the real-compaction runs need sessions that contain /compact boundaries.")
+        n = len([f for f in os.listdir(data) if f.endswith((".json", ".jsonl"))]) if os.path.isdir(data) else 0
+        print(f"  imported {n} session(s); " + (red[-1] if red else "redaction report: see the step log"))
+        return {"sessions": n, "redaction_lines": red[-5:], "redaction": "ON (never disabled by home_run)"}
+    camp.step(step, go)
+    return data
+
+
+def estimate_oh(camp: Campaign) -> dict:
+    """Amendment C.6: the OH projection is run_longsession's own (converted sessions, real synthetic boundaries,
+    end checkpoint) + the parity check; `--legacy-replay` keeps the pi replay projection (run_chainreplay)."""
+    if getattr(camp, "legacy_replay", False):
+        return estimate_oh_legacy(camp)
+    data = oh_convert(camp)
+    b = [int(x) for x in camp.cfg["oh"]["budgets"]]
+    s = estimate_ls(camp, "oh", data, b, "end", True, extra=oh_ls_extra(camp.cfg))
+    pd = oh_parity_data(camp)
+    p = estimate_ls(camp, "oh", pd, [max(b)], "end", True, extra=oh_ls_extra(camp.cfg), tag=".parity")
+    return {"track": "oh", "gen_usd": 0.0, "run_usd": s["run_usd"] + p["run_usd"], "judge_usd": s["judge_usd"],
+            "judged_items": s["judged_items"], "wall_hours": s["wall_hours"] + p["wall_hours"], "budgets": b,
+            "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": s["ingest_hours"],
+            "parity_check_usd": p["run_usd"], "main_run_usd": s["run_usd"],
+            "unpriced_models": s["unpriced_models"], "cache_saving_usd": s.get("cache_saving_usd", 0.0),
+            "note": "run_longsession projection (summariser + HARS extraction ESTIMATE + asks) incl. the parity "
+                    f"check ({p['sessions']} session); HARS ingest wall-clock uses 11 s/piece (a guess)"}
+
+
+def estimate_oh_legacy(camp: Campaign) -> dict:
+    chains = oh_inputs(camp)
+    b = camp.cfg["oh"]["budgets"]
+    rc, text = camp.run("dry.oh", [camp.script("run_chainreplay.py"), "--dry-run", "--chains", chains,
+                                   *profile_args(camp.cfg), "--allow-same-family-judge",
+                                   "--mem-budgets", budgets_arg(b), "--budget-usd", "100000",
+                                   "--mcp", camp.cfg["general"]["mcp"], "--require-no-clip"], check=False)
+    if rc != 0:
+        raise HomeRunError("run_chainreplay --dry-run failed; see logs/dry.oh.log")
+    d = parse_chainreplay_dry(text)
+    ju = judge_unit_usd(camp.cfg)
+    return {"track": "oh", "gen_usd": 0.0, "run_usd": d["usd"], "judge_usd": d["asks"] * ju,
+            "judged_items": d["asks"], "wall_hours": d["minutes"] / 60.0, "budgets": b,
+            "cache_saving_usd": d["cache_saving_single_b"] * len(b),
+            "chains": len(read_jsonl(chains)), "per_chain_usd_single_b": d["per_chain_usd_single_b"],
+            "note": "run = pi agent turns + flagged HARS/keyword estimates (run_chainreplay projection)"}
+
+
+def parse_json_block(text: str) -> dict:
+    """The JSON object a script printed (indent=1, so its first line is a lone '{'), after any
+    log lines that the merged stdout/stderr stream may carry."""
+    i = text.rfind("\n{\n")
+    i = i + 1 if i >= 0 else (0 if text.startswith("{\n") else -1)
+    if i < 0:
+        raise HomeRunError("no JSON object in the script output")
+    return json.loads(text[i:text.rindex("}") + 1])
+
+
+def estimate_ls(camp: Campaign, track: str, data: str, budgets, checkpoints: str, real: bool,
+                extra: list[str] | None = None, tag: str = "", only_arm: str | None = None, reused: bool = False) -> dict:
+    argv = [camp.script("run_longsession.py"), "--sessions", data, "--dry-run", "--json",
+            *profile_args(camp.cfg), "--mem-budgets", budgets_arg(budgets), "--checkpoints", checkpoints,
+            "--budget-usd", "1000000"] + (["--use-real-compactions"] if real else []) + (extra or [])
+    rc, text = camp.run(f"dry.{track}{tag}", argv, check=False)
+    if rc != 0:
+        raise HomeRunError(f"run_longsession --dry-run failed for {track}; see logs/dry.{track}{tag}.log")
+    res = parse_json_block(text)
+    return ls_dry_summary(res, len(budgets), judge_unit_usd(camp.cfg), only_arm, reused)
+
+
+def estimate_beam(camp: Campaign) -> dict:
+    data = beam_import(camp)
+    b = camp.cfg["beam"]
+    s = estimate_ls(camp, "beam", data, b["budgets"], b["checkpoints"], False, extra=list(b.get("extra_args") or []))
+    return {"track": "beam", "gen_usd": 0.0, "run_usd": s["run_usd"], "judge_usd": s["judge_usd"],
+            "judged_items": s["judged_items"], "wall_hours": s["wall_hours"], "budgets": b["budgets"],
+            "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": s["ingest_hours"],
+            "unpriced_models": s["unpriced_models"], "cache_saving_usd": s.get("cache_saving_usd", 0.0),
+            "selection": (beam_selection(camp.cfg) or {}).get("selected"),
+            "note": "HARS ingest wall-clock uses 11 s/piece (a guess: calibrate on the first session)"}
+
+
+def estimate_cc(camp: Campaign) -> dict:
+    data = cc_import(camp)
+    c = camp.cfg["cc"]
+    import longsession as L  # noqa: PLC0415
+    sessions = L.load_sessions([data])
+    if not sessions:
+        raise HomeRunError("no Claude Code session survived the import filters (--min-tokens?)")
+    with_c = [s for s in sessions if s.get("compactions")]
+    print(f"  {len(with_c)} of {len(sessions)} imported session(s) contain real compactions (only those can run)")
+    if not with_c:
+        raise HomeRunError("no imported Claude Code session contains a real /compact boundary: the cc track "
+                           "(--use-real-compactions, `orig` arm) needs sessions that were compacted by Claude Code")
+    dry = camp.p("cc", "dry-data")
+    shutil.rmtree(dry, ignore_errors=True)
+    nq = int(c["n_single"]) + int(c["n_multihop"]) + int(c.get("n_unanswerable", 4))
+    for s in sessions:
+        if s.get("compactions"):
+            L.save_session(placeholder_session(s, nq), dry)
+    gen_usd = 0.0
+    if os.path.isdir(dry):
+        _, gtext = camp.run("dry.cc.gen", [camp.script("gen_longsession_qa.py"), "--sessions", data,
+                                           "--out", camp.p("cc", "dry-gen"), *profile_args(camp.cfg),
+                                           "--use-real-compactions", "--n-single", str(c["n_single"]),
+                                           "--n-multihop", str(c["n_multihop"]),
+                                           "--n-unanswerable", str(c.get("n_unanswerable", 4)), "--dry-run",
+                                           "--budget-usd", "1000000"], check=False)
+        gen_usd = parse_gen_dry(gtext)
+        s = estimate_ls(camp, "cc", dry, c["budgets"], c["checkpoints"], True,
+                        extra=(["--max-questions", str(c["max_questions"])] if c.get("max_questions") else [])
+                        + list(c.get("extra_args") or []))
+    else:
+        s = {"run_usd": 0.0, "judge_usd": 0.0, "judged_items": 0, "wall_hours": 0.0, "sessions": 0,
+             "boundaries": 0, "unpriced_models": []}
+    return {"track": "cc", "gen_usd": gen_usd, "run_usd": s["run_usd"], "judge_usd": s["judge_usd"],
+            "judged_items": s["judged_items"], "wall_hours": s["wall_hours"], "budgets": c["budgets"],
+            "sessions": s["sessions"], "sessions_imported": len(sessions), "cache_saving_usd": s.get("cache_saving_usd", 0.0),
+            "note": "questions are placeholders (n_single+n_multihop+n_unanswerable per session, real boundaries, "
+                    "orig arm included); QA generation is an upper-ish bound (max calls)"}
+
+
+def dry_run_report(camp: Campaign, tracks: list[str]) -> dict:
+    est: dict[str, dict] = {}
+    for t in tracks:
+        try:
+            est[t] = {"oh": estimate_oh, "beam": estimate_beam, "cc": estimate_cc}[t](camp)
+        except HomeRunError as e:
+            if t == "cc" and not camp.cfg["cc"].get("paths"):
+                # no session picked yet: carry the typical one-session figures of HOME-RUNBOOK section 0 so the
+                # all-tracks total is not understated (replaced by the real estimate after `cc --find/--session-id`)
+                est[t] = {"track": "cc", "gen_usd": CC_TYPICAL["gen"], "run_usd": CC_TYPICAL["run"],
+                          "judge_usd": CC_TYPICAL["judge"], "judged_items": 0, "wall_hours": 2.5, "cache_saving_usd": 0.0,
+                          "assumed": True, "note": "TYPICAL one session (none picked yet: use `cc --find TEXT` / "
+                                                   "`cc --list`); run `dry-run --find TEXT` for the real figure"}
+            else:
+                est[t] = {"track": t, "skipped": str(e)}
+    lines = ["track  | gen est   | run est    | judge est | total      | wall-clock | caps gen/run/judge   | check",
+             "-------+-----------+------------+-----------+------------+------------+----------------------+------"]
+    grand = {"gen": 0.0, "run": 0.0, "judge": 0.0}
+    for t in tracks:
+        e = est[t]
+        if e.get("skipped"):
+            lines.append(f"{t:<6} | skipped: {e['skipped'][:100]}")
+            continue
+        caps = {ph: cap_for(camp.cfg, t, ph) for ph in PHASES}
+        over = [ph for ph in PHASES if caps[ph] > 0 and e[f"{ph}_usd"] > caps[ph]]
+        unset = [ph for ph in PHASES if e[f"{ph}_usd"] > 0 and caps[ph] <= 0]
+        chk = "OVER " + ",".join(over) if over else ("NO CAP " + ",".join(unset) if unset else "ok")
+        for ph in PHASES:
+            grand[ph] += e[f"{ph}_usd"]
+        tot = e["gen_usd"] + e["run_usd"] + e["judge_usd"]
+        e["total_usd"] = tot
+        e["caps"] = caps
+        e["check"] = chk
+        lines.append(f"{t:<6} | {fmt_usd(e['gen_usd']):>9} | {fmt_usd(e['run_usd']):>10} | "
+                     f"{fmt_usd(e['judge_usd']):>9} | {fmt_usd(tot):>10} | {e['wall_hours']:>7.1f} h  | "
+                     f"{caps['gen']:>6.2f}/{caps['run']:>6.2f}/{caps['judge']:>6.2f} | {chk}")
+    lines.append(f"TOTAL  | {fmt_usd(grand['gen']):>9} | {fmt_usd(grand['run']):>10} | {fmt_usd(grand['judge']):>9} |"
+                 f" {fmt_usd(sum(grand.values())):>10} |")
+    total = sum(grand.values())
+    tcap = float(camp.cfg["caps"].get("total") or 0.0)
+    ceiling = tcap if tcap > 0 else BUDGET_TOTAL_DEFAULT
+    saving = sum(float(est[t].get("cache_saving_usd") or 0.0) for t in tracks if not est[t].get("skipped"))
+    verdict = (f"OK (headroom {fmt_usd(ceiling - total)})" if total <= ceiling else
+               f"OVER by {fmt_usd(total - ceiling)}: narrow the tracks / lower BEAM n_chats / skip the sweep")
+    skipped = [t for t in tracks if est[t].get("skipped")]
+    if skipped:
+        lines += ["", f"!!! the total EXCLUDES the skipped track(s) {skipped} (inputs missing, see above): fix the inputs and "
+                      "re-run dry-run before trusting it"]
+    assumed = [t for t in tracks if est[t].get("assumed")]
+    if assumed:
+        lines += [f"NOTE {assumed}: typical one-session figures, not your data (pick a session: dry-run --find TEXT)"]
+    lines += ["", f"ALL TRACKS TOTAL {fmt_usd(total)} vs {fmt_usd(ceiling)} total budget "
+                  f"({'[caps] total' if tcap > 0 else 'default ceiling, set [caps] total'}): {verdict}",
+              f"  by phase vs the campaign-wide caps: "
+              + ", ".join(f"{ph} {fmt_usd(grand[ph])}/{fmt_usd(float(camp.cfg['caps'].get(ph) or 0))}" for ph in PHASES),
+              f"  prompt cache (Amendment C.3, cost-only) is already inside the numbers above; estimated saving vs "
+              f"uncached {fmt_usd(saving)} (the dry runs of the scripts price cache writes/reads; summariser "
+              "and compaction calls are not cached)"]
+    lines += ["", f"judge unit: {JUDGE_IN_TOK} in / {JUDGE_OUT_TOK} out tokens per judged item at the profile's judge "
+                  f"price ({fmt_usd(judge_unit_usd(camp.cfg))} per item); wall-clock = the runners' own model "
+                  f"(OH) or ingest + {LLM_S_PER_SUMMARY:.0f}s/summary + {LLM_S_PER_ASK:.0f}s/ask (long-session).",
+              "caps are HARD limits: the runners stop at them (BUDGET STOP); a run above its cap is refused "
+              "unless --accept-partial."]
+    text = "\n".join(lines)
+    print("\n" + text)
+    out = {"ts": utc_iso(), "profile": camp.cfg["general"]["profile"], "estimates": est,
+           "total_budget_usd": ceiling, "within_total_budget": total <= ceiling, "cache_saving_usd": round(saving, 4),
+           "grand_total_usd": round(sum(grand.values()), 4), "by_phase": {k: round(v, 4) for k, v in grand.items()}}
+    write_json(camp.p("dry-run.json"), out)
+    with open(camp.p("dry-run.md"), "w") as f:
+        f.write("# home_run dry-run\n\n```\n" + text + "\n```\n")
+    return out
+
+
+def guard_estimate(camp: Campaign, track: str, est: dict, accept_partial: bool) -> None:
+    """Refuse a paid run whose estimate exceeds its run cap unless --accept-partial."""
+    cap = cap_for(camp.cfg, track, "run")
+    if cap > 0 and est["run_usd"] > cap and not accept_partial:
+        raise HomeRunError(f"{track}: estimated run cost {fmt_usd(est['run_usd'])} > run cap {fmt_usd(cap)}. The run "
+                           "would stop at the cap (B-major order keeps the primary B=1536 cell first). Raise the cap, "
+                           "narrow [<track>] budgets, or pass --accept-partial.")
+
+
+# =============================================================================
+# spend readers (ledger entries come from the artifacts the scripts wrote)
+# =============================================================================
+def chainreplay_spend(out: str) -> tuple[float, str]:
+    man = read_json(os.path.join(out, "run_manifest.json"), {}) or {}
+    sp = (man.get("spend") or {}).get("spent_usd")
+    if sp is not None:
+        return float(sp), "run_manifest.json spend.spent_usd (measured pi usage + flagged HARS/keyword estimates)"
+    rows = read_jsonl(os.path.join(out, "records.jsonl"))
+    lo = sum(float(r.get("cost_usd") or 0.0) for r in rows if isinstance(r.get("cost_usd"), (int, float)))
+    return lo, "LOWER BOUND from records.jsonl (the run ended without a final manifest: it crashed or was killed)"
+
+
+def longsession_spend(out: str) -> tuple[float, str]:
+    man = read_json(os.path.join(out, "MANIFEST.json"), {}) or {}
+    if man.get("budget_spent_all_invocations") is not None:
+        return float(man["budget_spent_all_invocations"]), "MANIFEST.json budget_spent_all_invocations"
+    comps = read_jsonl(os.path.join(out, "compactions.jsonl"))
+    rows = read_jsonl(os.path.join(out, "records.jsonl"))
+    lo = sum(float(c.get("cost_usd") or 0.0) for c in comps if not c.get("cached")) \
+        + sum(float(r.get("cost_usd") or 0.0) for r in rows)
+    return lo, "LOWER BOUND from compactions/records (no final MANIFEST: crashed or killed; HARS extraction estimate missing)"
+
+
+def genqa_spend(out: str) -> tuple[float, str]:
+    raw = read_jsonl(os.path.join(out, "qa-raw.jsonl"))
+    return sum(float(r.get("cost_usd") or 0.0) for r in raw), "qa-raw.jsonl cost_usd (every call, cumulative)"
+
+
+def judge_spend_from_text(text: str) -> float | None:
+    """Spend of a judge_v2 run from its output. Three forms (the LAST of the first kind wins):
+      * `judge spend: $X over N calls` - a finished run, and (since C.10) also an ABORTED one;
+      * `budget $L exhausted (spent $X over N calls)` / `judge budget exhausted after N calls: ... (spent $X ...)` - the abort message
+        of judge_v2 before C.10. The C.9 run booked $0.0 for its aborted first judge run ($1.0968 over 222 calls) because only the
+        first form was parsed and the abort path printed only the second."""
+    ms = re.findall(r"judge spend: \$([\d.]+) over (\d+) calls", text)
+    if ms:
+        return float(ms[-1][0])
+    ma = re.findall(r"spent \$([\d.]+)\s+over\s+(\d+)\s+calls", text)
+    return float(ma[-1][0]) if ma else None
+
+
+def judge_spend_of_run(judged: str, text: str) -> tuple[float, str]:
+    """(usd, how) of a judge run, aborted or not: the sidecar judge_v2 keeps on disk (<out>.spend.json, rewritten every 10 judgments
+    and at the end) and the printed line; the larger one wins (a killed run has only the sidecar, a crashed one only the line)."""
+    side = None
+    sp = read_json(judged + ".spend.json", None)
+    if isinstance(sp, dict) and sp.get("usd") is not None:
+        side = float(sp["usd"])
+    line = judge_spend_from_text(text)
+    vals = [v for v in (side, line) if v is not None]
+    if not vals:
+        return 0.0, "UNKNOWN: no spend line and no sidecar (the judge may have spent money; check the provider dashboard)"
+    how = ("sidecar " + str(sp.get("status"))) if (side is not None and side >= (line or 0.0)) else "printed line"
+    return max(vals), how
+
+
+# =============================================================================
+# judge / metrics steps shared by the tracks
+# =============================================================================
+def judge_step(camp: Campaign, track: str, tag: str, judge_in: str, judged: str, mapping: str,
+               accept_partial: bool = False, cap_override: float | None = None, step: str | None = None,
+               extra_args: list[str] | None = None) -> dict:
+    n = sum(1 for _ in open(judge_in)) if os.path.isfile(judge_in) else 0
+    unit = judge_unit_usd(camp.cfg)
+    est = n * unit
+    rem = cap_override if cap_override is not None else camp.remaining(track, "judge")
+    if est > rem and not accept_partial:
+        raise HomeRunError(f"{track}: judging {n} item(s) is estimated at {fmt_usd(est)} but only {fmt_usd(rem)} of the "
+                           "judge cap is left; judge_v2 stops at the cap and a partial verdict set is NOT usable for "
+                           "paired analysis. Raise [caps] judge or pass --accept-partial.")
+    if os.path.isfile(judged):
+        camp.quarantine(judged)
+    argv = [camp.script("judge_v2.py"), "--in", judge_in, "--out", judged, "--mapping", mapping,
+            *profile_args(camp.cfg), "--allow-same-family-judge", "--budget-usd", str(rem)] + list(extra_args or [])
+    partial = judged + ".partial"
+    if os.path.isfile(partial):                               # an aborted run's verdicts are kept, not paid for twice
+        argv += ["--resume-partial", partial]
+        print(f"[judge] resuming from the verdicts of an aborted run: {partial}")
+    for stale in (judged + ".spend.json",):
+        if os.path.isfile(stale):
+            os.replace(stale, stale + f".{utc_stamp()}")
+    step = step or f"{track}.judge"
+    rc, text = camp.run(step, argv, check=False)
+    spent, how = judge_spend_of_run(judged, text)
+    # booked EVEN WHEN the run aborted (rc != 0): C.9 booked $0.0 for an aborted run that had spent $1.0968
+    camp.charge(track, "judge", step, spent, source=judged + "#" + utc_stamp() + f".{time.time_ns() % 10 ** 6:06d}",
+                note=f"{n} items; {how}" + (f"; ABORTED rc={rc}" if rc != 0 else ""))
+    if rc != 0 or not os.path.isfile(judged):
+        raise HomeRunError(f"judging failed or hit the cap (exit {rc}); see logs/{step}.log. The spend so far (${spent:.4f}, {how}) is in "
+                           f"the ledger; the verdicts so far are in {partial}. Raise the judge cap and re-run: it resumes from them.")
+    if os.path.isfile(partial):
+        os.replace(partial, partial + ".done")
+    return {"judged": judged, "mapping": mapping, "items": n, "spent_usd": spent}
+
+
+def metrics_step(camp: Campaign, step: str, records: str, judged: str, mapping: str, judge_input: str,
+                 out_md: str, out_json: str, extra: list[str] | None = None) -> dict:
+    argv = [camp.script("metrics_v2.py"), "--records", records, "--judge", judged, "--mapping", mapping,
+            "--judge-input", judge_input, "--out", out_md, "--json", out_json] + (extra or [])
+    rc, text = camp.run(step, argv, check=False)
+    if rc != 0:
+        raise HomeRunError(f"metrics_v2 failed (exit {rc}); see logs/{step}.log")
+    verdict = re.search(r"\*\*verdict: (\w+)\*\*", text)
+    return {"report": out_md, "json": out_json, "verdict": verdict.group(1) if verdict else None}
+
+
+# =============================================================================
+# OpenHands chain track
+# =============================================================================
+def chain_cells(run_dir: str) -> dict[tuple[str, int], bool]:
+    """(chain, B) -> valid for one run_chainreplay dir (chain_budget valid AND every record valid AND
+    no recall_error: the merge_runs / metrics_v2 rule)."""
+    cells: dict[tuple[str, int], bool] = {}
+    for b in read_jsonl(os.path.join(run_dir, "chain_budget.jsonl")):
+        if b.get("mem_budget") is None:
+            continue
+        cells[(str(b["chain_id"]), int(b["mem_budget"]))] = b.get("valid") is True
+    for r in read_jsonl(os.path.join(run_dir, "records.jsonl")):
+        if r.get("mem_budget") is None:
+            continue
+        k = (str(r["chain_id"]), int(r["mem_budget"]))
+        if r.get("valid") is not True or r.get("recall_error"):
+            cells[k] = False
+        else:
+            cells.setdefault(k, True)
+    return cells
+
+
+def oh_attempt_dirs(camp: Campaign) -> list[str]:
+    out = []
+    for fn in os.listdir(camp.p("steps")):
+        if fn.startswith("oh.run.") and fn.endswith(".json"):
+            m = read_json(camp.p("steps", fn), {})
+            if m.get("out") and os.path.isdir(m["out"]):
+                out.append((m.get("ts", ""), m["out"]))
+    return [d for _, d in sorted(out)]
+
+
+def oh_final_cells(camp: Campaign) -> dict[tuple[str, int], tuple[str, bool]]:
+    """(chain, B) -> (chosen dir, valid): the latest attempt, but a valid attempt is never replaced
+    by an invalid one."""
+    chosen: dict[tuple[str, int], tuple[str, bool]] = {}
+    for d in oh_attempt_dirs(camp):
+        for k, ok in chain_cells(d).items():
+            prev = chosen.get(k)
+            if prev is None or ok or not prev[1]:
+                chosen[k] = (d, ok)
+    return chosen
+
+
+def run_oh_batch(camp: Campaign, tag: str, chain_ids: list[str], B: int, chains_path: str) -> dict:
+    step = f"oh.run.{tag}"
+
+    def go():
+        rem = camp.remaining("oh", "run")
+        out = camp.p("oh", "runs", tag)
+        if os.path.isdir(out) and os.listdir(out):
+            camp.quarantine(out)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        want = set(chain_ids)
+        sub = camp.p("oh", "batches", f"{tag}.chains.jsonl")
+        os.makedirs(os.path.dirname(sub), exist_ok=True)
+        with open(sub, "w") as f:
+            for c in read_jsonl(chains_path):
+                if c["chain_id"] in want:
+                    f.write(json.dumps(c, ensure_ascii=False) + "\n")
+        argv = [camp.script("run_chainreplay.py"), "--chains", sub, *profile_args(camp.cfg),
+                "--allow-same-family-judge", "--mem-budgets", str(int(B)), "--budget-usd", str(rem),
+                "--out", out, "--mcp", camp.cfg["general"]["mcp"], "--require-no-clip"]
+        if camp.cfg["general"].get("embedder_id"):
+            argv += ["--embedder-id", camp.cfg["general"]["embedder_id"]]
+        argv += list(getattr(camp, "oh_extra_argv", []) or [])      # baseline caps + exclusions (Amendment C.4)
+        rc, _ = camp.run(step, argv, check=False)
+        spent, src = chainreplay_spend(out)
+        man = read_json(os.path.join(out, "run_manifest.json"), {}) or {}
+        camp.charge("oh", "run", step, spent, source=f"{out}#{time.time_ns()}", note=src)
+        cells = chain_cells(out)
+        stopped = bool(((man.get("spend") or {}).get("stopped_by_budget")))
+        if stopped:
+            raise HomeRunError(f"BUDGET STOP in {tag}: the oh run cap is reached (spent {fmt_usd(camp.spent('oh', 'run'))}). "
+                               "Raise [caps] run and re-run `oh`: finished batches are skipped.")
+        if rc != 0 or len(cells) < len(want):
+            raise HomeRunError(f"batch {tag} did not finish (exit {rc}, {len(cells)}/{len(want)} chain cells written); "
+                               f"log logs/{step}.log; the dir is kept and re-running moves it aside and redoes the batch.")
+        nvalid = sum(1 for v in cells.values() if v)
+        print(f"  batch {tag}: {len(cells)} cell(s), {nvalid} valid, spent {fmt_usd(spent)}")
+        return {"out": out, "B": B, "chains": sorted(want), "valid_cells": nvalid, "spent_usd": spent}
+    return camp.step(step, go) or {}
+
+
+def oh_build_views(camp: Campaign) -> tuple[list[str], list[str]]:
+    """Accepted per-(chain, B) attempts as merge_runs input dirs (filtered rows + symlinks; the
+    originals stay untouched). Returns (view dirs in chain order, remaining-invalid cell labels)."""
+    chosen = oh_final_cells(camp)
+    shutil.rmtree(camp.p("oh", "accepted"), ignore_errors=True)
+    views = []
+    for d in oh_attempt_dirs(camp):
+        mine = {k for k, (dd, _) in chosen.items() if dd == d}
+        if not mine:
+            continue
+        v = camp.p("oh", "accepted", os.path.basename(d))
+        os.makedirs(v, exist_ok=True)
+        for fn in ("records.jsonl", "compactions.jsonl", "chain_budget.jsonl"):
+            with open(os.path.join(v, fn), "w") as f:
+                for r in read_jsonl(os.path.join(d, fn)):
+                    if r.get("mem_budget") is not None and (str(r.get("chain_id")), int(r["mem_budget"])) in mine:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for fn in ("run_manifest.json",):
+            if os.path.isfile(os.path.join(d, fn)):
+                shutil.copy2(os.path.join(d, fn), os.path.join(v, fn))
+        for chain, B in mine:
+            for sub in ("sessions", "logs", "answers"):
+                src = os.path.join(d, sub, f"{chain}__b{B}")
+                if os.path.isdir(src):
+                    os.makedirs(os.path.join(v, sub), exist_ok=True)
+                    dst = os.path.join(v, sub, f"{chain}__b{B}")
+                    if not os.path.exists(dst):
+                        os.symlink(os.path.abspath(src), dst)
+        views.append(v)
+    invalid = sorted(f"{c}@B{B}" for (c, B), (_, ok) in chosen.items() if not ok)
+    return views, invalid
+
+
+def oh_missing_or_invalid(camp: Campaign, ids: list[str], budgets: list[int]) -> dict[int, list[str]]:
+    chosen = oh_final_cells(camp)
+    need: dict[int, list[str]] = {}
+    for B in budgets:
+        bad = [c for c in ids if not chosen.get((c, B), ("", False))[1]]
+        if bad:
+            need[B] = bad
+    return need
+
+
+# =============================================================================
+# baseline-cap calibration (Amendment C.4)
+# =============================================================================
+def caps_to_str(v) -> str:
+    """[oh] baseline_cap may be "1536:2010,1024:1340" or a TOML table {1536 = 2010}; -> the CLI string."""
+    if not v:
+        return ""
+    if isinstance(v, dict):
+        return ",".join(f"{int(b)}:{int(c)}" for b, c in v.items())
+    return str(v).strip()
+
+
+def caps_from_str(spec: str) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        b, sep, c = part.partition(":")
+        if not sep or not b.strip().isdigit() or not c.strip().isdigit():
+            raise HomeRunError(f"baseline cap entry {part!r} must be B:CAP (integers), e.g. 1536:2010")
+        out[int(b)] = int(c)
+    return out
+
+
+def explicit_caps(cfg: dict, args) -> dict | None:
+    """An explicit cap given on the CLI (origin `cli`) or in [oh] (origin `config`); None when neither."""
+    cm, cs = getattr(args, "baseline_cap", None), getattr(args, "baseline_cap_scale", None)
+    if cm or cs:
+        return {"map": caps_from_str(cm or ""), "scale": cs, "origin": "cli"}
+    cm, cs = caps_to_str(cfg["oh"].get("baseline_cap")), cfg["oh"].get("baseline_cap_scale") or None
+    if cm or cs:
+        return {"map": caps_from_str(cm), "scale": cs, "origin": "config"}
+    return None
+
+
+def pick_calibration_chain(ids: list[str], seed) -> tuple[str, list[str]]:
+    """First chain in the seeded order: sorted ids shuffled by random.Random("<seed>:oh-calibration")."""
+    order = sorted(ids)
+    random.Random(f"{seed}:oh-calibration").shuffle(order)
+    return order[0], order
+
+
+def parse_calibration_out(out: str) -> dict:
+    cal = read_json(os.path.join(out, "calibration.json"), None)
+    if not cal:
+        raise HomeRunError(f"{out}/calibration.json is missing: run_chainreplay --calibrate did not finish "
+                           "(see the step log; the paid work is on the ledger)")
+    return cal
+
+
+def next_calibration_cap(cap: int, cal: dict) -> tuple[int | None, str]:
+    """Next baseline cap from the runner's own advice, or (None, reason) when the cap cannot fix it."""
+    clip = cal.get("clip") or {}
+    if (clip.get("nc-chunks") or {}).get("clip_fail"):
+        return None, ("the NC note itself is clipped (stop=length): its cap is frozen by the protocol, a baseline "
+                      "cap cannot fix that")
+    bclip = bool((clip.get("baseline") or {}).get("clip_fail"))
+    rec = cal.get("recommended_cap")
+    bump = int(-(-cap * 11 // 10))                       # ceil(cap * 1.10)
+    if cal.get("ratio") is None:
+        return None, "no measured ratio (no baseline/nc realized tokens)"
+    if not cal.get("in_window"):
+        nxt = int(rec) if rec else None
+        if bclip:
+            nxt = max(nxt or 0, bump)
+    else:
+        nxt = bump if bclip else None
+    if nxt is None or nxt == cap:
+        return None, "the runner's advice does not move the cap"
+    return nxt, ""
+
+
+def run_oh_calibration(camp: Campaign, *, budgets: list[int], max_iter: int, exclude: bool = True,
+                       start: dict | None = None, accept_partial: bool = False) -> dict:
+    """Amendment C.4. Per B: run_chainreplay --calibrate on the calibration chain (no QA asks), accept when
+    CLIP-free AND the realized parity ratio is in the window, else retry at the runner's recommended cap, at
+    most `max_iter` calibration runs per B. Writes <campaign>/calibration.json (status pass|fail)."""
+    cfg = camp.cfg
+    o = cfg["oh"]
+    allc = oh_all_chains(camp)
+    seed = o.get("calibration_seed", 20261026)
+    chain_id, order = pick_calibration_chain([c["chain_id"] for c in allc], seed)
+    k_chains = max(1, int(o.get("calibration_chains", 1) or 1))
+    if exclude and k_chains >= len(order):
+        raise HomeRunError(f"[oh] calibration_chains = {k_chains} would leave no decision-set chain "
+                           f"({len(order)} chains in total)")
+    cal_ids = order[:min(k_chains, len(order))]
+    cdir = camp.p("oh", "calibration")
+    os.makedirs(cdir, exist_ok=True)
+    chain_path = os.path.join(cdir, "chain.jsonl")
+    by_id = {c["chain_id"]: c for c in allc}
+    with open(chain_path, "w") as f:
+        for cid_ in cal_ids:
+            f.write(json.dumps(by_id[cid_], ensure_ascii=False) + "\n")
+    prof_ = P.load_profile(camp.cfg["general"]["profile"])
+    expect_native = tokcount.provider_of_profile(prof_.name) in tokcount.NATIVE_PROVIDERS
+    primary = 1536 if 1536 in budgets else max(budgets)
+    ordered = [primary] + sorted((b for b in budgets if b != primary), reverse=True)
+    start = start or {"map": {}, "scale": None, "origin": "default"}
+    print(f"[calibrate] chain(s) {cal_ids} (first {len(cal_ids)} of {len(order)} in seeded order, seed {seed}); B in {ordered}; "
+          f"at most {max_iter} calibration run(s) per B; acceptance: CLIP-free and ratio in [{PARITY_LO}, {PARITY_HI}]")
+    per_b: dict[str, dict] = {}
+    scale = None
+    status, spent_total = "pass", 0.0
+    for B in ordered:
+        if B in start["map"]:
+            cap = int(start["map"][B])
+        elif scale is not None:
+            cap = int(round(B * scale))
+        elif start.get("scale"):
+            cap = int(round(B * float(start["scale"])))
+        else:
+            cap = B
+        iters, ok, why = [], False, ""
+        for k in range(1, max_iter + 1):
+            step = f"oh.calibrate.b{B}.i{k}"
+            out = camp.p("oh", "calibration", f"b{B}-i{k}")
+
+            def go(B=B, cap=cap, out=out, step=step):
+                rem = camp.remaining("oh", "run")
+                if os.path.isdir(out) and os.listdir(out):
+                    camp.quarantine(out)
+                argv = [camp.script("run_chainreplay.py"), "--calibrate", "--chains", chain_path, "--limit", str(len(cal_ids)),
+                        "--calibrate-chains", str(len(cal_ids)),
+                        *profile_args(camp.cfg), "--allow-same-family-judge", "--arms", "baseline,nc-chunks",
+                        "--mem-budgets", str(int(B)), "--baseline-cap", f"{int(B)}:{int(cap)}",
+                        "--baseline-cap-source", "cli", "--budget-usd", str(rem), "--out", out,
+                        "--mcp", camp.cfg["general"]["mcp"], "--require-no-clip"]
+                if camp.cfg["general"].get("embedder_id"):
+                    argv += ["--embedder-id", camp.cfg["general"]["embedder_id"]]
+                rc, _ = camp.run(step, argv, check=False)
+                cal = read_json(os.path.join(out, "calibration.json"), None) or {}
+                spent = float(cal.get("spent_usd") or 0.0)
+                camp.charge("oh", "run", step, spent, source=f"{out}#{time.time_ns()}",
+                            note="calibration.json spent_usd (measured pi usage + flagged HARS estimates)")
+                if rc != 0 or not cal:
+                    raise HomeRunError(f"calibration run {step} did not finish (exit {rc}); log logs/{step}.log; "
+                                       "re-running redoes it")
+                return {"B": B, "iter": k, "cap": cap, "out": out, "ratio": cal.get("ratio"),
+                        "ratio_ask_time": cal.get("ratio_ask_time", cal.get("ratio")),
+                        "ratio_pooled_all_compactions": cal.get("ratio_pooled_all_compactions"),
+                        "tokenizer": cal.get("tokenizer"), "tokenizer_native": cal.get("tokenizer_native"),
+                        "amendment": cal.get("amendment"),
+                        "in_window": cal.get("in_window"), "clip": cal.get("clip"),
+                        "clip_free": cal.get("clip_free"), "recommended_cap": cal.get("recommended_cap"),
+                        "nc_memory_total": cal.get("nc_memory_total"),
+                        "baseline_memory_total": cal.get("baseline_memory_total"), "spent_usd": spent}
+            res = camp.step(step, go)
+            if int(res.get("cap")) != int(cap):
+                raise HomeRunError(f"{step} was run at cap {res.get('cap')} but the config now implies {cap}: "
+                                   f"use --new for a fresh campaign or --force-step {step}")
+            iters.append(res)
+            spent_total += float(res.get("spent_usd") or 0.0)
+            print(f"  [calibrate B={B} #{k}] cap {cap}: ask-time ratio {res['ratio']} "
+                  f"({'in' if res['in_window'] else 'OUTSIDE'} window; pooled over all compactions "
+                  f"{res.get('ratio_pooled_all_compactions')}), clip-free={res['clip_free']}, tokenizer "
+                  f"{res.get('tokenizer')}, advice cap {res['recommended_cap']}, spent {fmt_usd(res['spent_usd'])}")
+            if expect_native and not res.get("tokenizer_native"):
+                why = (f"the calibration run counted tokens with {res.get('tokenizer')!r} (native=False): Amendment C.5 "
+                       "calibrates in the answering model's NATIVE tokens only")
+                break
+            if res["clip_free"] and res["in_window"] is True:
+                ok = True
+                break
+            nxt, why = next_calibration_cap(cap, res)
+            if nxt is None:
+                break
+            if k == max_iter:
+                why = f"max iterations ({max_iter}) reached; the next cap would be {nxt}"
+                break
+            cap = nxt
+        per_b[str(B)] = {"cap": int(iters[-1]["cap"]), "accepted": ok, "ratio": iters[-1]["ratio"],
+                         "clip_free": iters[-1]["clip_free"], "run_dir": iters[-1]["out"],
+                         "iterations": iters, "stopped_because": ("" if ok else why),
+                         "next_cap_suggestion": (None if ok else iters[-1].get("recommended_cap"))}
+        if ok:
+            if B == primary:
+                scale = per_b[str(B)]["cap"] / B
+        else:
+            status = "fail"
+            break
+    pb = per_b.get(str(primary)) or {}
+    source_dir = pb.get("run_dir")
+    pb_tok = (pb.get("iterations") or [{}])[-1]
+    cal_out = {
+        "version": 2, "amendment": "C.5", "eval_version": HOME_RUN_VERSION, "ts": utc_iso(), "track": "oh", "status": status, "chain_id": cal_ids[0],
+        "chain_ids": cal_ids, "calibration_chains": len(cal_ids),
+        "tokenizer": (pb_tok or {}).get("tokenizer"), "tokenizer_native": (pb_tok or {}).get("tokenizer_native"),
+        "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first k',
+                            "seed": seed, "population": len(order), "order_head": order[:3]},
+        "primary_budget": primary, "budgets": ordered, "window": [PARITY_LO, PARITY_HI],
+        "max_iterations": max_iter,
+        "caps": {b: v["cap"] for b, v in per_b.items() if v["accepted"]},
+        "scale": (round(scale, 6) if scale is not None else None),
+        "scale_note": (f"cap(B)=round(B*scale) for B without a calibrated cap (scale = primary B={primary} "
+                       "cap / B)" if scale is not None else None),
+        "ratio": pb.get("ratio"), "per_b": per_b,
+        "source_run_dir": source_dir, "spent_usd": round(spent_total, 6),
+        "started_from": {"origin": start.get("origin"), "map": {str(k): v for k, v in start["map"].items()},
+                         "scale": start.get("scale")},
+        "excluded_from_decision_set": (list(cal_ids) if exclude else []),
+        "note": ("the calibration chain is excluded from the decision set (Amendment C.4)" if exclude else
+                 "smoke: nothing here is a decision set, the calibration chain is not excluded"),
+    }
+    write_json(camp.p(CAL_FILE), cal_out)
+    camp.write_manifest()
+    if status == "pass":
+        print(f"[calibrate] PASS: caps {cal_out['caps']} scale {cal_out['scale']} -> {camp.p(CAL_FILE)}")
+    else:
+        bad = next(v for v in per_b.values() if not v["accepted"])
+        print(f"[calibrate] FAIL: {bad['stopped_because']}. Last cap {bad['cap']}, ratio {bad['ratio']}, "
+              f"runner advice {bad['next_cap_suggestion']}. See HOME-RUNBOOK.md (calibration failed). "
+              f"calibration.json: {camp.p(CAL_FILE)}")
+    return cal_out
+
+
+def oh_cap_plan(camp: Campaign, args, budgets: list[int]) -> dict:
+    """Caps for the oh run: explicit CLI > passing calibration > explicit [oh] config; refuse otherwise. The
+    result is frozen per campaign in oh/caps.json (a later invocation with other caps is refused)."""
+    cfg = camp.cfg
+    cal = read_json(camp.p(CAL_FILE), None) or {}
+    cli = {"map": caps_from_str(getattr(args, "baseline_cap", None) or ""),
+           "scale": getattr(args, "baseline_cap_scale", None)}
+    if cli["map"] or cli["scale"]:
+        ex = {**cli, "origin": "cli"}
+        mode, source = "explicit", "cli"
+    elif cal and cal.get("amendment") != "C.5":
+        raise HomeRunError(f"oh refuses to run: {camp.p(CAL_FILE)} predates Amendment C.5 (counted in cl100k / chars "
+                           "tokens, not the answering model's native tokens) and is VOID. Run "
+                           "`home_run.py calibrate` again (new campaign dir: --new), or pass --baseline-cap explicitly.")
+    elif cal.get("status") == "pass":
+        ex = {"map": {int(b): int(c) for b, c in (cal.get("caps") or {}).items()}, "scale": cal.get("scale"),
+              "origin": "calibration"}
+        mode, source = "calibrated", f"calibrated:{cal.get('source_run_dir')}"
+    elif explicit_caps(cfg, args):
+        ex = explicit_caps(cfg, args)
+        mode, source = "explicit", "cli"
+    else:
+        why = ("the calibration FAILED (see calibration.json; HOME-RUNBOOK.md 'calibration failed')"
+               if cal else "there is no calibration yet")
+        raise HomeRunError(f"oh refuses to run: {why}. The baseline cap is a calibrated parity parameter "
+                           "(Amendment C.4): run `home_run.py calibrate` first (and then `oh --resume <that campaign>`; "
+                           "without --resume a NEW campaign is created), or pass --baseline-cap "
+                           "1536:<cap> (or --baseline-cap-scale S / [oh] baseline_cap) explicitly.")
+    rows = {}
+    for B in budgets:
+        if B in ex["map"]:
+            rows[str(B)] = {"cap": int(ex["map"][B]), "basis": "map", "source": source}
+        elif ex["scale"]:
+            rows[str(B)] = {"cap": int(round(B * float(ex["scale"]))), "basis": "scale", "source": source}
+        else:
+            raise HomeRunError(f"no baseline cap for B={B}: the explicit map {ex['map']} has no entry for it and "
+                               "no --baseline-cap-scale is set; pass --baseline-cap-scale or add the B to the map")
+    tok = {"tokenizer": cal.get("tokenizer"), "tokenizer_native": cal.get("tokenizer_native")} if mode == "calibrated" \
+        else {"tokenizer": None, "tokenizer_native": None,
+              "tokenizer_note": "explicit caps: the run's own tokenizer is stamped in run_manifest.json "
+                                "(Amendment C.5: the answering model's native counter)"}
+    plan = {"mode": mode, "origin": ex["origin"], "source": source, "caps": rows, **tok,
+            "map": {str(k): v for k, v in ex["map"].items()}, "scale": ex["scale"],
+            "calibration": camp.p(CAL_FILE) if cal else None,
+            "excluded_from_decision_set": oh_exclusions(camp), "ts": utc_iso()}
+    frozen = read_json(camp.p("oh", "caps.json"), None)
+    if frozen:
+        diff = {b: (frozen["caps"][b]["cap"], r["cap"]) for b, r in rows.items()
+                if b in frozen["caps"] and frozen["caps"][b]["cap"] != r["cap"]}
+        if diff:
+            raise HomeRunError(f"the baseline caps are FROZEN per campaign (oh/caps.json) and differ now: "
+                               f"{diff} (B: frozen, new). Start a new campaign (--new) to use other caps.")
+        plan["caps"] = {**frozen["caps"], **rows}
+    os.makedirs(camp.p("oh"), exist_ok=True)
+    write_json(camp.p("oh", "caps.json"), plan)
+    argv = []
+    if ex["map"]:
+        argv += ["--baseline-cap", caps_to_str(ex["map"])]
+    if ex["scale"]:
+        argv += ["--baseline-cap-scale", str(ex["scale"])]
+    argv += ["--baseline-cap-source", source]
+    if plan["excluded_from_decision_set"]:
+        argv += ["--exclude-chains", ",".join(plan["excluded_from_decision_set"])]
+    plan["argv"] = argv
+    return plan
+
+
+def cmd_calibrate_legacy(camp: Campaign, args) -> int:
+    cfg = camp.cfg
+    if cfg["general"].get("_offline"):
+        raise HomeRunError("the oh calibration needs the pi agent: there is no offline self-test for it")
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    n = int(args.max_iterations if args.max_iterations is not None else cfg["oh"]["calibration_max_iterations"])
+    if n < 1:
+        raise HomeRunError("--max-iterations must be >= 1")
+    start = explicit_caps(cfg, args)
+    res = run_oh_calibration(camp, budgets=budgets, max_iter=n, exclude=True, start=start)
+    return 0 if res["status"] == "pass" else 1
+
+
+
+def cmd_oh_legacy(camp: Campaign, args) -> int:
+    """`oh --legacy-replay`: the pre-C.6 pi agent replay (run_chainreplay) with the C.4 cap calibration. Kept for
+    reproducing earlier chain-replay numbers; NOT the decision-set runner since Amendment C.6."""
+    cfg = camp.cfg
+    o = cfg["oh"]
+    if cfg["general"].get("_offline"):
+        raise HomeRunError("the oh track needs the pi agent: there is no offline self-test for it")
+    chains_path = oh_inputs(camp)
+    ids = [c["chain_id"] for c in read_jsonl(chains_path)]
+    budgets = [int(b) for b in (args.budgets or o["budgets"])]
+    plan = oh_cap_plan(camp, args, budgets)          # refuses BEFORE any spend without a calibration / explicit cap
+    camp.oh_extra_argv = plan["argv"]
+    print(f"[oh] baseline caps ({plan['mode']}, source {plan['source']}): "
+          + ", ".join(f"B={b}: {r['cap']} [{r['basis']}]" for b, r in plan["caps"].items() if int(b) in budgets)
+          + (f"; excluded from the decision set: {plan['excluded_from_decision_set']}"
+             if plan["excluded_from_decision_set"] else ""))
+    est = camp.step("oh.estimate", lambda: {"estimate": estimate_oh_legacy(camp)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    bsz = max(1, int(o["batch_chains"]))
+    # pass 1: B-major (the primary B = max(budgets) = 1536 completes for ALL chains first)
+    for B in sorted(budgets, reverse=True):
+        for k in range(0, len(ids), bsz):
+            run_oh_batch(camp, f"b{B}-{k // bsz:02d}", ids[k:k + bsz], B, chains_path)
+    # retries of invalid / missing cells (a chain is the unit of retry; the failed attempt is kept)
+    retries = int(args.retries if args.retries is not None else o["retries"])
+    for r in range(1, retries + 1):
+        need = oh_missing_or_invalid(camp, ids, budgets)
+        if not need:
+            break
+        print(f"[retry {r}] invalid/missing cells: " + "; ".join(f"B={B}: {len(v)}" for B, v in need.items()))
+        for B in sorted(need, reverse=True):
+            for k in range(0, len(need[B]), bsz):
+                run_oh_batch(camp, f"retry{r}-b{B}-{k // bsz:02d}", need[B][k:k + bsz], B, chains_path)
+    merged = camp.p("oh", "merged")
+
+    def do_merge():
+        views, invalid = oh_build_views(camp)
+        if not views:
+            raise HomeRunError("no finished OH run dirs to merge")
+        if os.path.isdir(merged) and os.listdir(merged):
+            camp.quarantine(merged)
+        argv = [camp.script("merge_runs.py"), "--out", merged, "--chains", chains_path, *views]
+        if oh_exclusions(camp):
+            argv += ["--exclude-chains", ",".join(oh_exclusions(camp))]
+        if invalid:
+            argv.append("--allow-invalid")
+            print(f"  WARNING {len(invalid)} cell(s) stay invalid after the retries and are kept with valid=false "
+                  f"(metrics_v2 drops them whole): {invalid[:6]}")
+        camp.run("oh.merge", argv)
+        return {"views": views, "invalid_cells": invalid}
+    camp.step("oh.merge", do_merge)
+    rec = os.path.join(merged, "records.jsonl")
+    ji, judged, mp = (os.path.join(merged, n) for n in ("judge-input.jsonl", "judged.jsonl", "judge-mapping.json"))
+    camp.step("oh.export", lambda: (camp.run("oh.export", [camp.script("export_judge_input.py"), "--records", rec,
+                                                           "--chains", chains_path, "--out", ji]), {"out": ji})[1])
+    if args.skip_judge:
+        print("[oh] --skip-judge: stopping before the judge")
+        return 0
+    camp.step("oh.judge", lambda: judge_step(camp, "oh", "oh", ji, judged, mp, args.accept_partial))
+    excl = oh_exclusions(camp)
+    camp.step("oh.metrics", lambda: metrics_step(
+        camp, "oh.metrics", rec, judged, mp, ji, os.path.join(merged, "REPORT-chains.md"),
+        os.path.join(merged, "metrics.json"),
+        (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else None)))
+
+    def do_funnel():
+        argv = [camp.script("funnel_chains.py"), "--run", merged, "--chains", chains_path,
+                "--out-md", os.path.join(merged, "funnel.md"), "--out-json", os.path.join(merged, "funnel.json")]
+        if o.get("graph_store"):
+            argv += ["--graph-store", o["graph_store"]]
+        camp.run("oh.funnel", argv)
+        return {"md": os.path.join(merged, "funnel.md")}
+    camp.step("oh.funnel", do_funnel)
+    summarize_track(camp, "oh", merged)
+    return 0
+
+
+# =============================================================================
+# OpenHands track on the streaming long-session runner (Amendment C.6)
+# =============================================================================
+OH_ARMS = "baseline,nc-enriched,nc-note-only"       # Amendment C.7 (one memory configuration); nc-chunks / nc-graph are opt-in
+OH_ENRICH_ARMS = OH_ARMS
+# Fixed, question-independent probes of the parity CHECK: no decision-set question is ever asked by the check.
+PARITY_PROBES = (
+    "What are the most important files, identifiers, commands and results of this session so far?",
+    "Which errors, failing tests or exceptions came up in this session, and what was concluded about each?",
+)
+
+
+def oh_ls_extra(cfg: dict, arms: str | None = None) -> list[str]:
+    """run_longsession flags of the OH track (besides --use-real-compactions, set by `real=True`): the converted
+    chains carry their synthetic boundaries as compactions, the tail after C3 is empty as in the chain replay."""
+    o = cfg["oh"]
+    return ["--keep-tail", "0", "--arms", arms or OH_ARMS,
+            "--session-concurrency", str(int(o.get("session_concurrency") or 1))] + list(o.get("extra_args") or [])
+
+
+def oh_convert(camp: Campaign, step: str = "oh.convert") -> str:
+    """chains.jsonl (decision set) -> longsession/1 sessions in <campaign>/oh/ls-data via chains_to_longsession.py.
+    Needs chains.jsonl ONLY (the chain records carry the span events)."""
+    chains = oh_inputs(camp)
+    data = camp.p("oh", "ls-data")
+    want = sorted(c["chain_id"] for c in read_jsonl(chains))
+    conv = read_json(os.path.join(data, C2L.MANIFEST_NAME), None)
+    if conv and sorted(s["sid"] for s in conv.get("sessions", [])) != want:
+        camp.force_steps.add(step)                      # the decision set changed since the last conversion
+
+    def go():
+        if os.path.isdir(data) and os.listdir(data):
+            camp.quarantine(data)
+        camp.run(step, [camp.script("chains_to_longsession.py"), "--chains", chains, "--out", data])
+        m = read_json(os.path.join(data, C2L.MANIFEST_NAME), {}) or {}
+        if m.get("errors") or len(m.get("sessions", [])) != len(want):
+            raise HomeRunError(f"chain conversion incomplete: {m.get('errors')}")
+        n_q = sum(x["questions"] for x in m["sessions"])
+        print(f"  converted {len(m['sessions'])} chain(s) / {n_q} question(s) -> {data}")
+        return {"sessions": len(m["sessions"]), "questions": n_q, "chains_sha256": m.get("chains_sha256"),
+                "out": data}
+    camp.step(step, go)
+    return data
+
+
+def oh_parity_ids(camp: Campaign) -> list[str]:
+    """The first k chains in the seeded order (same seed and order as the C.4 calibration chain)."""
+    o = camp.cfg["oh"]
+    ids = [c["chain_id"] for c in oh_all_chains(camp)]
+    k = max(1, int(o.get("calibration_chains", 1) or 1))
+    _, order = pick_calibration_chain(ids, o.get("calibration_seed", 20261026))
+    return order[:min(k, len(order))]
+
+
+def parity_session(session: dict) -> dict:
+    """The probe twin of a converted chain: same messages and boundaries, ONLY fixed generic questions (no
+    decision-set question, no gold). sid `parity-<chain id>` so nothing can join a decision-set record."""
+    sid = f"parity-{session['sid']}"[:64]
+    s = json.loads(json.dumps(session))
+    s["sid"] = sid
+    s["title"] = f"parity probe of {session['sid']}"
+    s["meta"] = {**(s.get("meta") or {}), "parity_probe_of": session["sid"]}
+    s["questions"] = [{"qid": f"{sid}_p{i + 1}", "qtype": "single", "question": q,
+                       "answer": "n/a (parity probe, never scored)", "answerable": True, "evidence": []}
+                      for i, q in enumerate(PARITY_PROBES)]
+    return s
+
+
+def oh_parity_data(camp: Campaign) -> str:
+    d = camp.p("oh", "parity", "data")
+    by_id = {c["chain_id"]: c for c in oh_all_chains(camp)}
+    for cid in oh_parity_ids(camp):
+        sess, _ = C2L.convert_chain(by_id[cid])
+        C2L.write_session(parity_session(sess), d)
+    return d
+
+
+def _mean(xs):
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def parity_from_records(rows: list[dict], comps: list[dict], budgets: list[int]) -> dict:
+    """Pure: per B the realized ask-time memory (the runner's own `memory_tokens`, NATIVE tokens) of
+    baseline vs nc-chunks / nc-graph (note + recall AS INJECTED), the ratio (mean over sessions of the
+    per-session run-mean ratio: the quantity metrics_v2's win_mem_token_ratio gates), CLIP and validity."""
+    out: dict[str, dict] = {}
+    for B in budgets:
+        rb = [r for r in rows if int(r.get("mem_budget") or 0) == int(B)]
+        sids = sorted({str(r.get("chain_id")) for r in rb})
+
+        def per_sid(arm, field="memory_tokens"):
+            return {sid: _mean([float(r[field]) for r in rb if r["arm"] == arm and str(r["chain_id"]) == sid
+                                and r.get(field) is not None]) for sid in sids}
+        base, chunks, graph = per_sid("baseline"), per_sid("nc-chunks"), per_sid("nc-graph")
+        enr = per_sid("nc-enriched")
+        note = per_sid("nc-note-only")
+
+        def ratio(num):
+            rs = [num[s_] / base[s_] for s_ in sids if num.get(s_) and base.get(s_)]
+            return round(sum(rs) / len(rs), 4) if rs else None
+        rc_, rg, re_ = ratio(chunks), ratio(graph), ratio(enr)
+        clip = {}
+        for r in rb:
+            cs = r.get("clipped_summaries") or {}
+            k = (r["arm"], str(r["chain_id"]))
+            if k not in clip:
+                clip[k] = (int(cs.get("n") or 0), int(cs.get("unrepaired") or 0))
+        clip_fail = sorted(f"{a}@{sid}" for (a, sid), (n, bad) in clip.items() if n and bad / n > 1 / 6)
+        invalid = sorted({f"{r['arm']}@{r['chain_id']}: " + "; ".join(map(str, r.get("chain_invalid_reasons") or []))[:160]
+                          for r in rb if r.get("valid") is not True})
+        bsum = [float(c["realized_tokens"]) for c in comps if c.get("arm") == "baseline" and int(c.get("B") or 0) == int(B)
+                and c.get("realized_tokens") is not None]
+        nsum = [float(c["realized_tokens"]) for c in comps if c.get("arm") == "note" and int(c.get("B") or 0) == int(B)
+                and c.get("realized_tokens") is not None]
+        inwin = lambda v: v is not None and PARITY_LO <= v <= PARITY_HI  # noqa: E731
+        out[str(B)] = {
+            "sessions": sids, "rows": len(rb),
+            "ratio_nc_chunks": rc_, "ratio_nc_graph": rg, "ratio_nc_enriched": re_, "window": [PARITY_LO, PARITY_HI],
+            "in_window": bool([x for x in (rc_, rg, re_) if x is not None]
+                              and all(inwin(x) for x in (rc_, rg, re_) if x is not None)),
+            "baseline_memory_tokens_mean": _mean(list(base.values())),
+            "nc_chunks_memory_tokens_mean": _mean(list(chunks.values())),
+            "nc_graph_memory_tokens_mean": _mean(list(graph.values())),
+            "nc_enriched_memory_tokens_mean": _mean(list(enr.values())),
+            "nc_note_only_memory_tokens_mean": _mean(list(note.values())),
+            "note_tokens_mean": _mean([float(r["arm_note_tokens"]) for r in rb if r["arm"] in ("nc-chunks", "nc-enriched")
+                                       and r.get("arm_note_tokens") is not None]),
+            "injected_recall_tokens_mean": _mean([float(r["memory_tokens_injected"]) for r in rb
+                                                  if r["arm"] in ("nc-chunks", "nc-enriched")
+                                                  and r.get("memory_tokens_injected") is not None]),
+            "baseline_fill_of_B": (round(_mean(list(base.values())) / B, 4) if _mean(list(base.values())) else None),
+            "pooled_summary_tokens": {"baseline_mean": _mean(bsum), "note_mean": _mean(nsum),
+                                      "baseline_n": len(bsum), "note_n": len(nsum)},
+            "clip_free": not clip_fail, "clip_fail": clip_fail,
+            "all_valid": not invalid and bool(rb), "invalid": invalid,
+            "tokenizer": next((r.get("tokenizer") for r in rb if r.get("tokenizer")), None),
+            "tokenizer_native": next((r.get("tokenizer_native") for r in rb if "tokenizer_native" in r), None),
+        }
+    return out
+
+
+def run_oh_parity(camp: Campaign, *, budgets: list[int]) -> dict:
+    """Amendment C.6 calibration = a cheap parity CHECK on the run_longsession path (no cap is tuned, nothing
+    iterates). k sessions (default 1) are compacted exactly like the real run (baseline summaries, nc notes,
+    HARS ingest) and asked ONLY the fixed probe questions (never a decision-set question), so the check is not
+    excluded from the decision set. PASS = every row valid, CLIP-free and the realized ask-time memory ratio of
+    nc-chunks AND nc-graph vs baseline inside [0.80, 1.05] at every B. Writes <campaign>/calibration.json."""
+    cfg = camp.cfg
+    ids = oh_parity_ids(camp)
+    data = oh_parity_data(camp)
+    run_dir = camp.p("oh", "parity", "run")
+    prof_ = P.load_profile(cfg["general"]["profile"])
+    expect_native = tokcount.provider_of_profile(prof_.name) in tokcount.NATIVE_PROVIDERS and not cfg["general"].get("_offline")
+    print(f"[parity] chain(s) {ids} (first {len(ids)} in seeded order, seed {cfg['oh'].get('calibration_seed', 20261026)}); "
+          f"B in {budgets}; compaction + {len(PARITY_PROBES)} fixed probe asks, run_longsession path, nothing is tuned; "
+          f"acceptance: valid + CLIP-free + ratio in [{PARITY_LO}, {PARITY_HI}]")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_ls_extra(cfg), len(ids), True, "oh-parity",
+                step="oh.parity.run")
+    rows = read_jsonl(os.path.join(run_dir, "records.jsonl"))
+    comps = read_jsonl(os.path.join(run_dir, "compactions.jsonl"))
+    per_b = parity_from_records(rows, comps, budgets)
+    why = []
+    for B, d in per_b.items():
+        if not d["rows"]:
+            why.append(f"B={B}: no records")
+        if not d["all_valid"]:
+            why.append(f"B={B}: invalid cells {d['invalid'][:3]}")
+        if not d["clip_free"]:
+            why.append(f"B={B}: CLIP {d['clip_fail']}")
+        if not d["in_window"]:
+            why.append(f"B={B}: ask-time ratio nc-enriched {d['ratio_nc_enriched']} / nc-chunks {d['ratio_nc_chunks']} / "
+                       f"nc-graph {d['ratio_nc_graph']} outside [{PARITY_LO}, {PARITY_HI}] (baseline fills "
+                       f"{d['baseline_fill_of_B']} of B)")
+        if expect_native and d["tokenizer_native"] is False:
+            why.append(f"B={B}: counted with {d['tokenizer']!r} (native=False): Amendment C.5 measures NATIVE tokens")
+    pb = per_b.get(str(max(budgets, key=lambda b: (b == 1536, b)))) or {}
+    spent = sum(e["usd"] for e in camp.ledger()["entries"] if e.get("step") == "oh.parity.run")
+    cal = {"version": 3, "amendment": "C.6", "eval_version": HOME_RUN_VERSION, "mode": "parity-check", "ts": utc_iso(), "track": "oh",
+           "status": "fail" if why else "pass", "stopped_because": why, "chain_id": ids[0], "chain_ids": ids,
+           "parity_sessions": [f"parity-{i}"[:64] for i in ids], "budgets": budgets, "window": [PARITY_LO, PARITY_HI],
+           "tokenizer": pb.get("tokenizer"), "tokenizer_native": pb.get("tokenizer_native"),
+           "ratio": pb.get("ratio_nc_enriched") if pb.get("ratio_nc_enriched") is not None else pb.get("ratio_nc_graph"),
+           "ratio_nc_chunks": pb.get("ratio_nc_chunks"), "ratio_nc_enriched": pb.get("ratio_nc_enriched"),
+           "ratio_nc_graph": pb.get("ratio_nc_graph"), "per_b": per_b,
+           "chain_selection": {"method": 'sorted(ids) shuffled by random.Random(f"{seed}:oh-calibration"); first k',
+                               "seed": cfg["oh"].get("calibration_seed", 20261026)},
+           "probes": list(PARITY_PROBES), "source_run_dir": run_dir, "spent_usd": round(spent, 6),
+           "excluded_from_decision_set": [],
+           "why_not_excluded": "the check asks only the fixed probe questions (sid parity-<chain>, never a decision-set "
+                               "qid) and tunes nothing: no answer, cap or parameter depends on a decision-set item",
+           "note": "no baseline-cap iteration (Amendment C.6): the baseline cap is B (C.5-2); a FAIL is a report"}
+    write_json(camp.p(CAL_FILE), cal)
+    camp.write_manifest()
+    if why:
+        print(f"[parity] FAIL: {'; '.join(why)}")
+    else:
+        nc_mean = pb.get("nc_enriched_memory_tokens_mean") or pb.get("nc_chunks_memory_tokens_mean") or 0
+        print(f"[parity] PASS: ask-time ratio nc-enriched {pb['ratio_nc_enriched']} / nc-chunks {pb['ratio_nc_chunks']} / "
+              f"nc-graph {pb['ratio_nc_graph']} (window {PARITY_LO}-{PARITY_HI}); baseline {pb['baseline_memory_tokens_mean']:.0f} "
+              f"tok, nc memory {nc_mean:.0f} (note {(pb['note_tokens_mean'] or 0):.0f} + recalled "
+              f"{(pb['injected_recall_tokens_mean'] or 0):.0f}); {tokcount_label(pb)}; spent {fmt_usd(spent)} -> {camp.p(CAL_FILE)}")
+    return cal
+
+
+def tokcount_label(pb: dict) -> str:
+    return f"tokenizer {pb.get('tokenizer')} native={pb.get('tokenizer_native')}"
+
+
+def oh_parity_gate(camp: Campaign, args, budgets: list[int]) -> dict | None:
+    """The `oh` precondition: a passing parity check in this campaign (run now when absent)."""
+    if getattr(args, "skip_parity_check", False):
+        print("[oh] --skip-parity-check: the cheap parity check is skipped (recorded); the run's own "
+              "win_mem_token_ratio gate still decides")
+        return None
+    cal = read_json(camp.p(CAL_FILE), None)
+    if cal and cal.get("amendment") != "C.6":
+        raise HomeRunError(f"oh refuses to use {camp.p(CAL_FILE)}: it is a pre-C.6 (pi replay, cap-iteration) calibration "
+                           "and is VOID for the streaming runner. Start a new campaign (--new) or pass --skip-parity-check.")
+    if not cal:
+        others = [c for c in list_campaigns(camp.cfg["general"]["artifact_root"]) if c["path"] != camp.path
+                  and (read_json(os.path.join(c["path"], CAL_FILE), {}) or {}).get("status") == "pass"]
+        print(f"[oh] {os.path.basename(camp.path)} has no {CAL_FILE}: running the cheap parity check now."
+              + (f" (An earlier campaign already holds a passing one: {others[0]['name']}; to reuse it, stop and re-run "
+                 f"`oh --resume {others[0]['name']}`.)" if others else ""))
+        cal = run_oh_parity(camp, budgets=budgets)
+    missing = [B for B in budgets if str(B) not in (cal.get("per_b") or {})]
+    if missing:
+        raise HomeRunError(f"the parity check covers B={sorted(int(b) for b in cal.get('per_b', {}))} but this run uses "
+                           f"B={missing} too: run `home_run.py calibrate --budgets {','.join(map(str, budgets))} "
+                           "--force-step oh.parity.run` first.")
+    if cal.get("status") != "pass" and not getattr(args, "accept_parity_fail", False):
+        raise HomeRunError("oh refuses to run: the parity check FAILED (" + "; ".join(cal.get("stopped_because") or [])[:400]
+                           + f"). See {camp.p(CAL_FILE)}. Nothing is tuned in C.6, so a failing check means the summariser "
+                             "fill and the nc memory do not land in the pre-registered window on this model; investigate "
+                             "(logs/oh.parity.run.log, oh/parity/run/records.jsonl), or pass --accept-parity-fail to run "
+                             "anyway (recorded; the run's win_mem_token_ratio gate will report the same fact).")
+    return cal
+
+
+def cmd_calibrate(camp: Campaign, args) -> int:
+    if getattr(args, "legacy_replay", False):
+        return cmd_calibrate_legacy(camp, args)
+    guard_spend(camp, "calibrate")
+    cfg = camp.cfg
+    if getattr(args, "check_sessions", None):
+        cfg["oh"]["calibration_chains"] = int(args.check_sessions)
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    cal = run_oh_parity(camp, budgets=budgets)
+    return 0 if cal["status"] == "pass" else 1
+
+
+def cmd_oh(camp: Campaign, args) -> int:
+    if getattr(args, "legacy_replay", False):
+        return cmd_oh_legacy(camp, args)
+    guard_spend(camp, "oh")
+    cfg = camp.cfg
+    o = cfg["oh"]
+    chains_path = oh_inputs(camp)
+    ids = [c["chain_id"] for c in read_jsonl(chains_path)]
+    data = oh_convert(camp)
+    budgets = [int(b) for b in (args.budgets or o["budgets"])]
+    cal = oh_parity_gate(camp, args, budgets)
+    if cal is not None and cal.get("status") != "pass":
+        print("[oh] --accept-parity-fail: running although the parity check failed (recorded in calibration.json)")
+    est = camp.step("oh.estimate", lambda: {"estimate": estimate_oh(camp)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", "run")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_ls_extra(cfg), len(ids), args.accept_partial, "oh")
+    rec = os.path.join(run_dir, "records.jsonl")
+    if getattr(args, "tolerate_invalid_run", False) and any(r.get("valid") is not True for r in read_jsonl(rec)):
+        print("[oh] some arms are invalid (smoke with --allow-shim): export / judge / metrics are skipped")
+        return 0
+    ji, judged, mp = (os.path.join(run_dir, n) for n in ("judge-input.jsonl", "judged.jsonl", "judge-mapping.json"))
+    camp.step("oh.export", lambda: (camp.run("oh.export", [camp.script("export_longsession_judge.py"), "--records", rec,
+                                                           "--sessions", data, "--out", ji]), {"out": ji})[1])
+    if args.skip_judge:
+        print("[oh] --skip-judge: stopping before the judge")
+        return 0
+    camp.step("oh.judge", lambda: judge_step(camp, "oh", "oh", ji, judged, mp, args.accept_partial))
+    excl = oh_exclusions(camp)
+    xs = (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else [])
+    camp.step("oh.metrics", lambda: metrics_step(
+        camp, "oh.metrics", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-oh.md"),
+        os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only", "--ls-family", "oh"] + xs))
+    # DESCRIPTIVE companion (Amendment C.6-3): the chain-track reading (S1-S3 on clean_anchor_hit, m = 3) of the same records
+    camp.step("oh.metrics_chains", lambda: metrics_step(
+        camp, "oh.metrics_chains", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-oh-chains-family.md"),
+        os.path.join(run_dir, "metrics-chains-family.json"), ["--track", "chains", "--end-only"] + xs))
+
+    def do_funnel():
+        argv = [camp.script("funnel_chains.py"), "--run", run_dir, "--chains", chains_path,
+                "--out-md", os.path.join(run_dir, "funnel.md"), "--out-json", os.path.join(run_dir, "funnel.json")]
+        if o.get("graph_store"):
+            argv += ["--graph-store", o["graph_store"]]
+        rc, _ = camp.run("oh.funnel", argv, check=False)
+        return {"md": os.path.join(run_dir, "funnel.md"), "rc": rc,
+                "note": "best effort: funnel_chains reads run_chainreplay run dirs; a longsession run dir may only fill part of it"}
+    camp.step("oh.funnel", do_funnel)
+    summarize_track(camp, "oh", run_dir)
+    return 0
+
+
+# =============================================================================
+# Amendment C.7: oh-probe / oh-enrich on a FINISHED oh campaign (no re-ingest, no re-summarising, no re-judging)
+# =============================================================================
+REUSE_ARMS = "baseline,nc-note-only"
+
+
+def oh_old_run(camp: Campaign, args, need_judged: bool = False) -> str:
+    """The finished run_longsession dir of the campaign whose HARS sessions / notes / baseline / nc-note-only rows are reused."""
+    d = os.path.abspath(getattr(args, "reuse_dir", None) or camp.p("oh", "run"))
+    need = ["config.json", "records.jsonl", "done.jsonl", "compactions.jsonl"] + (["judged.jsonl"] if need_judged else [])
+    miss = [fn for fn in need if not os.path.isfile(os.path.join(d, fn))]
+    if miss:
+        raise HomeRunError(f"{d} is not a finished `oh` run dir (missing {miss}). `oh-probe` / `oh-enrich` reuse the HARS sessions, "
+                           "notes and judged baseline / nc-note-only rows of a finished `home_run.py oh` campaign: "
+                           "--resume <that campaign> (or --reuse-dir <its oh/run>).")
+    return d
+
+
+def oh_reuse_extra(cfg: dict, old: str, *, probe: bool = False, args=None, layout_extra: list[str] | None = None) -> list[str]:
+    ex = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--reuse-arms", REUSE_ARMS] + list(layout_extra or [])
+    nq = getattr(args, "enrich_queries", None)
+    if nq:
+        ex += ["--enrich-queries", str(int(nq))]
+    if getattr(args, "packer", None):
+        ex += ["--packer", args.packer]
+    if probe:
+        ex += ["--recall-probe"]
+        if getattr(args, "probe_caps", None):
+            ex += ["--probe-caps", args.probe_caps]
+    return ex
+
+
+def estimate_oh_enrich(camp: Campaign, args, old: str, *, probe: bool, layout_extra: list[str] | None = None) -> dict:
+    """run_longsession's own projection WITH --reuse-run: no ingest / extraction / memory_compact, no baseline / note
+    summaries, no ask for the reused arms; judge items = the NEW nc-enriched rows only."""
+    data = oh_convert(camp)
+    b = [max(int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"]))] if probe else \
+        [int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])]
+    tag = ".probe" if probe else ".enrich"
+    s = estimate_ls(camp, "oh", data, b, "end", True, extra=oh_reuse_extra(camp.cfg, old, probe=probe, args=args, layout_extra=layout_extra), tag=tag,
+                    only_arm=None if probe else "nc-enriched", reused=True)
+    return {"track": "oh", "gen_usd": 0.0, "run_usd": s["run_usd"], "judge_usd": 0.0 if probe else s["judge_usd"],
+            "judged_items": 0 if probe else s["judged_items"], "wall_hours": s["wall_hours"], "budgets": b,
+            "sessions": s["sessions"], "boundaries": s["boundaries"], "ingest_hours": s["ingest_hours"],
+            "unpriced_models": s["unpriced_models"], "cache_saving_usd": s.get("cache_saving_usd", 0.0),
+            "note": ("recall probe: one keyword-writing call per anchored answerable question; HARS recalls are free"
+                     if probe else
+                     "nc-enriched only: query-writing call per boundary + its asks"
+                     + (" - NO ingest / extraction (reused HARS sessions; split-session = DIAGNOSTIC ONLY)" if "split-session" in (layout_extra or []) else
+                        "" if "--hars-ingested" in (layout_extra or []) else
+                        " + the INGEST of the dropped spans into the nc-* projects (server-side extraction cost and ingest "
+                        "wall-clock are in these numbers)")
+                     + "; baseline / nc-note-only copied from the old run; judge = new rows only")}
+
+
+def print_estimate(camp: Campaign, est: dict, what: str) -> None:
+    tot = est["run_usd"] + est["judge_usd"]
+    caps = {ph: cap_for(camp.cfg, "oh", ph) for ph in ("run", "judge")}
+    print(f"\n[{what}] estimate (zero spend): run {fmt_usd(est['run_usd'])} + judge {fmt_usd(est['judge_usd'])} "
+          f"({est['judged_items']} new item(s)) = {fmt_usd(tot)} | caps run {caps['run']:.2f} / judge {caps['judge']:.2f} | "
+          f"{est['sessions']} session(s), wall-clock ~{est['wall_hours']:.1f} h | {est['note']}")
+    write_json(camp.p(f"{what}-estimate.json"), {"ts": utc_iso(), **est, "total_usd": tot})
+
+
+def mark_reuse(camp: Campaign, old: str, what: str) -> None:
+    camp.reuse_ok = True
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj.setdefault("c7_reuse", {})[what] = {"ts": utc_iso(), "eval_version": HOME_RUN_VERSION, "reused_run": old,
+                                          "campaign_eval_version": cj.get("eval_version")}
+    write_json(camp.p("campaign.json"), cj)
+    dst = camp.p("scripts", "c7")
+    os.makedirs(dst, exist_ok=True)
+    for fn in ("home_run.py", "run_longsession.py", "run_chainreplay.py", "longsession.py", "metrics_v2.py",
+               "judge_v2.py", "export_longsession_judge.py", "funnel_chains.py", "tokcount.py", "providers.py",
+               "run_agentic.py", "metrics_agentic.py", "anchors.py", "oh_workspaces.py"):
+        src = os.path.join(BASE, fn)
+        if os.path.isfile(src) and not os.path.exists(os.path.join(dst, fn)):
+            shutil.copy2(src, os.path.join(dst, fn))
+
+
+# ---------------------------------------------------------------------------
+# Amendment C.8: the project layout (one isolated project per eval session on the owner's EXISTING server)
+# ---------------------------------------------------------------------------
+def oh_layout(args) -> str:
+    return getattr(args, "layout", None) or "project"
+
+
+def layout_suffix(layout: str) -> tuple[str, str]:
+    """(step suffix, dir suffix): the diagnostic split-session path keeps its own steps / dirs."""
+    return ("", "") if layout == "project" else (".split", "-split")
+
+
+def projects_dir_of(cfg: dict, args=None) -> str:
+    raw = (getattr(args, "projects_dir", None) or cfg["hars"].get("projects_dir") or os.environ.get("HARS_MEMORY_PROJECTS_DIR")
+           or DEFAULT_PROJECTS_DIR)
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def oh_projects(camp: Campaign) -> dict:
+    """The provisioned projects of this campaign (campaign.json c8_projects), or a loud error."""
+    d = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects")
+    if not d or not d.get("pids"):
+        raise HomeRunError("no projects are provisioned for this campaign: run `home_run.py oh-provision --resume "
+                           f"{os.path.basename(camp.path)}`, restart your HARS server ONCE, then `doctor --resume ...`. "
+                           "(--layout split-session is the diagnostic side-channel path and needs none.)")
+    return d
+
+
+def layout_args(camp: Campaign, layout: str, *, ingested: bool) -> list[str]:
+    if layout != "project":
+        return ["--hars-layout", "split-session"]
+    pj = oh_projects(camp)
+    return ["--hars-layout", "project", "--hars-run-id", pj["hars_run_id"]] + (["--hars-ingested"] if ingested else [])
+
+
+def cmd_oh_provision(camp: Campaign, args) -> int:
+    """Write one project dir per eval session into the projects dir of the owner's server (nothing else: no server is
+    started or stopped, `default` and the global KB are never touched) and say what to do next."""
+    cfg = camp.cfg
+    chains_path = oh_inputs(camp)
+    data = oh_convert(camp)
+    import longsession as LS  # noqa: PLC0415
+    sessions = [x for x in LS.load_sessions([data])]
+    prev = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects") or {}
+    rid = prev.get("hars_run_id") or f"e{re.sub(r'[^0-9TZ]', '', os.path.basename(camp.path)[:16])}"
+    if getattr(args, "new_projects", False):
+        # fresh, never-used project ids: the old nc-* projects may hold data mixed across projects by the
+        # pre-fix LightRAG workspace sharing (all instances of a server process bound to one in-memory store)
+        rid = f"e{re.sub(r'[^0-9TZ]', '', os.path.basename(camp.path)[:16])}r{time.strftime('%m%d%H%M', time.gmtime())}"
+    pdir = projects_dir_of(cfg, args)
+    pids = {x["sid"]: LS.make_project_id(rid, x["sid"]) for x in sessions}
+    if "default" in pids.values() or len(set(pids.values())) != len(pids):
+        raise HomeRunError("project ids collide or hit the reserved id `default`")
+    print(f"[oh-provision] {len(pids)} project(s) `nc-{rid}-<sid>` under {pdir} (run id {rid})")
+    if args.dry_run:
+        for sid, pid in pids.items():
+            print(f"  {pid}  <- session {sid}")
+        return 0
+    if getattr(args, "new_projects", False) and prev:
+        void = camp.p("oh", f"void-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
+        moved = []
+        for rel in ("ingest-run", "probe-run", "enrich-run", "agentic-run", "agentic-projects.json"):
+            if os.path.exists(camp.p("oh", rel)):
+                os.makedirs(void, exist_ok=True)
+                shutil.move(camp.p("oh", rel), os.path.join(void, rel))
+                moved.append(rel)
+        sdir = camp.p("steps")
+        for fn in sorted(os.listdir(sdir)) if os.path.isdir(sdir) else []:
+            if re.match(r"oh\.(ingest|probe|enrich|agentic)", fn):
+                os.makedirs(os.path.join(void, "steps"), exist_ok=True)
+                shutil.move(os.path.join(sdir, fn), os.path.join(void, "steps", fn))
+                moved.append("steps/" + fn)
+        print(f"[oh-provision] --new-projects: old run id {prev.get('hars_run_id')} retired; moved {len(moved)} item(s) "
+              f"depending on it to {void}. The old nc-* project dirs are NOT deleted (remove them by hand once the new "
+              "ingest works).")
+    os.makedirs(pdir, exist_ok=True)
+    for sid, pid in pids.items():
+        d = os.path.join(pdir, pid)
+        os.makedirs(d, exist_ok=True)
+        # the index dir's own name must be unique per project: the server isolates LightRAG instances by it
+        # (hars_memory.server.lightrag_init.isolated_workspace); `<pid>/index` for every project would collide
+        meta = {"project_id": pid, "name": pid, "index_dir": os.path.join(d, pid), "staging_dir": os.path.join(d, "staging"),
+                "visibility": "private", "description": f"neurocompact eval session {sid} (campaign {os.path.basename(camp.path)})"}
+        write_json(os.path.join(d, "project.json"), meta)
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj["c8_projects"] = {"ts": utc_iso(), "hars_run_id": rid, "projects_dir": pdir, "pids": pids, "eval_version": HOME_RUN_VERSION}
+    write_json(camp.p("campaign.json"), cj)
+    camp.step("oh.provision", lambda: {"projects": len(pids), "projects_dir": pdir, "hars_run_id": rid})
+    default_dir = os.path.abspath(os.path.expanduser(DEFAULT_PROJECTS_DIR))
+    print(f"\n[oh-provision] wrote {len(pids)} project.json under {pdir}.\n"
+          f"  NEXT (once): RESTART your existing HARS server so it discovers them (the registry reads the projects dir at start "
+          "only; there is no MCP/HTTP reload).\n"
+          + ("" if pdir == default_dir else
+             f"  Your server must run with HARS_MEMORY_PROJECTS_DIR={pdir} (not the default dir); also put `projects_dir = \"{pdir}\"` "
+             "under [hars] in home_run.toml.\n")
+          + f"  Then: home_run.py doctor --resume {os.path.basename(camp.path)}   (row projects.registered)\n"
+          f"        home_run.py oh-ingest --dry-run --resume {os.path.basename(camp.path)}   then without --dry-run\n"
+          f"        home_run.py oh-probe  --resume ...   then   home_run.py oh-enrich --resume ...\n"
+          "  The eval writes ONLY into these nc-* projects (memory_upsert_document) and never into `default`.")
+    return 0
+
+
+def estimate_oh_ingest(camp: Campaign, args, old: str) -> dict:
+    data = oh_convert(camp)
+    b = [int(x) for x in (getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])]
+    pj = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects") or {}
+    extra = oh_ls_extra(camp.cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--hars-layout", "project", "--ingest-only",
+                                                      "--hars-run-id", pj.get("hars_run_id") or "DRYRUN"]
+    s = estimate_ls(camp, "oh", data, b, "end", True, extra=extra, tag=".ingest", reused=True)
+    return {"track": "oh", "gen_usd": 0.0, "run_usd": s["run_usd"], "judge_usd": 0.0, "judged_items": 0,
+            "wall_hours": s["ingest_hours"], "budgets": b, "sessions": s["sessions"], "boundaries": s["boundaries"],
+            "ingest_hours": s["ingest_hours"], "unpriced_models": s["unpriced_models"], "cache_saving_usd": 0.0,
+            "note": "ingest only: memory_upsert_document of the dropped spans (same pieces, same boundaries) into the nc-* projects; "
+                    "cost = the flagged estimate of the SERVER-side extraction, wall-clock = pieces x extract_s_per_piece; "
+                    "no query writing, no asks, no judge"}
+
+
+def cmd_oh_ingest(camp: Campaign, args) -> int:
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-ingest")
+    cfg = camp.cfg
+    old = oh_old_run(camp, args)
+    data = oh_convert(camp)
+    if args.dry_run:
+        print_estimate(camp, estimate_oh_ingest(camp, args, old), "oh-ingest")
+        return 0
+    oh_projects(camp)
+    mark_reuse(camp, old, "oh-ingest")
+    est = camp.step("oh.ingest.estimate", lambda: {"estimate": estimate_oh_ingest(camp, args, old)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", "ingest-run")
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    ids = [c["chain_id"] for c in read_jsonl(oh_inputs(camp))]
+    extra = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old] + layout_args(camp, "project", ingested=False) + ["--ingest-only"]
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, extra, len(ids), args.accept_partial, "oh-ingest", step="oh.ingest.run")
+    rows = read_jsonl(os.path.join(run_dir, "ingest.jsonl"))
+    bad = [r for r in rows if not r.get("ok")]
+    camp.step("oh.ingest", lambda: {"projects": len(rows), "problems": len(bad), "dir": run_dir})
+    eu = [r.get("extract_usage") for r in rows if isinstance(r.get("extract_usage"), dict)]
+    if eu:
+        tok = sum(int(x.get("total_tokens") or 0) for x in eu)
+        unm = sum(int(x.get("documents_unmeasured") or 0) for x in eu)
+        print(f"[oh-ingest] extractor usage reported by the server: {tok:,} tokens, {sum(int(x.get('calls') or 0) for x in eu)} calls"
+              + (f"; {unm} document(s) WITHOUT usage (an older server or unchanged documents): the figure is partial" if unm else ""))
+    else:
+        print("[oh-ingest] the server reported no extract_usage (it predates C.10): run `oh-ingest-measure` for the ingest cost")
+    print(f"\n[oh-ingest] {len(rows)} project(s) written ({len(bad)} with problems). Next: home_run.py oh-probe --resume "
+          f"{os.path.basename(camp.path)}")
+    return 1 if bad else 0
+
+
+def cmd_oh_probe(camp: Campaign, args) -> int:
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-probe")
+    cfg = camp.cfg
+    layout = oh_layout(args)
+    S, D = layout_suffix(layout)
+    if layout != "project":
+        print("[oh-probe] --layout split-session is DIAGNOSTIC ONLY: it probes the server's session side channel, not the memory "
+              "(REPORT-PROTOCOL.md Amendment C.8)")
+    old = oh_old_run(camp, args)
+    chains_path = oh_inputs(camp)
+    ids = [c["chain_id"] for c in read_jsonl(chains_path)]
+    data = oh_convert(camp)
+    lx = layout_args(camp, layout, ingested=True) if not args.dry_run or layout == "project" and (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects") else \
+        (["--hars-layout", "project", "--hars-run-id", "DRYRUN", "--hars-ingested"] if layout == "project" else ["--hars-layout", "split-session"])
+    if args.dry_run:
+        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=True, layout_extra=lx), f"oh-probe{D}")
+        return 0
+    if layout == "project" and not camp.is_done("oh.ingest"):
+        raise HomeRunError("the project layout probes INGESTED projects: run `home_run.py oh-ingest --resume "
+                           f"{os.path.basename(camp.path)}` first (provision -> restart server -> doctor -> oh-ingest)")
+    mark_reuse(camp, old, f"oh-probe{D}")
+    est = camp.step(f"oh.probe{S}.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=True, layout_extra=lx)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", f"probe-run{D}")
+    budgets = [max(int(b) for b in (args.budgets or cfg["oh"]["budgets"]))]
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, probe=True, args=args, layout_extra=lx),
+                len(ids), args.accept_partial, f"oh-probe{D}", step=f"oh.probe{S}.run")
+    summ = read_json(os.path.join(run_dir, "probe-summary.json"), {}) or {}
+    rep = os.path.join(run_dir, "REPORT-probe.md")
+    if os.path.isfile(rep):
+        print("\n" + open(rep).read())
+
+    def done():
+        return {"summary": os.path.join(run_dir, "probe-summary.json"), "report": rep, "probe_jsonl": os.path.join(run_dir, "probe.jsonl"),
+                "n_questions": summ.get("n_questions"), "n_recoverable": summ.get("n_recoverable"), "layout": layout,
+                "headline": {k: (summ.get("all", {}).get(k) or {}).get("rate") for k in
+                             ("A_raw", "A_packed", "B_raw", "C_old_cap", "D_old_cap")}}
+    camp.step(f"oh.probe{S}", done)
+    print(f"\n[oh-probe] done. Read {rep}; next (paid): home_run.py oh-enrich --resume {os.path.basename(camp.path)}"
+          + (" --layout split-session" if layout != "project" else ""))
+    summarize_track(camp, "oh", run_dir)
+    return 0
+
+
+def merge_judged(old_judged: str, new_judged: str, records: list[dict], out: str) -> dict:
+    """judged.jsonl for metrics = the old verdicts of the reused rows (their rids) + the new verdicts; every valid row
+    must carry one."""
+    rids = {r["rid"] for r in records if r.get("valid") is True}
+    rows = [j for j in read_jsonl(old_judged) if j.get("rid") in rids]
+    new = read_jsonl(new_judged)
+    have = {j["rid"] for j in rows}
+    rows += [j for j in new if j.get("rid") not in have]
+    have = {j.get("rid") for j in rows if j.get("score") is not None or j.get("rid")}
+    missing = sorted(rids - have)
+    with open(out, "w") as f:
+        for j in rows:
+            f.write(json.dumps(j, ensure_ascii=False) + "\n")
+    return {"rows": len(rows), "from_old": len([j for j in rows if j.get("rid") in rids and j not in new]), "from_new": len(new),
+            "missing": missing}
+
+
+def cmd_oh_enrich(camp: Campaign, args) -> int:
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-enrich")
+    cfg = camp.cfg
+    layout = oh_layout(args)
+    S, D = layout_suffix(layout)
+    if layout != "project":
+        print("[oh-enrich] --layout split-session is DIAGNOSTIC ONLY: the recall is the server's session side channel, not the "
+              "memory (REPORT-PROTOCOL.md Amendment C.8). Use the project layout for the decision.")
+    have_pj = bool((read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects"))
+    ingested = layout == "project" and camp.is_done("oh.ingest")
+    lx = layout_args(camp, layout, ingested=ingested) if (not args.dry_run or have_pj or layout != "project") else \
+        ["--hars-layout", "project", "--hars-run-id", "DRYRUN"] + (["--hars-ingested"] if ingested else [])
+    old = oh_old_run(camp, args, need_judged=True)
+    chains_path = oh_inputs(camp)
+    ids = [c["chain_id"] for c in read_jsonl(chains_path)]
+    data = oh_convert(camp)
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    if args.dry_run:
+        print_estimate(camp, estimate_oh_enrich(camp, args, old, probe=False, layout_extra=lx), f"oh-enrich{D}")
+        return 0
+    if not camp.is_done(f"oh.probe{S}") and not args.skip_probe:
+        raise HomeRunError("run the recall probe first (it is cheap and tells whether the retrieval can work at all): "
+                           f"home_run.py oh-probe --resume {os.path.basename(camp.path)}{' --layout split-session' if layout != 'project' else ''}; or pass --skip-probe (recorded)")
+    if args.skip_probe:
+        print("[oh-enrich] --skip-probe: the recall probe is skipped (recorded)")
+    prof = P.load_profile(cfg["general"]["profile"])
+    jm = P.resolve_models(prof, {})["judge"]
+    old_map = read_json(os.path.join(old, "judge-mapping.json"), {}) or {}
+    old_jm = old_map.get("judge_model") or old_map.get("model")
+    if old_jm and old_jm != jm:
+        raise HomeRunError(f"the old verdicts were made by judge {old_jm!r}, this profile judges with {jm!r}: a paired "
+                           "contrast across two judges is not valid. Use the same profile / judge model.")
+    mark_reuse(camp, old, f"oh-enrich{D}")
+    est = camp.step(f"oh.enrich{S}.estimate", lambda: {"estimate": estimate_oh_enrich(camp, args, old, probe=False, layout_extra=lx)})["estimate"]
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    run_dir = camp.p("oh", f"enrich-run{D}")
+    ls_run_step(camp, "oh", data, run_dir, budgets, "end", True, oh_reuse_extra(cfg, old, args=args, layout_extra=lx), len(ids),
+                args.accept_partial, f"oh-enrich{D}", step=f"oh.enrich{S}.run")
+    summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
+    par = summ.get("parity_enriched") or {}
+    bad = {B: v for B, v in par.items() if not v.get("in_window")}
+    for B, v in par.items():
+        print(f"[parity] B={B}: nc-enriched / baseline realized ask-time memory {v['ratio_enriched_vs_baseline']} "
+              f"(window {PARITY_LO}-{PARITY_HI}) {'IN' if v['in_window'] else 'OUTSIDE'}")
+    if bad and not getattr(args, "accept_parity_fail", False):
+        raise HomeRunError(f"parity FAILED for B={sorted(bad)}: the realized nc-enriched memory is outside [{PARITY_LO}, {PARITY_HI}] "
+                           "of the baseline's. Nothing was judged. Look at oh/enrich-run/summary.json and the enrich/ artifacts, "
+                           "or pass --accept-parity-fail (recorded; the metrics win_mem_token_ratio gate will report it).")
+    rec = os.path.join(run_dir, "records.jsonl")
+    ji, ji_new = os.path.join(run_dir, "judge-input.jsonl"), os.path.join(run_dir, "judge-input.new.jsonl")
+    old_judged = os.path.join(old, "judged.jsonl")
+    camp.step(f"oh.enrich{S}.export", lambda: (camp.run(f"oh.enrich{S}.export", [camp.script("export_longsession_judge.py"), "--records", rec,
+                                                                           "--sessions", data, "--out", ji]), {"out": ji})[1])
+    camp.step(f"oh.enrich{S}.export_new", lambda: (camp.run(f"oh.enrich{S}.export_new", [
+        camp.script("export_longsession_judge.py"), "--records", rec, "--sessions", data, "--out", ji_new,
+        "--skip-judged", old_judged]), {"out": ji_new, "items": sum(1 for _ in open(ji_new))})[1])
+    if args.skip_judge:
+        print("[oh-enrich] --skip-judge: stopping before the judge")
+        return 0
+    new_j, mp = os.path.join(run_dir, "judged.new.jsonl"), os.path.join(run_dir, "judge-mapping.json")
+    camp.step(f"oh.enrich{S}.judge", lambda: judge_step(camp, "oh", f"oh-enrich{D}", ji_new, new_j, mp, args.accept_partial,
+                                                    step=f"oh.enrich{S}.judge"))
+    merged = os.path.join(run_dir, "judged.jsonl")
+
+    def do_merge():
+        info = merge_judged(old_judged, new_j, read_jsonl(rec), merged)
+        if info["missing"]:
+            raise HomeRunError(f"{len(info['missing'])} valid row(s) have no judge verdict (old or new): {info['missing'][:3]}")
+        return info
+    camp.step(f"oh.enrich{S}.merge", do_merge)
+    excl = oh_exclusions(camp)
+    xs = (["--exclude-sid", "^(?:" + "|".join(re.escape(c) for c in excl) + ")$"] if excl else [])
+    camp.step(f"oh.enrich{S}.metrics", lambda: metrics_step(
+        camp, f"oh.enrich{S}.metrics", rec, merged, mp, ji, os.path.join(run_dir, "REPORT-oh-enrich.md"),
+        os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only", "--ls-family", "oh"] + xs))
+
+    def do_funnel():
+        argv = [camp.script("funnel_chains.py"), "--run", run_dir, "--chains", chains_path,
+                "--out-md", os.path.join(run_dir, "funnel.md"), "--out-json", os.path.join(run_dir, "funnel.json")]
+        if cfg["oh"].get("graph_store"):
+            argv += ["--graph-store", cfg["oh"]["graph_store"]]
+        rc, _ = camp.run(f"oh.enrich{S}.funnel", argv, check=False)
+        return {"md": os.path.join(run_dir, "funnel.md"), "rc": rc, "note": "best effort"}
+    camp.step(f"oh.enrich{S}.funnel", do_funnel)
+    summarize_track(camp, "oh", run_dir)
+    print(f"\n[oh-enrich] report: {os.path.join(run_dir, 'REPORT-oh-enrich.md')}; next: home_run.py bundle --resume {os.path.basename(camp.path)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Amendment C.9: the agentic track (PRIMARY question) - workspaces, then agents with / without memory
+# ---------------------------------------------------------------------------
+AGENTIC_ARMS = "sum,sum+mem"
+DEFAULT_WORKSPACE_CACHE = "~/.cache/nc-eval/workspaces"
+
+
+def workspace_cache_of(cfg: dict, args=None) -> str:
+    raw = getattr(args, "cache_dir", None) or cfg["oh"].get("workspace_cache") or DEFAULT_WORKSPACE_CACHE
+    return os.path.abspath(os.path.expanduser(raw))
+
+
+def oh_source_dir(camp: Campaign) -> str:
+    d = camp.cfg["oh"].get("artifact_dir")
+    if d and os.path.isdir(d):
+        return d
+    return (read_json(camp.p("inputs", "oh_inputs.json"), {}) or {}).get("source_dir") or ""
+
+
+def cmd_oh_workspaces(camp: Campaign, args) -> int:
+    """Provision one read-only workspace per eval session (cache dir at home, network needed): the SWE-bench repo at
+    base_commit (+ the session's final patch ONLY when --instances supplies model_patch; the OH import keeps neither
+    base_commit nor the patch). Never the transcript, never git history. Spends nothing."""
+    import oh_workspaces as OW  # noqa: PLC0415
+    camp.reuse_ok = True
+    cfg = camp.cfg
+    chains = read_jsonl(oh_inputs(camp))
+    cache = workspace_cache_of(cfg, args)
+    dest = os.path.join(cache, "ws", os.path.basename(camp.path))
+    instances = OW.load_instances(getattr(args, "instances", None))
+    oh_dir = oh_source_dir(camp)
+    infos = OW.session_infos(oh_dir, chains)
+    print(f"[oh-workspaces] {len(chains)} session(s); cache {cache}; workspaces -> {dest}")
+    for cid, info in infos.items():
+        row = instances.get(info.get("instance_id") or "", {})
+        print(f"  {cid}: instance {info.get('instance_id') or row.get('instance_id') or '?'} repo {info.get('repo') or row.get('repo') or '?'}"
+              f"  base_commit {'given' if row.get('base_commit') else 'from the SWE-bench Verified dataset'}"
+              f"  final patch {'given' if row.get('model_patch') else 'from the submission (' + OW.SUBMISSION_PREFIX + 'logs/<iid>/patch.diff)'}")
+    if args.dry_run:
+        return 0
+    summ = OW.provision(chains, oh_dir, cache, dest, instances, getattr(args, "clone_url", None) or OW.CLONE_URL)
+    if summ["errors"]:
+        raise HomeRunError(f"{len(summ['errors'])} workspace(s) could not be built: {summ['errors']}")
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj["c9_workspaces"] = {"ts": utc_iso(), "dest": dest, "cache": cache, "kinds": summ["kinds"], "eval_version": HOME_RUN_VERSION}
+    write_json(camp.p("campaign.json"), cj)
+    camp.step("oh.workspaces", lambda: {"dest": dest, "kinds": summ["kinds"], "sessions": len(summ["workspaces"])})
+    kinds = summ["kinds"]
+    print(f"\n[oh-workspaces] {len(summ['workspaces'])} workspace(s): {kinds}")
+    if "base_commit+final_patch" not in kinds or kinds.get("base_commit"):
+        print("  NOTE: workspace = base_commit WITHOUT the session's final patch for "
+              f"{kinds.get('base_commit', 0)} session(s) (the submission's patch.diff was missing or did not apply; pass "
+              "--instances with model_patch). "
+              "The agent then cannot find the session's edits in the workspace; REPORT-PROTOCOL.md C.9 states this limit.")
+    print(f"  next: home_run.py oh-agentic --dry-run --resume {os.path.basename(camp.path)}")
+    return 0
+
+
+def agentic_c10(args) -> bool:
+    """Amendment C.10 mode: the control arms and / or a reused C.9 run. Own run dir, own steps, so the finished C.9 run is untouched."""
+    return bool(getattr(args, "controls", False) or getattr(args, "reuse_agentic_run", None))
+
+
+def agentic_names(args) -> dict:
+    if agentic_c10(args):
+        return {"dir": "agentic-c10-run", "pmap": "agentic-c10-projects.json", "step": "oh.agentic.c10", "est": "oh-agentic-c10-estimate.json",
+                "report": "REPORT-oh-agentic-c10.md", "metrics": "metrics-agentic-c10.json"}
+    return {"dir": "agentic-run", "pmap": "agentic-projects.json", "step": "oh.agentic", "est": "oh-agentic-estimate.json",
+            "report": "REPORT-oh-agentic.md", "metrics": "metrics-agentic.json"}
+
+
+def agentic_arms(args) -> list[str]:
+    import run_agentic as RA  # noqa: PLC0415
+    if getattr(args, "controls", False) and getattr(args, "arms", None):
+        raise HomeRunError("--controls and --arms are alternatives (--controls = " + ",".join(RA.CONTROL_ARMS) + ")")
+    spec = ",".join(RA.CONTROL_ARMS) if getattr(args, "controls", False) else (getattr(args, "arms", None) or AGENTIC_ARMS)
+    arms = [x.strip() for x in spec.split(",") if x.strip()]
+    bad = [x for x in arms if x not in RA.ALL_ARMS]
+    if bad or not arms:
+        raise HomeRunError(f"--arms: unknown {bad}; choose from {RA.ALL_ARMS}")
+    return arms
+
+
+def agentic_reuse_dir(camp: Campaign, args) -> str:
+    """The finished C.9 agentic run whose rows / verdicts are reused ('' = none)."""
+    if not agentic_c10(args):
+        return ""
+    d = os.path.abspath(getattr(args, "reuse_agentic_run", None) or camp.p("oh", "agentic-run"))
+    miss = [fn for fn in ("records.jsonl", "judged.jsonl", "summary.json") if not os.path.isfile(os.path.join(d, fn))]
+    if miss:
+        raise HomeRunError(f"{d} is not a finished C.9 agentic run (missing {miss}): the control arms reuse its `sum` and `sum+mem` rows "
+                           "and verdicts. --reuse-agentic-run <that dir>, or run `oh-agentic` (without --controls) first.")
+    summ = read_json(os.path.join(d, "summary.json"), {}) or {}
+    if summ.get("n_missing"):
+        raise HomeRunError(f"{d} is incomplete ({summ.get('n_missing')} row(s) missing): finish it before reusing it")
+    return d
+
+
+def agentic_reuse_arms(arms: list[str], reuse_dir: str) -> list[str]:
+    """Arms of the old run to copy: those whose C.10 label is not itself a run arm."""
+    import run_agentic as RA  # noqa: PLC0415
+    return [o for o, lab in RA.REUSED_ARM_LABELS.items() if reuse_dir and lab not in arms]
+
+
+def agentic_sources(camp: Campaign, args, old: str):
+    import longsession as LS  # noqa: PLC0415
+    import run_agentic as RA  # noqa: PLC0415
+    data = oh_convert(camp)
+    sessions = {s["sid"]: s for s in LS.load_sessions([data])}
+    arms = agentic_arms(args)
+    mb = int((getattr(args, "budgets", None) or camp.cfg["oh"]["budgets"])[0])
+    try:
+        src = RA.load_sources(old, sessions, arms, mb)
+    except RA.SourceError as e:
+        raise HomeRunError(f"oh-agentic: {e}")
+    return data, sessions, arms, src
+
+
+def piece_chars_of(cfg: dict) -> int:
+    """run_longsession --piece-chars of the OH track (default 8000; an [oh] extra_args override is honoured)."""
+    ex = [str(x) for x in (cfg["oh"].get("extra_args") or [])]
+    if "--piece-chars" in ex:
+        try:
+            return int(ex[ex.index("--piece-chars") + 1])
+        except (IndexError, ValueError):
+            pass
+    return 8000
+
+
+def retrieval_cap_of(args) -> int:
+    return int(getattr(args, "retrieval_max_chars", None) or getattr(args, "memory_max_chars", None) or 6000)
+
+
+def estimate_oh_agentic(camp: Campaign, args, old: str) -> dict:
+    import run_agentic as RA  # noqa: PLC0415
+    data, sessions, arms, src = agentic_sources(camp, args, old)
+    reuse = agentic_reuse_dir(camp, args)
+    reused = [RA.REUSED_ARM_LABELS[o] for o in agentic_reuse_arms(arms, reuse)]
+    prof = P.load_profile(camp.cfg["general"]["profile"])
+    model = P.resolve_models(prof, {})["agent"]
+    old_rows = read_jsonl(os.path.join(reuse, "records.jsonl")) if reuse else []
+    sids = sorted(src["summary"])
+    est = RA.estimate_for(sessions, src, sids, arms, prof, model, args.max_steps, retrieval_cap_of(args), judge_unit_usd(camp.cfg),
+                          piece_chars_of(camp.cfg), old_rows, reused)
+    est["run_usd"] = est["run_usd_guard"]            # the cap check: the no-cache expectation (conservative); the oracle's cached prefix is priced cached
+    est["judge_usd_total"] = est["judge_usd"]
+    est["reuse_dir"] = reuse or None
+    est["retrieval_max_chars"] = retrieval_cap_of(args)
+    return est
+
+
+def print_agentic_estimate(camp: Campaign, est: dict, args=None) -> None:
+    caps = {ph: cap_for(camp.cfg, "oh", ph) for ph in ("run", "judge")}
+    print(f"\n[oh-agentic] estimate (zero spend), model: steps x tokens (assumptions below), cache reads priced separately:\n"
+          f"  {est['questions']} questions x {len(est['arms'])} arm(s) {est['arms']} = {est['judge_items']} agent runs, {est['sessions']} sessions"
+          + (f"; REUSED from {est['reuse_dir']}: {est['reused_arms']} (no run, no judge)" if est.get("reuse_dir") else "") + "\n"
+          f"  run: expected {fmt_usd(est['run_usd_expected_with_cache'])} with cache / {fmt_usd(est['run_usd_expected_without_cache'])} without; "
+          f"calibrated to the observed C.9 step counts {fmt_usd(est.get('run_usd_expected_calibrated', 0.0))}; "
+          f"upper bound (every question runs {est['max_steps']} steps, no cache) {fmt_usd(est['run_usd_upper_bound'])}\n"
+          f"  judge: {est['judge_items']} items = {fmt_usd(est['judge_usd'])} | caps run {caps['run']:.2f} / judge {caps['judge']:.2f}\n"
+          f"  mean tokens per question (all input incl. cache reads + output) ~{est['mean_tokens_per_question']}\n"
+          f"  METHOD per arm: input_k = P0 + (k-1)(o + r) (P0 = system + tool schemas + summary + question [+ the whole dropped transcript for "
+          f"the oracle, cached once per session and read at every step], o = output per step, r = tool-result tokens: workspace result, or "
+          f"min(cap/3.6, 1800)*0.4 + 0.6*workspace for the capped retrieval arms, cap {est.get('retrieval_max_chars')} chars); step k reads "
+          f"step k-1 from the cache. Figures: (8 steps) = the stated assumption; (n steps) = the same model with the mean steps OBSERVED in the "
+          f"C.9 run (sum+mem, sum+bm25, sum+grep take sum+mem's, sum and oracle take sum's)")
+    for arm, v in est["per_arm"].items():
+        print(f"    {arm:9s} ${v['usd_with_cache']:.3f} (8 steps) | ${v['usd_calibrated']:.3f} ({v['steps_calibrated']} steps) | "
+              f"no cache ${v['usd_without_cache']:.3f} | ~{v['tokens_per_question']} tok/q")
+    print(f"  power (pre-run guess): {est['mde_prior']['rule']} -> MDE ~{est['mde_prior']['mde_relative_to_mean_tokens']:.0%} of the mean "
+          f"(~{est['mde_prior']['mde_tokens']} tokens)\n"
+          f"  assumptions: {est['assumptions']}")
+    write_json(camp.p(agentic_names(args)["est"] if args is not None else "oh-agentic-estimate.json"), {"ts": utc_iso(), **est})
+
+
+def merge_agentic_judged(old_judged: str, new_judged: str, records: list[dict], out: str, remap: dict[str, str] | None = None) -> dict:
+    """judged.jsonl for metrics_agentic = the C.9 verdicts of the REUSED rows (rid mapped to the C.10 label: `q::sum+mem` ->
+    `q::sum+mem@uncapped`) + the new verdicts. Every valid row must carry one (a missing verdict is an error, not a zero)."""
+    rids = {r["rid"] for r in records if r.get("valid") is True}
+    reused = {r["rid"]: r.get("reused_rid") or r["rid"] for r in records if r.get("valid") is True and r.get("reused_from")}
+    back = {old: new for new, old in reused.items()}
+    rows, have = [], set()
+    for j in read_jsonl(old_judged):
+        new = back.get(j.get("rid"))
+        if new and new not in have:
+            rows.append({**j, "rid": new, "reused_rid": j.get("rid"), "reused_verdict": True})
+            have.add(new)
+    for j in read_jsonl(new_judged):
+        if j.get("rid") in rids and j["rid"] not in have:
+            rows.append(j)
+            have.add(j["rid"])
+    missing = sorted(rids - have)
+    with open(out, "w") as f:
+        for j in rows:
+            f.write(json.dumps(j, ensure_ascii=False) + "\n")
+    return {"rows": len(rows), "from_old": sum(1 for j in rows if j.get("reused_verdict")), "from_new": len(rows) - sum(1 for j in rows if j.get("reused_verdict")),
+            "missing": missing, "unparsed": sum(1 for j in rows if j.get("judge_unparsed"))}
+
+
+def ingest_for_metrics(camp: Campaign) -> str:
+    """The MEASURED ingest cost file for metrics_agentic --ingest-json, best first: the C.8 ingest run itself when every document
+    reported its extract_usage (a server older than C.10 did not), else the oh-ingest-measure extrapolation. '' = none."""
+    s1 = read_json(camp.p("oh", "ingest-run", "summary.json"), {}) or {}
+    m1 = s1.get("hars_extraction_measured") or {}
+    if m1.get("complete") and m1.get("total_tokens"):
+        return camp.p("oh", "ingest-run", "summary.json")
+    m2 = camp.p("oh", "ingest-measure", "measure.json")
+    return m2 if os.path.isfile(m2) else ""
+
+
+def metrics_agentic_argv(camp: Campaign, rec: str, judged: str, report: str, mj: str) -> list[str]:
+    argv = [camp.script("metrics_agentic.py"), "--records", rec, "--judged", judged, "--out", report, "--json", mj]
+    ing = ingest_for_metrics(camp)
+    if ing:
+        argv += ["--ingest-json", ing]
+    return argv
+
+
+def cmd_oh_agentic(camp: Campaign, args) -> int:
+    """Amendment C.9 (PRIMARY) / C.10: agents with workspace tools, with / without memory_recall, per question; the C.10 control arms
+    (sum+bm25, sum+grep, oracle) on the same questions; judge --outcome; metrics_agentic."""
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-agentic")
+    cfg = camp.cfg
+    nm = agentic_names(args)
+    old = oh_old_run(camp, args, need_judged=True)
+    est = estimate_oh_agentic(camp, args, old)
+    if args.dry_run:
+        print_agentic_estimate(camp, est, args)
+        return 0
+    arms = est["arms"]
+    reuse = est["reuse_dir"] or ""
+    if any(a in ("sum+mem", "note+mem") for a in arms) and not camp.is_done("oh.ingest"):
+        raise HomeRunError("oh-agentic needs the C.8 project layout ingested: run `home_run.py oh-provision`, restart the server, "
+                           f"`oh-ingest --resume {os.path.basename(camp.path)}` first")
+    if not camp.is_done("oh.workspaces"):
+        raise HomeRunError(f"run `home_run.py oh-workspaces --resume {os.path.basename(camp.path)}` first (workspaces are provisioned at home)")
+    if "note+mem" in arms and not camp.is_done(nm["step"] + ".run"):
+        print("[oh-agentic] note+mem is the OPTIONAL arm: the protocol (C.10) runs it only if the GAIN rule of metrics_agentic is met "
+              "(sum+mem gain over sum >= +0.10 accuracy with CI_lo > 0 and an A_BETTER* verdict, and neither bm25 nor grep beats sum+mem)")
+    prof = P.load_profile(cfg["general"]["profile"])
+    jm = P.resolve_models(prof, {})["judge"]
+    old_map = read_json(os.path.join(old, "judge-mapping.json"), {}) or {}
+    old_jm = old_map.get("judge_model") or old_map.get("model")
+    if old_jm and old_jm != jm:
+        raise HomeRunError(f"the C.6 campaign was judged by {old_jm!r}, this profile judges with {jm!r}: refusing (same judge required)")
+    if reuse:
+        rj = read_json(os.path.join(reuse, "judge-mapping.json"), {}) or {}
+        rjm = rj.get("judge_model") or rj.get("model")
+        if rjm and rjm != jm:
+            raise HomeRunError(f"the reused C.9 agentic verdicts were made by judge {rjm!r}, this profile judges with {jm!r}: refusing")
+    mark_reuse(camp, old, "oh-agentic")
+    guard_estimate(camp, "oh", est, args.accept_partial)
+    print_agentic_estimate(camp, est, args)
+    data = oh_convert(camp)
+    pj = oh_projects(camp) if any(a in ("sum+mem", "note+mem") for a in arms) else {"pids": {}}
+    pmap = camp.p("oh", nm["pmap"])
+    write_json(pmap, pj["pids"])
+    ws_dest = (read_json(camp.p("campaign.json"), {}) or {}).get("c9_workspaces", {}).get("dest") or ""
+    run_dir = camp.p("oh", nm["dir"])
+    mb = int((getattr(args, "budgets", None) or cfg["oh"]["budgets"])[0])
+    cap = retrieval_cap_of(args)
+
+    def go():
+        rem = camp.remaining("oh", "run")
+        argv = [camp.script("run_agentic.py"), "--sessions", data, "--reuse-run", old, "--workspaces", ws_dest, "--projects-map", pmap,
+                "--arms", ",".join(arms), "--mem-budget", str(mb), "--max-steps", str(args.max_steps),
+                "--max-question-tokens", str(args.max_question_tokens), "--retrieval-max-chars", str(cap),
+                "--piece-chars", str(piece_chars_of(cfg)), "--bm25-passage-chars", str(getattr(args, "bm25_passage_chars", 1500)),
+                "--concurrency", str(args.concurrency), "--mcp", cfg["general"]["mcp"], "--budget-usd", str(rem)]
+        if reuse:
+            argv += ["--reuse-agentic-run", reuse, "--reuse-arms", ",".join(agentic_reuse_arms(arms, reuse))]
+        argv += profile_args(cfg) if not cfg["general"].get("_offline") else ["--mock-llm", "--fake-hars"]
+        if os.path.isfile(os.path.join(run_dir, "config.json")):
+            argv += ["--resume", run_dir]
+        else:
+            if os.path.isdir(run_dir) and os.listdir(run_dir):
+                camp.quarantine(run_dir)
+            argv += ["--out", run_dir, "--name", "oh"]
+        rc, _ = camp.run(nm["step"] + ".run", argv, check=False)
+        spent, src_ = longsession_spend(run_dir)
+        camp.charge("oh", "run", nm["step"] + ".run", spent, source=run_dir, note=src_)
+        summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
+        if rc != 0 or summ.get("n_missing"):
+            raise HomeRunError(f"{nm['step']}.run incomplete (exit {rc}, {summ.get('n_missing')} of {summ.get('expected')} rows missing); "
+                               f"log logs/{nm['step']}.run.log. Re-run the same command to RESUME (finished rows are kept).")
+        return {"out": run_dir, "rows": summ.get("rows"), "spent_usd": spent, "retrieval_cap": summ.get("retrieval_cap")}
+    camp.step(nm["step"] + ".run", go)
+    rec, ji = os.path.join(run_dir, "records.jsonl"), os.path.join(run_dir, "judge-input.jsonl")
+    camp.step(nm["step"] + ".export", lambda: (camp.run(nm["step"] + ".export", [camp.script("run_agentic.py"), "--export-judge", "--out", run_dir,
+                                                                                  "--sessions", data, "--piece-chars", str(piece_chars_of(cfg))]), {"out": ji})[1])
+    if args.skip_judge:
+        print("[oh-agentic] --skip-judge: stopping before the judge")
+        return 0
+    judged, mp = os.path.join(run_dir, "judged.jsonl"), os.path.join(run_dir, "judge-mapping.json")
+    if reuse:
+        new_j = os.path.join(run_dir, "judged.new.jsonl")
+        camp.step(nm["step"] + ".judge", lambda: judge_step(camp, "oh", "oh-agentic", ji, new_j, mp, args.accept_partial,
+                                                           step=nm["step"] + ".judge", extra_args=["--outcome"]))
+
+        def do_merge():
+            info = merge_agentic_judged(os.path.join(reuse, "judged.jsonl"), new_j, read_jsonl(rec), judged)
+            if info["missing"]:
+                raise HomeRunError(f"{len(info['missing'])} valid row(s) have no judge verdict (reused or new): {info['missing'][:3]}")
+            if info["unparsed"]:
+                print(f"[oh-agentic] {info['unparsed']} verdict(s) are judge_unparsed: excluded from accuracy by metrics_agentic (reported)")
+            return info
+        camp.step(nm["step"] + ".merge", do_merge)
+    else:
+        camp.step(nm["step"] + ".judge", lambda: judge_step(camp, "oh", "oh-agentic", ji, judged, mp, args.accept_partial,
+                                                           step=nm["step"] + ".judge", extra_args=["--outcome"]))
+    report, mj = os.path.join(run_dir, nm["report"]), os.path.join(run_dir, nm["metrics"])
+
+    def do_metrics():
+        camp.run(nm["step"] + ".metrics", metrics_agentic_argv(camp, rec, judged, report, mj))
+        return {"report": report, "json": mj}
+    camp.step(nm["step"] + ".metrics", do_metrics)
+    summarize_track(camp, "oh", run_dir)
+    print(f"\n[oh-agentic] report: {report}; next: home_run.py oh-ingest-measure --resume {os.path.basename(camp.path)} (the ingest "
+          f"cost for the token comparison), then home_run.py bundle --resume {os.path.basename(camp.path)}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Amendment C.10: measure the ingest (extractor) tokens and USD on a few throwaway projects
+# ---------------------------------------------------------------------------
+def measure_sids(all_sids: list[str], k: int) -> list[str]:
+    """K sessions spread over the sorted sids (deterministic): every (n/K)-th."""
+    ss = sorted(all_sids)
+    k = max(1, min(int(k), len(ss)))
+    step = max(1, len(ss) // k)
+    return ss[::step][:k]
+
+
+def measure_delete_instructions(pdir: str, pids: list[str], base_collection: str = "<base collection>") -> str:
+    lines = [f"  rm -r {os.path.join(pdir, pid)}" for pid in pids]
+    q = [f"  curl -X DELETE http://localhost:6333/collections/{base_collection}_{pid}" for pid in pids]
+    return ("The throwaway projects (they are NOT the nc-* projects of the main ingest and nothing reads them):\n"
+            + "\n".join(f"  {pid}" for pid in pids)
+            + "\nDelete them when done (stop nothing; restart the server once afterwards so it forgets them):\n"
+            + "\n".join(lines) + "\n  # and their Qdrant collections (if Qdrant is the vector store; the collection name is "
+            "<your base collection>_<project id>):\n" + "\n".join(q))
+
+
+def cmd_oh_ingest_measure(camp: Campaign, args) -> int:
+    """Re-ingest K sessions into FRESH THROWAWAY projects (ids `nc-<run id>m<MMDDHHMM>-<sid>`, never the main nc-* projects) with the
+    fixed server, to MEASURE the extractor's calls / tokens / USD per session (the server's `extract_usage`). Two invocations: the first
+    writes the project dirs (the server reads its projects dir at start only), you restart the server, the second ingests. The mean
+    per session x the number of sessions is the extrapolated ingest cost the token comparison amortises over the questions."""
+    camp.reuse_ok = True
+    guard_spend(camp, "oh-ingest-measure")
+    cfg = camp.cfg
+    import longsession as LS  # noqa: PLC0415
+    old = oh_old_run(camp, args)
+    data = oh_convert(camp)
+    pj = oh_projects(camp)
+    sessions = [x for x in LS.load_sessions([data])]
+    k = int(getattr(args, "sessions", None) or 3)
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    plan = cj.get("c10_ingest_measure") if not getattr(args, "new_measure", False) else None
+    if plan and plan.get("k") != k:
+        plan = None
+    mcp = getattr(args, "mcp", None) or cfg["general"]["mcp"]
+    if plan and plan.get("measured_ts") and not args.dry_run:
+        # a finished measurement is never silently redone or rewritten: a new server config needs --new-measure
+        print(f"[oh-ingest-measure] plan {plan['hars_run_id']} was already MEASURED at {plan['measured_ts']} against {plan.get('mcp', '?')}; "
+              f"its result is {camp.p('oh', 'ingest-measure', plan['hars_run_id'], 'measure.json')}.\n"
+              "  Nothing was run and nothing was rewritten. To measure again (e.g. after changing the server's chunking / gleaning), pass "
+              "--new-measure (fresh throwaway projects, a fresh run dir).")
+        return 0
+    if not plan:
+        sids = measure_sids([x["sid"] for x in sessions], k)
+        used = set((cj.get("c10_ingest_measures") or {})) | ({(cj.get("c10_ingest_measure") or {}).get("hars_run_id")} - {None})
+        rid_m = f"{pj['hars_run_id']}m{time.strftime('%m%d%H%M', time.gmtime())}"
+        n_ = 1
+        while rid_m in used:                                           # a second plan in the same minute must still be NEW
+            n_ += 1
+            rid_m = f"{pj['hars_run_id']}m{time.strftime('%m%d%H%M', time.gmtime())}{chr(96 + min(n_, 26))}"
+        pdir = projects_dir_of(cfg, args)
+        plan = {"k": k, "hars_run_id": rid_m, "sids": sids, "projects_dir": pdir, "pids": {sid: LS.make_project_id(rid_m, sid) for sid in sids},
+                "ts": utc_iso(), "provisioned": False, "main_run_id": pj["hars_run_id"], "n_sessions_total": len(sessions), "mcp": mcp}
+        if set(plan["pids"].values()) & set(pj["pids"].values()) or "default" in plan["pids"].values():
+            raise HomeRunError("a throwaway project id collides with a main nc-* project or `default`")
+    print(f"[oh-ingest-measure] {len(plan['sids'])} of {len(sessions)} session(s) {plan['sids']} -> throwaway projects `nc-{plan['hars_run_id']}-<sid>` "
+          f"under {plan['projects_dir']} (the main nc-{pj['hars_run_id']}-* projects are not touched)")
+    est = estimate_oh_ingest(camp, args, old)
+    sc = len(plan["sids"]) / max(1, len(sessions))
+    print(f"  estimate (zero spend, flagged: the SERVER-side extraction, scaled to {len(plan['sids'])}/{len(sessions)} sessions): "
+          f"~{fmt_usd(est['run_usd'] * sc)}, ~{est['ingest_hours'] * sc:.1f} h of ingest wall-clock; the measurement REPLACES this guess with the "
+          "server's own token counts")
+    print(measure_delete_instructions(plan["projects_dir"], sorted(plan["pids"].values())))
+    if args.dry_run:
+        return 0
+    if not plan.get("provisioned"):
+        os.makedirs(plan["projects_dir"], exist_ok=True)
+        for sid, pid in plan["pids"].items():
+            d = os.path.join(plan["projects_dir"], pid)
+            os.makedirs(d, exist_ok=True)
+            write_json(os.path.join(d, "project.json"), {"project_id": pid, "name": pid, "index_dir": os.path.join(d, pid),
+                                                         "staging_dir": os.path.join(d, "staging"), "visibility": "private",
+                                                         "description": f"THROWAWAY ingest-cost measurement of session {sid} (campaign {os.path.basename(camp.path)}); delete me"})
+        plan["provisioned"] = True
+        cj["c10_ingest_measure"] = plan
+        write_json(camp.p("campaign.json"), cj)
+        print(f"\n[oh-ingest-measure] wrote {len(plan['pids'])} throwaway project.json. NEXT: restart your HARS server ONCE (it reads its "
+              f"projects dir at start only; HARS_MEMORY_PROJECTS_DIR={plan['projects_dir']}), then re-run THE SAME command:\n"
+              f"  home_run.py oh-ingest-measure --resume {os.path.basename(camp.path)} --sessions {k}")
+        return 3
+    if plan.get("mcp") and plan["mcp"] != mcp:
+        raise HomeRunError(f"plan {plan['hars_run_id']} was provisioned for {plan['mcp']}, this call targets {mcp}; pass the same --mcp, "
+                           "or --new-measure for a new plan")
+    cj["c10_ingest_measure"] = plan
+    write_json(camp.p("campaign.json"), cj)
+    if not cfg["general"].get("_offline") and camp.guards_enabled:          # a fake runner (tests) has no server to ask
+        try:
+            lp = (getattr(camp, "probes", None) or Probes()).mcp(mcp, "memory_list_projects", {}, 60)
+            have = {p.get("project_id") for p in (lp or {}).get("projects", [])}
+        except Exception as e:  # noqa: BLE001
+            raise HomeRunError(f"memory_list_projects failed ({type(e).__name__}: {str(e)[:120]}): is the server up?")
+        miss = [p for p in plan["pids"].values() if p not in have]
+        if miss:
+            raise HomeRunError(f"{len(miss)} throwaway project(s) are not registered on the server ({miss[:2]}): restart it once, then re-run")
+    mdir = camp.p("oh", "ingest-measure", plan["hars_run_id"])        # one dir per plan: a new plan never resumes an old run
+    ddir = os.path.join(mdir, "ls-data")                              # the K sessions only (run_longsession --sessions takes files / dirs)
+    os.makedirs(ddir, exist_ok=True)
+    wanted = set(plan["sids"])
+    for x in sessions:
+        if x["sid"] in wanted and x.get("_path"):
+            shutil.copy2(x["_path"], os.path.join(ddir, os.path.basename(x["_path"])))
+    run_dir = os.path.join(mdir, "run")
+    budgets = [int(b) for b in (args.budgets or cfg["oh"]["budgets"])]
+    extra = oh_ls_extra(cfg, OH_ENRICH_ARMS) + ["--reuse-run", old, "--hars-layout", "project", "--hars-run-id", plan["hars_run_id"], "--ingest-only"]
+    saved_mcp = cfg["general"]["mcp"]
+    cfg["general"]["mcp"] = mcp                                       # ls_run_step passes the campaign's --mcp
+    try:
+        ls_run_step(camp, "oh", ddir, run_dir, budgets, "end", True, extra, len(plan["sids"]), args.accept_partial, "oh-ingest-measure",
+                    step=f"oh.ingest.measure.run.{plan['hars_run_id']}")
+    finally:
+        cfg["general"]["mcp"] = saved_mcp
+    rows = read_jsonl(os.path.join(run_dir, "ingest.jsonl"))
+    # the rows must come from THIS plan's throwaway projects and from real extraction, never from an earlier run
+    want = set(plan["pids"].values())
+    foreign = [r.get("project") for r in rows if r.get("project") not in want]
+    if foreign:
+        raise HomeRunError(f"ingest rows of other projects in {run_dir} ({foreign[:2]}): refusing to report them as this plan's measurement")
+    stale = [r.get("sid") for r in rows if str(r.get("ts") or "") < str(plan["ts"])]
+    if stale:
+        raise HomeRunError(f"ingest rows older than plan {plan['hars_run_id']} ({stale[:3]}): not a fresh measurement")
+    idle = [r.get("sid") for r in rows if not ((r.get("extract_usage") or {}).get("calls") or 0)]
+    if idle:
+        raise HomeRunError(f"{len(idle)} session(s) ran NO extraction ({idle[:3]}): the server answered 'unchanged' (already-ingested "
+                           "content) or did not report usage; nothing was measured. Use --new-measure for fresh projects.")
+    ext_price = None
+    summ = read_json(os.path.join(run_dir, "summary.json"), {}) or {}
+    m = (summ.get("hars_extraction_measured") or {})
+    per = []
+    for r in rows:
+        eu = r.get("extract_usage") or {}
+        per.append({"sid": r["sid"], "ok": r.get("ok"), "calls": eu.get("calls"), "prompt_tokens": eu.get("prompt_tokens"),
+                    "completion_tokens": eu.get("completion_tokens"), "total_tokens": eu.get("total_tokens"), "usd": eu.get("usd"),
+                    "estimated": eu.get("estimated"), "documents": eu.get("documents"), "documents_unmeasured": eu.get("documents_unmeasured")})
+    good = [x for x in per if x["ok"] and x["total_tokens"]]
+    n = len(good)
+    if n == 0:
+        raise HomeRunError("no session reported extract_usage: the server predates the C.10 `extract_usage` field (restart it from this "
+                           "checkout) or the extractor is not an OpenAI-compatible endpoint with usage")
+    mean = lambda key: sum(float(x[key] or 0) for x in good) / n  # noqa: E731
+    total_n = plan["n_sessions_total"]
+    out = {"ts": utc_iso(), "sessions_measured": n, "sessions_total": total_n, "per_session": per,
+           "mean_per_session": {"usd": mean("usd"), "tokens": mean("total_tokens"), "calls": mean("calls")},
+           "extrapolated_total": {"usd": mean("usd") * total_n, "total_tokens": mean("total_tokens") * total_n, "tokens": mean("total_tokens") * total_n,
+                                  "calls": mean("calls") * total_n,
+                                  "estimated": any(x["estimated"] or x["documents_unmeasured"] for x in good),
+                                  "note": f"mean of {n} measured session(s) x {total_n} sessions (the sessions differ in size by ~10%: a mean, not a sum)"},
+           "run_summary": m, "throwaway_projects": plan["pids"], "plan": plan["hars_run_id"], "mcp": mcp, "run_dir": run_dir}
+    out.update(out["extrapolated_total"])                                 # metrics_agentic.load_ingest reads usd / total_tokens
+    out["usd"], out["total_tokens"] = out["extrapolated_total"]["usd"], out["extrapolated_total"]["total_tokens"]
+    write_json(os.path.join(mdir, "measure.json"), out)                # per plan: kept
+    write_json(camp.p("oh", "ingest-measure", "measure.json"), out)    # the latest: what the metrics read
+    plan["measured_ts"] = out["ts"]
+    cj = read_json(camp.p("campaign.json"), {}) or {}
+    cj["c10_ingest_measure"] = plan
+    cj.setdefault("c10_ingest_measures", {})[plan["hars_run_id"]] = {"ts": out["ts"], "mcp": mcp, "mean_usd": out["mean_per_session"]["usd"]}
+    write_json(camp.p("campaign.json"), cj)
+    camp.force_steps.add("oh.ingest.measure")
+    camp.step("oh.ingest.measure", lambda: {"sessions": n, "mean_usd": out["mean_per_session"]["usd"], "extrapolated_usd": out["usd"],
+                                             "extrapolated_tokens": out["total_tokens"]})
+    print(f"\n[oh-ingest-measure] MEASURED over {n} session(s): mean {out['mean_per_session']['tokens']:,.0f} tokens "
+          f"({out['mean_per_session']['calls']:.0f} extractor calls), ${out['mean_per_session']['usd']:.4f} per session; "
+          f"extrapolated to {total_n} sessions: {out['total_tokens']:,.0f} tokens, ${out['usd']:.4f}"
+          f"{' (some figures are ESTIMATES: the provider returned no usage)' if out['extrapolated_total']['estimated'] else ''}\n"
+          f"  file: {camp.p('oh', 'ingest-measure', 'measure.json')}")
+    # refresh the metrics of a finished C.10 run so its per-correct figures include the ingest
+    nm = agentic_names(argparse.Namespace(controls=True))
+    rd = camp.p("oh", nm["dir"])
+    if camp.is_done(nm["step"] + ".metrics") and os.path.isfile(os.path.join(rd, "judged.jsonl")):
+        camp.run(nm["step"] + ".metrics2", metrics_agentic_argv(camp, os.path.join(rd, "records.jsonl"), os.path.join(rd, "judged.jsonl"),
+                                                              os.path.join(rd, nm["report"]), os.path.join(rd, nm["metrics"])), check=False)
+        print(f"  metrics of the C.10 run re-computed WITH the ingest cost: {os.path.join(rd, nm['report'])}")
+    print("\n" + measure_delete_instructions(plan["projects_dir"], sorted(plan["pids"].values())))
+    return 0
+
+
+# =============================================================================
+# BEAM and Claude Code (long-session) tracks
+# =============================================================================
+def ls_run_step(camp: Campaign, track: str, sessions: str, run_dir: str, budgets, checkpoints: str,
+                real: bool, extra: list[str] | None, n_expected_sessions: int, accept_partial: bool,
+                name: str, step: str | None = None) -> dict:
+    step = step or f"{track}.run"
+
+    def go():
+        rem = camp.remaining(track, "run")
+        argv = [camp.script("run_longsession.py"), "--sessions", sessions, *profile_args(camp.cfg),
+                "--mem-budgets", budgets_arg(budgets), "--checkpoints", checkpoints, "--mcp", camp.cfg["general"]["mcp"],
+                "--budget-usd", str(rem)] + (["--use-real-compactions"] if real else []) + (extra or [])
+        if camp.cfg["general"].get("_offline") and "--fake-hars" not in argv:
+            argv += ["--agent-model", "mock", "--fake-hars", "--no-preflight"]
+        if os.path.isfile(os.path.join(run_dir, "config.json")):
+            argv += ["--resume", run_dir]
+        else:
+            if os.path.isdir(run_dir) and os.listdir(run_dir):
+                camp.quarantine(run_dir)
+            argv += ["--out", run_dir, "--name", name]
+        rc, _ = camp.run(step, argv, check=False)
+        spent, src = longsession_spend(run_dir)
+        camp.charge(track, "run", step, spent, source=run_dir, note=src)
+        man = read_json(os.path.join(run_dir, "MANIFEST.json"), {}) or {}
+        done = read_jsonl(os.path.join(run_dir, "done.jsonl"))
+        n_cells = len({(d["sid"], d["arm"], int(d["B"])) for d in done})
+        failed = man.get("failed_sessions") or []
+        if rc != 0 or failed:
+            raise HomeRunError(f"{track}.run incomplete (exit {rc}, {n_cells} (sid, arm, B) cells done, failed sessions "
+                               f"{failed[:3]}); log logs/{step}.log. Re-run the same subcommand to RESUME "
+                               f"(run_longsession --resume; spend so far {fmt_usd(spent)} of the run cap).")
+        return {"out": run_dir, "cells_done": n_cells, "spent_usd": spent, "sessions": n_expected_sessions}
+    return camp.step(step, go) or {}
+
+
+def cmd_beam(camp: Campaign, args) -> int:
+    guard_spend(camp, "beam")
+    cfg = camp.cfg
+    b = cfg["beam"]
+    data = beam_import(camp)
+    est = camp.step("beam.estimate", lambda: {"estimate": estimate_beam(camp)})["estimate"]
+    guard_estimate(camp, "beam", est, args.accept_partial)
+    run_dir = camp.p("beam", "run")
+    budgets = [int(x) for x in (args.budgets or b["budgets"])]
+    extra = ["--session-concurrency", str(int(b.get("session_concurrency") or 1))] + list(b.get("extra_args") or [])
+    ls_run_step(camp, "beam", data, run_dir, budgets, b["checkpoints"], False, extra, est.get("sessions", 0),
+                args.accept_partial, f"beam{b['size']}")
+    rec = os.path.join(run_dir, "records.jsonl")
+    ji, judged, mp = (os.path.join(run_dir, n) for n in ("judge-input.jsonl", "judged.jsonl", "judge-mapping.json"))
+    sid_re = f"^beam-{b['size']}-"
+    camp.step("beam.export", lambda: (camp.run("beam.export", [camp.script("export_longsession_judge.py"), "--records", rec,
+                                                               "--sessions", data, "--out", ji,
+                                                               "--include-sid", sid_re]), {"out": ji})[1])
+    if args.skip_judge:
+        print("[beam] --skip-judge: stopping before the judge")
+        return 0
+    camp.step("beam.judge", lambda: judge_step(camp, "beam", "beam", ji, judged, mp, args.accept_partial))
+    camp.step("beam.metrics", lambda: metrics_step(
+        camp, "beam.metrics", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-beam.md"),
+        os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--include-sid", sid_re, "--end-only"]))
+    summarize_track(camp, "beam", run_dir)
+    return 0
+
+
+def cc_discover_cmd(cfg: dict, args, *, input_fn=input, isatty=None, out=print) -> tuple[int, dict | None]:
+    """`cc --list | --find TEXT | --session-id ID`: scan <root>/*/*.jsonl, print the candidates (size, dates,
+    messages, compact boundaries, title) and let the owner pick (prompt on a TTY, else --pick N or the single
+    match). Returns (exit code, chosen candidate or None). Reads transcripts only; zero spend."""
+    root = getattr(args, "projects_root", None) or cfg["cc"].get("root") or cc_discover.DEFAULT_ROOT
+    root = os.path.expanduser(root)
+    find, sid, lst = getattr(args, "find", None), getattr(args, "session_id", None), getattr(args, "list", False)
+    files = cc_discover.list_files(root)
+    out(f"[cc] scanning {len(files)} transcript file(s) under {root}")
+    if not files:
+        raise HomeRunError(f"no *.jsonl transcripts under {root} (expected ~/.claude/projects/<project>/<session>.jsonl;"
+                           " pass --projects-root or set [cc] root)")
+    cands = cc_discover.discover(root, find=find, session_id=sid, list_top=int(getattr(args, "top", 15) or 15) if lst else 0)
+    if lst:
+        out("longest sessions, most compact boundaries first (only sessions with boundaries can run the cc track):")
+        out(cc_discover.format_candidates(cands))
+        out("\nnext: home_run.py cc --find \"<title words>\"   or   cc --session-id <id>   (then --pick N if several)")
+        return 0, None
+    what = f"title/first message containing {find!r}" if find else f"session id {sid!r}"
+    if not cands:
+        raise HomeRunError(f"no session matches {what} under {root}. Try `cc --list`, a shorter --find, a "
+                           "different --projects-root, or the full transcript path via --cc-paths.")
+    out(f"{len(cands)} candidate(s) for {what}:")
+    out(cc_discover.format_candidates(cands))
+    pick = getattr(args, "pick", None)
+    if pick is None:
+        if len(cands) == 1:
+            pick = 1
+        else:
+            tty = sys.stdin.isatty() if isatty is None else isatty
+            if not tty:
+                out("\nseveral candidates and no terminal: re-run with --pick N (the # column); nothing was imported or spent.")
+                return 3, None
+            ans = input_fn(f"Pick one [1-{len(cands)}, q = quit]: ").strip().lower()
+            if ans in ("", "q", "quit"):
+                out("nothing picked.")
+                return 3, None
+            pick = int(ans) if ans.isdigit() else 0
+    if not (1 <= int(pick) <= len(cands)):
+        raise HomeRunError(f"--pick {pick} is out of range 1..{len(cands)}")
+    ch = cands[int(pick) - 1]
+    out(f"\n[cc] picked #{pick}: {ch['path']}  ({human_size(ch['size'])}, {ch['messages']} msgs, "
+        f"{ch['compactions']} compact boundaries, {ch['first_ts'][:10]}..{ch['last_ts'][:10]})")
+    if ch["compactions"] == 0:
+        raise HomeRunError("this session has NO /compact boundary: the cc track (`orig` arm, real boundaries) cannot run "
+                           "on it. Pick another candidate or run `cc --list`.")
+    return 0, ch
+
+
+def cmd_cc(camp: Campaign, args) -> int:
+    import longsession as L  # noqa: PLC0415
+    guard_spend(camp, "cc")
+    cfg = camp.cfg
+    c = cfg["cc"]
+    sel = cfg.get("_cc_selected")
+    if sel:
+        sp = camp.p("cc", "selected-session.json")
+        prev = read_json(sp, None)
+        if prev and prev.get("path") != sel["path"]:
+            raise HomeRunError(f"this campaign already imported {prev['path']}; use --new to run another session")
+        write_json(sp, {k: sel[k] for k in ("path", "file_id", "project", "size", "first_ts", "last_ts", "messages",
+                                           "compactions", "matched") if k in sel} | {"ts": utc_iso(),
+                        "label": cc_discover.label(sel, 80), "selection": "home_run cc --find/--session-id"})
+    data = cc_import(camp)
+    qa_dir = camp.p("cc", "data-qa")
+
+    def do_qa():
+        rem = camp.remaining("cc", "gen")
+        have = {s["sid"] for s in L.load_sessions([qa_dir])} if os.path.isdir(qa_dir) else set()
+        todo = [s for s in L.load_sessions([data]) if s["sid"] not in have and s.get("compactions")]
+        if not todo:
+            print("  every session already has generated questions")
+        else:
+            os.makedirs(qa_dir, exist_ok=True)
+            argv = [camp.script("gen_longsession_qa.py"), "--sessions", *[s["_path"] for s in todo], "--out", qa_dir,
+                    *profile_args(cfg), "--use-real-compactions", "--n-single", str(c["n_single"]),
+                    "--n-multihop", str(c["n_multihop"]),
+                    "--n-unanswerable", str(c.get("n_unanswerable", 4)), "--budget-usd", str(rem),
+                    "--session-budget-usd", str(c["session_budget_usd"])]
+            rc, _ = camp.run("cc.qa", argv, check=False)
+            if os.path.isfile(os.path.join(qa_dir, "qa-manifest.json")):
+                os.replace(os.path.join(qa_dir, "qa-manifest.json"), os.path.join(qa_dir, f"qa-manifest-{utc_stamp()}.json"))
+            spent, src = genqa_spend(qa_dir)
+            camp.charge("cc", "gen", "cc.qa", spent, source=qa_dir, note=src)
+            if rc != 0:
+                raise HomeRunError("QA generation failed or hit the gen cap; see logs/cc.qa.log (finished sessions are kept; re-run resumes)")
+        qs = L.load_sessions([qa_dir])
+        nq = {s["sid"]: len(s.get("questions") or []) for s in qs}
+        if not any(nq.values()):
+            raise HomeRunError("QA generation produced no accepted question (see cc/data-qa/qa-raw.jsonl for the rejections)")
+        print(f"  questions per session: {nq}")
+        return {"questions": nq}
+    camp.step("cc.qa", do_qa)
+    est = camp.step("cc.estimate", lambda: {"estimate": estimate_cc(camp)})["estimate"]
+    guard_estimate(camp, "cc", est, args.accept_partial)
+    run_dir = camp.p("cc", "run")
+    budgets = [int(x) for x in (args.budgets or c["budgets"])]
+    extra = (["--max-questions", str(c["max_questions"])] if c.get("max_questions") else []) \
+        + list(c.get("extra_args") or [])
+    ls_run_step(camp, "cc", qa_dir, run_dir, budgets, c["checkpoints"], True, extra, 0, args.accept_partial, "cc")
+    rec = os.path.join(run_dir, "records.jsonl")
+    ji, judged, mp = (os.path.join(run_dir, n) for n in ("judge-input.jsonl", "judged.jsonl", "judge-mapping.json"))
+    camp.step("cc.export", lambda: (camp.run("cc.export", [camp.script("export_longsession_judge.py"), "--records", rec,
+                                                           "--sessions", qa_dir, "--out", ji]), {"out": ji})[1])
+    if args.skip_judge:
+        print("[cc] --skip-judge: stopping before the judge")
+        return 0
+    camp.step("cc.judge", lambda: judge_step(camp, "cc", "cc", ji, judged, mp, args.accept_partial))
+    camp.step("cc.metrics", lambda: metrics_step(camp, "cc.metrics", rec, judged, mp, ji,
+                                                 os.path.join(run_dir, "REPORT-cc.md"),
+                                                 os.path.join(run_dir, "metrics.json"), ["--track", "longsession"]))
+    camp.step("cc.metrics_end", lambda: metrics_step(camp, "cc.metrics_end", rec, judged, mp, ji,
+                                                     os.path.join(run_dir, "REPORT-cc-end.md"),
+                                                     os.path.join(run_dir, "metrics-end.json"),
+                                                     ["--track", "longsession", "--end-only"]))
+    summarize_track(camp, "cc", run_dir)
+    return 0
+
+
+def summarize_track(camp: Campaign, track: str, run_dir: str) -> None:
+    led = camp.ledger()["totals"]
+    rows = read_jsonl(os.path.join(run_dir, "records.jsonl"))
+    s = {"track": track, "run_dir": run_dir, "records": len(rows),
+         "valid_records": sum(1 for r in rows if r.get("valid") is True),
+         "spend_usd": {k: v for k, v in led.items() if k.startswith(track + ".")}}
+    write_json(os.path.join(run_dir, "home_run-summary.json"), s)
+    camp.write_manifest()
+    print(f"\n[{track}] done: {s['valid_records']}/{s['records']} valid records; spend {s['spend_usd']}")
+    print(f"  next: home_run.py bundle   (campaign {camp.path})")
+
+
+# =============================================================================
+# smoke
+# =============================================================================
+def synthetic_session(sid: str = "smoke-ls", n: int = 64, chars: int = 1500) -> dict:
+    """Deterministic tiny long session (no real text) with 5 questions, rubrics and a gold anchor."""
+    filler = ("lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut "
+              "labore et dolore magna aliqua ")
+    msgs = []
+    for i in range(n):
+        role = "user" if i % 4 == 0 else ("tool" if i % 4 == 2 else "assistant")
+        head = (f"step {i}: job JOB{i:04d} finished with metric_{i} = {1000 + 7 * i} units in "
+                f"{(i % 9) + 1}.{i % 7}s; artifact path /data/run{i:03d}/out.bin ")
+        msgs.append({"idx": i, "role": role, "text": (head + filler * 40)[:chars]})
+    qs = []
+    for k, idx in enumerate((4, 12, 20, 28), 1):
+        qs.append({"qid": f"{sid}_q{k}", "qtype": "single", "source_qtype": "information_extraction",
+                   "question": f"What was the value of metric_{idx} reported by job JOB{idx:04d}?",
+                   "answer": str(1000 + 7 * idx), "answerable": True, "evidence": [{"msg_idx": idx}],
+                   "gold_anchor": str(1000 + 7 * idx),
+                   "rubric": [f"LLM response should state: {1000 + 7 * idx}"]})
+    qs.append({"qid": f"{sid}_m1", "qtype": "multihop", "source_qtype": "multi_session_reasoning",
+               "question": "What metric did the job that ran at step 24 report, given it came after JOB0008?",
+               "answer": str(1000 + 7 * 24), "answerable": True,
+               "evidence": [{"msg_idx": 8}, {"msg_idx": 24}], "gold_anchor": str(1000 + 7 * 24),
+               "rubric": [f"LLM response should state: {1000 + 7 * 24}"]})
+    return {"format": "longsession/1", "sid": sid, "source": "synthetic", "title": "smoke session",
+            "messages": msgs, "compactions": [], "questions": qs, "meta": {"synthetic": True}}
+
+
+def smoke_stage(results: list, name: str, fn) -> bool:
+    t0 = time.time()
+    try:
+        info = fn() or {}
+        results.append({"stage": name, "ok": True, "seconds": round(time.time() - t0, 1), **info})
+        print(f"[PASS] {name}")
+        return True
+    except (HomeRunError, SystemExit, Exception) as e:  # noqa: BLE001
+        results.append({"stage": name, "ok": False, "seconds": round(time.time() - t0, 1), "error": str(e)[:300]})
+        print(f"[FAIL] {name}: {str(e)[:300]}")
+        return False
+
+
+def cmd_smoke(cfg: dict, args, runner=None, probes: Probes | None = None) -> int:
+    import longsession as L  # noqa: PLC0415
+    sm = cfg["smoke"]
+    scfg = deep_merge(cfg, {"caps": {"oh": {"run": sm["run_cap_oh"], "judge": sm["judge_cap"]},
+                                     "smoke": {"run": sm["run_cap_ls"], "judge": sm["judge_cap"]}},
+                            "oh": {"budgets": [1536], "batch_chains": 1, "retries": 0}})
+    camp = open_campaign(scfg, args, "smoke", runner=runner)
+    camp.legacy_replay = bool(getattr(args, "legacy_replay", False))
+    probes = probes or Probes()
+    results: list[dict] = []
+    offline = bool(cfg["general"].get("_offline"))
+    print(f"[smoke] campaign {camp.path}\n[smoke] caps: OH run {fmt_usd(sm['run_cap_oh'])}, long-session run "
+          f"{fmt_usd(sm['run_cap_ls'])}, judge {fmt_usd(sm['judge_cap'])} each (hard)")
+    legacy = bool(getattr(args, "legacy_replay", False))
+    rows = doctor_checks(scfg, probes, live=not args.no_live, deep=not offline, tracks=("oh",) if not args.skip_oh else (),
+                         offline=offline, legacy_replay=legacy)
+    write_json(camp.p("doctor.json"), rows)
+    print_doctor(rows)
+    fails = [r for r in rows if r["status"] == "FAIL"]
+    shim = [r for r in fails if r["check"] in ("hars.embedder", "hars.semantic_probe")]
+    if shim and args.allow_shim:
+        print("[smoke] --allow-shim: the hash/shim embedder is accepted for THIS smoke only (nc-chunks recall may be "
+              "empty -> valid=false is expected); never for a decision run")
+        fails = [r for r in fails if r["check"] not in ("hars.embedder", "hars.semantic_probe")]
+    results.append({"stage": "doctor", "ok": not fails, "fails": [r["check"] for r in fails]})
+    if fails:
+        print("[smoke] doctor has FAILs: fix them first (or --allow-shim for the embedder)")
+        write_json(camp.p("smoke-report.json"), results)
+        return 1
+
+    if not args.skip_oh and not legacy:
+        def oh_new():
+            """Amendment C.6: ONE chain through the streaming runner: parity check -> 4 arms -> judge -> metrics."""
+            src = cfg["oh"].get("artifact_dir")
+            if not src or not os.path.isfile(os.path.join(src, "chains.jsonl")):
+                raise HomeRunError("[oh] artifact_dir not set: pass --skip-oh or copy the OH artifact dir")
+            chains = read_jsonl(os.path.join(src, "chains.jsonl"))
+            # cheapest chain = fewest span characters (the run cost is ~ tokens; deterministic, no dry run needed)
+            size = lambda c: (sum(len(e.get("text") or "") for sp in c["spans"] for e in sp["segments"]), c["chain_id"])  # noqa: E731
+            pick = min(chains, key=size)["chain_id"]
+            first = camp.p("smoke", "oh-src")
+            os.makedirs(first, exist_ok=True)
+            with open(os.path.join(first, "chains.jsonl"), "w") as f:
+                for c in chains:
+                    if c["chain_id"] == pick:
+                        f.write(json.dumps(c, ensure_ascii=False) + "\n")
+            scfg["oh"]["artifact_dir"] = first
+            camp.cfg = scfg
+            ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=bool(args.skip_judge),
+                                    legacy_replay=False, skip_parity_check=bool(getattr(args, "skip_calibrate", False)),
+                                    accept_parity_fail=bool(args.allow_shim), tolerate_invalid_run=bool(args.allow_shim))
+            rcode = cmd_oh(camp, ns)
+            cal = read_json(camp.p(CAL_FILE), {}) or {}
+            m = read_json(os.path.join(camp.p("oh", "run"), "metrics.json"), {}) or {}
+            pb = (cal.get("per_b") or {}).get("1536") or {}
+            return {"chain": pick, "verdict": (m.get("gates") or {}).get("verdict"), "exit": rcode,
+                    "parity": cal.get("status"), "parity_ratio_nc_chunks": pb.get("ratio_nc_chunks"),
+                    "parity_ratio_nc_enriched": pb.get("ratio_nc_enriched"),
+                    "parity_ratio_nc_graph": pb.get("ratio_nc_graph"),
+                    "memory_tokens": {"baseline": pb.get("baseline_memory_tokens_mean"),
+                                      "nc_chunks": pb.get("nc_chunks_memory_tokens_mean"),
+                                      "nc_graph": pb.get("nc_graph_memory_tokens_mean"),
+                                      "nc_note_only": pb.get("nc_note_only_memory_tokens_mean")},
+                    "tokenizer": pb.get("tokenizer"), "tokenizer_native": pb.get("tokenizer_native")}
+        smoke_stage(results, "oh (1 chain via run_longsession: parity check, B=1536, 4 arms -> judge -> metrics)", oh_new)
+
+    if not args.skip_oh and legacy:
+        def oh():
+            src = cfg["oh"].get("artifact_dir")
+            if not src or not os.path.isfile(os.path.join(src, "chains.jsonl")):
+                raise HomeRunError("[oh] artifact_dir not set: pass --skip-oh or copy the OH artifact dir")
+            chains = read_jsonl(os.path.join(src, "chains.jsonl"))
+            # cheapest chain by the runner's own projection
+            first = camp.p("smoke", "oh-src")
+            os.makedirs(first, exist_ok=True)
+            all_p = os.path.join(first, "all.jsonl")
+            shutil.copyfile(os.path.join(src, "chains.jsonl"), all_p)
+            rc, text = camp.run("smoke.oh.pick", [camp.script("run_chainreplay.py"), "--dry-run", "--chains", all_p,
+                                                  *profile_args(scfg), "--allow-same-family-judge", "--mem-budgets", "1536",
+                                                  "--budget-usd", "100000", "--mcp", cfg["general"]["mcp"],
+                                                  "--require-no-clip"], check=False)
+            per = parse_chainreplay_dry(text)["per_chain_usd_single_b"] if rc == 0 else {}
+            pick = min(per, key=per.get) if per else chains[0]["chain_id"]
+            with open(os.path.join(first, "chains.jsonl"), "w") as f:
+                for c in chains:
+                    if c["chain_id"] == pick:
+                        f.write(json.dumps(c, ensure_ascii=False) + "\n")
+            for fn in ("verify-report.md",):
+                if os.path.isfile(os.path.join(src, fn)):
+                    shutil.copy2(os.path.join(src, fn), first)
+            os.remove(all_p)
+            scfg["oh"]["artifact_dir"] = first
+            ns = argparse.Namespace(budgets=[1536], retries=0, accept_partial=True, skip_judge=bool(args.skip_judge),
+                                    baseline_cap=None, baseline_cap_scale=None, legacy_replay=True)
+            camp.cfg = scfg
+            cal_info = {}
+            if not getattr(args, "skip_calibrate", False):
+                # the smoke chain is the only chain: calibrate on it, do NOT exclude it (nothing here is a decision set)
+                cal = run_oh_calibration(camp, budgets=[1536], exclude=False,
+                                         max_iter=int(scfg["oh"]["calibration_max_iterations"]),
+                                         start=explicit_caps(scfg, ns))
+                cal_info = {"calibration": cal["status"], "calibrated_caps": cal["caps"], "calibration_ratio": cal["ratio"]}
+                if cal["status"] != "pass":
+                    raise HomeRunError("baseline-cap calibration failed in the smoke (calibration.json): the decision "
+                                       "run would refuse too; see HOME-RUNBOOK.md 'calibration failed'")
+            else:
+                ns.baseline_cap_scale = 1.0          # smoke only: nothing calibrated, B=cap explicit
+            rcode = cmd_oh_legacy(camp, ns)
+            m = read_json(os.path.join(camp.p("oh", "merged"), "metrics.json"), {}) or {}
+            return {"chain": pick, "projected_usd": per.get(pick), "verdict": (m.get("gates") or {}).get("verdict"),
+                    "exit": rcode, **cal_info}
+        smoke_stage(results, "oh --legacy-replay (1 chain, pi: baseline-cap calibration, B=1536, 4 arms -> judge -> metrics -> funnel)", oh)
+
+    def ls():
+        data = camp.p("smoke", "ls-data")
+        if not os.path.isdir(data):
+            L.save_session(synthetic_session(), data)
+        run_dir = camp.p("smoke", "ls-run")
+        extra = ["--window", "12000", "--keep-tail", "2500", "--reserve", "1000", "--piece-chars", "4000"]
+        if offline:
+            extra += ["--agent-model", "mock", "--fake-hars", "--no-preflight"]
+        ls_run_step(camp, "smoke", data, run_dir, [512], "end", False, extra, 1, True, "smoke")
+        rec = os.path.join(run_dir, "records.jsonl")
+        rows_ = read_jsonl(rec)
+        bad = sorted({f"{r['arm']}: {'; '.join(map(str, r.get('chain_invalid_reasons') or []))[:160]}"
+                      for r in rows_ if r.get("valid") is not True})
+        info = {"records": len(rows_), "invalid_arms": bad,
+                "tokenizer": rows_[0].get("tokenizer") if rows_ else None}
+        if bad:
+            if args.allow_shim:
+                info["note"] = ("arms invalid as expected with a hash/shim embedder; the export / judge / metrics stages "
+                                "need a valid set and are skipped (--allow-shim)")
+                return info
+            raise HomeRunError("some arms are invalid: " + "; ".join(bad[:3]))
+        ji, judged, mp = (os.path.join(run_dir, n) for n in ("judge-input.jsonl", "judged.jsonl", "judge-mapping.json"))
+        camp.run("smoke.export", [camp.script("export_longsession_judge.py"), "--records", rec, "--sessions", data, "--out", ji])
+        if not offline and not args.skip_judge:
+            judge_step(camp, "smoke", "smoke", ji, judged, mp, True)
+            m = metrics_step(camp, "smoke.metrics", rec, judged, mp, ji, os.path.join(run_dir, "REPORT-smoke.md"),
+                             os.path.join(run_dir, "metrics.json"), ["--track", "longsession", "--end-only"])
+            info["verdict"] = m.get("verdict")
+        return info
+    if not args.skip_ls:
+        smoke_stage(results, "long-session (synthetic, B=512, 4 arms -> judge -> metrics)", ls)
+    camp.cfg = scfg
+    camp.write_manifest()
+    spent = camp.ledger()["totals"]
+    results.append({"stage": "spend_usd", "ok": True, "totals": spent, "total": round(sum(spent.values()), 4)})
+    write_json(camp.p("smoke-report.json"), results)
+    print("\n[smoke] summary")
+    for r in results:
+        print(f"  {'PASS' if r['ok'] else 'FAIL'}  {r['stage']}" + (f"  {r.get('error', '')}" if not r["ok"] else ""))
+    print(f"  spend {spent} (total {fmt_usd(sum(spent.values()))}); report {camp.p('smoke-report.json')}")
+    return 0 if all(r["ok"] for r in results) else 1
+
+
+# =============================================================================
+# bundle
+# =============================================================================
+BUNDLE_EXT = (".json", ".jsonl", ".md", ".txt", ".log", ".toml", ".py", ".sh")
+RAW_DIRS = {"sessions", "recall", "partial", "memory", "data", "data-qa", "dry-data", "dry-gen", "answers",
+            "batches", "files", "oh-src", "ls-data"}
+NEVER_DIRS = {"bundle", "accepted", "__pycache__", "scripts-copy"}
+RAW_FILE_RES = (re.compile(r"^chains.*\.jsonl$"), re.compile(r"^judge-input.*\.jsonl$"), re.compile(r"^traces.*\.jsonl$"),
+                re.compile(r"^qa-raw.*\.jsonl$"), re.compile(r"^all\.jsonl$"))
+# Amendment C.10: raw files that ARE part of the default bundle of the (public) OH track, gzip-compressed and under --max-raw-mb:
+# the agentic traces (every step's messages and tool results), the recall / probe sidecars. The owner's private Claude Code track keeps
+# every raw file behind --include-raw.
+DEFAULT_RAW_FILE_RES = (re.compile(r"^traces.*\.jsonl$"), re.compile(r"^recall_raw.*\.jsonl$"), re.compile(r"^probe.*\.jsonl$"))
+DEFAULT_RAW_DIRS = {"recall"}
+DEFAULT_RAW_TRACKS = ("oh",)
+DEFAULT_MAX_RAW_MB = 200.0
+CC_TEXT_FIELDS = ("memory_text", "injected")
+
+
+def is_default_raw(rel: str) -> bool:
+    parts = rel.split(os.sep)
+    if not parts or parts[0] not in DEFAULT_RAW_TRACKS or any(".failed-" in x for x in parts):
+        return False
+    return any(r.match(parts[-1]) for r in DEFAULT_RAW_FILE_RES) or any(x in DEFAULT_RAW_DIRS for x in parts[1:-1])
+SECRET_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD)", re.I)
+
+
+def bundle_candidates(camp_path: str, include_raw: bool, tracks, default_raw: bool = False) -> tuple[list[tuple[str, str]], list[dict]]:
+    """(include [(abs, rel)], excluded [{rel, reason, bytes}]) for a campaign dir. `default_raw`: also include the
+    `is_default_raw` files (the caller compresses them and applies the size guard)."""
+    inc, exc = [], []
+    for dp, dns, fns in os.walk(camp_path, followlinks=False):
+        rel_dir = os.path.relpath(dp, camp_path)
+        parts = [] if rel_dir == "." else rel_dir.split(os.sep)
+        keep = []
+        for d in dns:
+            full = os.path.join(dp, d)
+            if d in NEVER_DIRS or os.path.islink(full):
+                continue
+            keep.append(d)
+        dns[:] = keep
+        for fn in fns:
+            full = os.path.join(dp, fn)
+            rel = os.path.join(*parts, fn) if parts else fn
+            if os.path.islink(full) or fn.endswith(".tmp"):
+                continue
+            size = os.path.getsize(full)
+            top = parts[0] if parts else ""
+            if top in TRACKS and top not in tracks:
+                exc.append({"rel": rel, "reason": f"track {top} not selected", "bytes": size})
+                continue
+            failed = any(".failed-" in p for p in parts)
+            raw_dir = any(p in RAW_DIRS for p in parts) or any(
+                p in ("logs", "answers") for p in parts[1:]) or (parts[:1] == ["inputs"] and "files" in parts)
+            raw_file = any(r.match(fn) for r in RAW_FILE_RES)
+            if not fn.endswith(BUNDLE_EXT):
+                reason = "not a text artifact"
+            elif failed and not include_raw:
+                reason = "failed/unfinished attempt (kept in the campaign dir)"
+            elif (raw_dir or raw_file) and not include_raw and not (default_raw and is_default_raw(rel)):
+                reason = "raw (transcripts / session graph stores / recall payloads / judge input)"
+            else:
+                inc.append((full, rel))
+                continue
+            if reason == "not a text artifact" and include_raw:
+                inc.append((full, rel))
+                continue
+            exc.append({"rel": rel, "reason": reason, "bytes": size})
+    return inc, exc
+
+
+def env_secrets() -> list[str]:
+    vals = []
+    for k, v in os.environ.items():
+        if SECRET_ENV_RE.search(k) and len(v) >= 12 and not v.isdigit() and v not in vals:
+            vals.append(v)
+    return vals
+
+
+def stage_file(src: str, dst: str, rel: str, secrets: list[str], drop_fields: tuple, redact: bool, gz: bool = False) -> dict:
+    """Copy src -> dst line by line, dropping fields and redacting; returns {counts, env_hits, dropped}. `gz`: dst is written gzip-compressed
+    (the caller names it *.gz); redaction runs BEFORE compression, so a compressed file is never an unredacted copy."""
+    counts: dict[str, int] = {}
+    env_hits = 0
+    dropped = 0
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    is_jsonl = src.endswith(".jsonl")
+    import gzip  # noqa: PLC0415
+    with open(src, encoding="utf-8", errors="replace") as fi, (gzip.open(dst, "wt", encoding="utf-8", compresslevel=6) if gz
+                                                              else open(dst, "w", encoding="utf-8")) as fo:
+        for line in fi:
+            if drop_fields and is_jsonl and line.strip():
+                try:
+                    o = json.loads(line)
+                    for k in drop_fields:
+                        if k in o:
+                            o.pop(k)
+                            dropped += 1
+                    line = json.dumps(o, ensure_ascii=False) + "\n"
+                except ValueError:
+                    pass
+            if redact:
+                for s in secrets:
+                    if s in line:
+                        env_hits += line.count(s)
+                        line = line.replace(s, "[REDACTED:env_secret]")
+                line, c = ls_redact.redact(line)
+                for k, v in c.items():
+                    counts[k] = counts.get(k, 0) + v
+            fo.write(line)
+    ok_json = True
+    if src.endswith((".jsonl", ".json")):
+        try:
+            with (gzip.open(dst, "rt", encoding="utf-8") if gz else open(dst, encoding="utf-8")) as f:
+                if src.endswith(".jsonl"):
+                    for ln in f:
+                        if ln.strip():
+                            json.loads(ln)
+                else:
+                    json.load(f)
+        except ValueError:
+            ok_json = False
+    return {"counts": counts, "env_hits": env_hits, "dropped_fields": dropped, "json_ok": ok_json}
+
+
+def workspace_kinds_of(camp: Campaign) -> dict:
+    """{sid: workspace_kind} of the C.9 workspaces (per-session meta next to the workspaces, outside the campaign dir)."""
+    dest = ((read_json(camp.p("campaign.json"), {}) or {}).get("c9_workspaces") or {}).get("dest") or ""
+    out: dict = {}
+    summ = read_json(os.path.join(dest, "workspaces.json"), {}) if dest else {}
+    for sid, m in ((summ or {}).get("workspaces") or {}).items():
+        out[sid] = {"workspace_kind": m.get("workspace_kind"), "patch_applied": m.get("patch_applied"), "instance_id": m.get("instance_id")}
+    if dest and os.path.isdir(dest):
+        for fn in sorted(os.listdir(dest)):
+            if fn.endswith(".json") and fn != "workspaces.json" and fn[:-5] not in out:
+                m = read_json(os.path.join(dest, fn), {}) or {}
+                if m.get("workspace_kind"):
+                    out[fn[:-5]] = {"workspace_kind": m.get("workspace_kind"), "patch_applied": m.get("patch_applied"),
+                                    "instance_id": m.get("instance_id")}
+    return out
+
+
+def cmd_bundle(camp: Campaign, args) -> int:
+    tracks = tuple(t for t in (args.tracks.split(",") if args.tracks else TRACKS) if t)
+    use_default_raw = not getattr(args, "no_default_raw", False)
+    max_raw = int(float(getattr(args, "max_raw_mb", DEFAULT_MAX_RAW_MB)) * 1024 * 1024)
+    inc, exc = bundle_candidates(camp.path, args.include_raw, tracks, default_raw=use_default_raw)
+    stamp = utc_stamp()
+    bdir = camp.p("bundle")
+    stage = os.path.join(bdir, f"stage-{stamp}")
+    shutil.rmtree(stage, ignore_errors=True)
+    secrets = env_secrets()
+    report = {"ts": utc_iso(), "include_raw": bool(args.include_raw), "redaction": not args.no_redact,
+              "env_secret_values_scanned": len(secrets), "files": {}, "excluded_raw": 0}
+    totals: dict[str, int] = {}
+    env_total = 0
+    bad_json = []
+    staged: list[tuple[str, str]] = []                     # (src, staged rel)
+    scanned_bytes = 0
+    # plain files first, then the default-raw files (gzip-compressed) smallest first, under the size guard
+    plain = [(s_, r_) for s_, r_ in inc if args.include_raw or not (use_default_raw and is_default_raw(r_))]
+    plain_set = set(plain)
+    rawd = sorted([(s_, r_) for s_, r_ in inc if (s_, r_) not in plain_set], key=lambda x: os.path.getsize(x[0]))
+    for src, rel in plain:
+        drop = CC_TEXT_FIELDS if (rel.split(os.sep)[0] == "cc" and not args.include_raw
+                                   and rel.endswith((".jsonl",))) else ()
+        scanned_bytes += os.path.getsize(src)
+        r = stage_file(src, os.path.join(stage, rel), rel, secrets, drop, not args.no_redact)
+        if r["counts"] or r["env_hits"] or r["dropped_fields"] or not r["json_ok"]:
+            report["files"][rel] = r
+        for k, v in r["counts"].items():
+            totals[k] = totals.get(k, 0) + v
+        env_total += r["env_hits"]
+        if not r["json_ok"]:
+            bad_json.append(rel)
+        staged.append((src, rel))
+    raw_used, raw_skipped, raw_packed = 0, [], []
+    for src, rel in rawd:
+        size = os.path.getsize(src)
+        dst_rel = rel + ".gz"
+        dst = os.path.join(stage, dst_rel)
+        scanned_bytes += size
+        r = stage_file(src, dst, rel, secrets, (), not args.no_redact, gz=True)
+        gz_size = os.path.getsize(dst)
+        if raw_used + gz_size > max_raw:
+            os.remove(dst)                                  # the redaction scan of a skipped file still counted (it was not shipped)
+            raw_skipped.append({"rel": rel, "bytes": size, "bytes_gz": gz_size,
+                                "reason": f"size guard: --max-raw-mb {getattr(args, 'max_raw_mb', DEFAULT_MAX_RAW_MB)} would be exceeded"})
+            continue
+        raw_used += gz_size
+        raw_packed.append({"rel": dst_rel, "bytes": size, "bytes_gz": gz_size})
+        if r["counts"] or r["env_hits"] or r["dropped_fields"] or not r["json_ok"]:
+            report["files"][dst_rel] = r
+        for k, v in r["counts"].items():
+            totals[k] = totals.get(k, 0) + v
+        env_total += r["env_hits"]
+        if not r["json_ok"]:
+            bad_json.append(dst_rel)
+        staged.append((src, dst_rel))
+    for rel in bad_json:                                  # never ship a file the redaction broke
+        os.remove(os.path.join(stage, rel))
+        report["files"][rel]["removed"] = "unparseable after redaction"
+    inc = [(s_, r_) for s_, r_ in staged if r_ not in bad_json]
+    wk = workspace_kinds_of(camp)
+    if wk:
+        write_json(os.path.join(stage, "oh", "workspace-kinds.json"), wk)
+        inc.append(("", os.path.join("oh", "workspace-kinds.json")))
+    report["hits_by_kind"] = totals
+    report["env_secret_hits"] = env_total
+    report["total_hits"] = sum(totals.values()) + env_total
+    # hits inside the campaign's COPIES OF THE SCRIPTS are pattern false positives of the `assign` kind (`"unsupported_tokens": ...`,
+    # `SUM_MAX_TOKENS_SLACK = 1.8`), not leaks: the verdict is on every other file (and any env-secret hit anywhere)
+    code_hits = sum(sum(v["counts"].values()) for k, v in report["files"].items() if k.startswith("scripts" + os.sep) and k.endswith(".py"))
+    report["code_copy_hits"] = code_hits
+    report["data_hits"] = report["total_hits"] - code_hits
+    report["files_scanned"] = len(staged)
+    report["bytes_scanned"] = scanned_bytes
+    report["excluded"] = {"count": len(exc), "bytes": sum(e["bytes"] for e in exc),
+                          "by_reason": {k: sum(1 for e in exc if e["reason"] == k) for k in sorted({e["reason"] for e in exc})},
+                          "examples": [e["rel"] for e in exc[:12]]}
+    report["raw_default"] = {"enabled": use_default_raw and not args.include_raw, "max_raw_mb": getattr(args, "max_raw_mb", DEFAULT_MAX_RAW_MB),
+                             "packed": raw_packed, "packed_bytes_gz": raw_used, "skipped": raw_skipped}
+    write_json(os.path.join(stage, "bundle-redaction-report.json"), report)
+    man = {"campaign": os.path.basename(camp.path), "ts": utc_iso(), "git_head": git_head(), "include_raw": args.include_raw,
+           "tracks": list(tracks), "spend_usd": camp.ledger()["totals"],
+           "workspace_kinds": wk, "raw_default": report["raw_default"],
+           "files": {rel: {"bytes": os.path.getsize(os.path.join(stage, rel)),
+                           "sha256": sha256_file(os.path.join(stage, rel))} for _, rel in inc}}
+    write_json(os.path.join(stage, "bundle-manifest.json"), man)
+    out = args.out or os.path.join(bdir, f"{os.path.basename(camp.path)}-bundle-{stamp}.tar.gz")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with tarfile.open(out, "w:gz") as tf:
+        tf.add(stage, arcname=os.path.basename(camp.path))
+    size = os.path.getsize(out)
+    digest = sha256_file(out)
+    print(f"\nbundle: {len(inc)} file(s) packed, {len(exc)} excluded "
+          f"({human_size(report['excluded']['bytes'])}: {report['excluded']['by_reason']})")
+    if raw_packed or raw_skipped:
+        print(f"raw (gzip) by default: {len(raw_packed)} file(s) packed, {human_size(raw_used)} compressed (guard --max-raw-mb "
+              f"{getattr(args, 'max_raw_mb', DEFAULT_MAX_RAW_MB)}); SKIPPED by the guard: {len(raw_skipped)}"
+              + (" -> " + ", ".join(f"{x['rel']} ({human_size(x['bytes'])} raw / {human_size(x['bytes_gz'])} gz)" for x in raw_skipped[:5])
+                 if raw_skipped else ""))
+    if wk:
+        kinds: dict[str, int] = {}
+        for v in wk.values():
+            kinds[v["workspace_kind"]] = kinds.get(v["workspace_kind"], 0) + 1
+        print(f"workspace kinds (oh/workspace-kinds.json): {kinds}")
+    if report["total_hits"]:
+        print(f"REDACTION SCAN: {report['total_hits']} secret-looking string(s) redacted in the packed copy "
+              f"(kinds {totals}, env-secret values {env_total}); files: {sorted(report['files'])[:8]} -> REVIEW "
+              "bundle-redaction-report.json inside the archive before sending")
+    else:
+        print(f"REDACTION SCAN: 0 hits")
+    print(f"LEAK SCAN: {'PASS' if not report['data_hits'] else 'REVIEW'} - {report['files_scanned']} file(s), "
+          f"{human_size(scanned_bytes)} scanned, {len(secrets)} env secret value(s) checked, {report['data_hits']} hit(s)"
+          f"{f' (+{code_hits} known pattern false positive(s) in the script copies)' if code_hits else ''}"
+          f"{'' if not args.no_redact else ' (REDACTION OFF)'}")
+    if any(rel.split(os.sep)[0] == "cc" for _, rel in inc):
+        print("NOTE: cc records/judged files contain excerpts of your private Claude Code sessions (questions, answers); "
+              "memory_text/injected were dropped. Use --tracks oh,beam to leave them out.")
+    print(f"BUNDLE: {out}\nsize: {human_size(size)}  sha256: {digest}")
+    camp.step(f"bundle.{stamp}", lambda: {"bundle": out, "bytes": size, "sha256": digest,
+                                          "files": len(inc), "hits": report["total_hits"]})
+    shutil.rmtree(stage, ignore_errors=True)
+    return 0
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+def common_parser() -> argparse.ArgumentParser:
+    c = argparse.ArgumentParser(add_help=False)
+    S = argparse.SUPPRESS
+    c.add_argument("--config", default=S, help="home_run.toml (default ./home_run.toml if present)")
+    c.add_argument("--root", default=S, help=f"artifact root (default {DEFAULT_ROOT}; never /tmp)")
+    c.add_argument("--profile", default=S, choices=list(P.PROFILE_NAMES), help="provider profile (frozen per decision set)")
+    c.add_argument("--mcp", default=S, help="HARS MCP url (default http://127.0.0.1:8307/mcp)")
+    c.add_argument("--key-env", default=S, help="read the API key from this env var (value never printed)")
+    c.add_argument("--embedder-id", default=S, help="recorded when the server reports no embedder id")
+    c.add_argument("--gen-cap", type=float, default=S, help="hard USD cap for QA generation")
+    c.add_argument("--run-cap", type=float, default=S, help="hard USD cap for runs (replay/compaction/answers + HARS estimate)")
+    c.add_argument("--judge-cap", type=float, default=S, help="hard USD cap for judging")
+    c.add_argument("--resume", nargs="?", const="newest", default=S, metavar="ID|PATH",
+                   help="continue a campaign: bare --resume = the NEWEST by creation time (campaign.json created_utc, not "
+                        "mtime; printed loudly), --resume ID|PATH = that one. Without it, a command that needs a campaign "
+                        "creates a NEW one; bundle / status refuse without a target")
+    c.add_argument("--new", action="store_true", default=S, help="start a fresh campaign (the default; overrides --resume)")
+    c.add_argument("--force-shared-hars", action="store_true", default=S,
+                   help="run although another home_run holds the lock of this HARS endpoint (unsafe: two clients on one HARS)")
+    c.add_argument("--force-step", action="append", default=S, metavar="STEP", help="redo this finished step (repeatable)")
+    c.add_argument("--oh-dir", default=S, help="the copied OpenHands artifact dir (holds chains.jsonl)")
+    c.add_argument("--beam-repo", default=S, help="BEAM checkout (contains chats/)")
+    c.add_argument("--beam-size", default=S, choices=("100K", "500K", "1M", "10M"))
+    c.add_argument("--beam-limit", type=int, default=S, help="max BEAM chats (0 = all)")
+    c.add_argument("--cc-paths", nargs="+", default=S, help="Claude Code transcript files/dirs")
+    c.add_argument("--oh-tar", default=S, metavar="TAR",
+                   help=f"unpack the OpenHands dataset tarball ({OH_TAR_DEFAULT}) into the artifact root and use it")
+    c.add_argument("--beam-n", type=int, default=S, help="BEAM: number of seeded sample chats (default 10)")
+    c.add_argument("--offline-selftest", action="store_true", default=S,
+                   help="CI only: mock LLM + fake HARS for the long-session tracks, no network")
+    return c
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = common_parser()
+    ap = argparse.ArgumentParser(description=__doc__, parents=[common],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("doctor", parents=[common], help="environment checks")
+    d.add_argument("--no-live", action="store_true", help="skip the cents-level LLM liveness pings")
+    d.add_argument("--deep", action="store_true", help="also run one tiny memory_compact end to end on the HARS server")
+    d.add_argument("--tracks", default="oh,beam,cc")
+    d.add_argument("--legacy-replay", action="store_true",
+                   help="also require the pi agent + node (only `oh --legacy-replay` needs them, Amendment C.6)")
+    sub.add_parser("hars-env", parents=[common], help="print the HARS server env block")
+    dr = sub.add_parser("dry-run", parents=[common], help="cost / wall-clock estimate of all tracks (zero spend)")
+    dr.add_argument("--tracks", default="oh,beam,cc")
+    dr.add_argument("--legacy-replay", action="store_true", help="price the OH track as the pi replay (pre-C.6)")
+    dr.add_argument("--find", default=None, metavar="TEXT", help="price the Claude Code session whose title matches")
+    dr.add_argument("--session-id", default=None, metavar="ID")
+    dr.add_argument("--pick", type=int, default=None, metavar="N")
+    dr.add_argument("--projects-root", default=None)
+    sm = sub.add_parser("smoke", parents=[common], help="1 chain + 1 tiny long session (own campaign)")
+    sm.add_argument("--no-live", action="store_true")
+    sm.add_argument("--skip-oh", action="store_true")
+    sm.add_argument("--skip-ls", action="store_true", help="skip the synthetic long-session part")
+    sm.add_argument("--skip-calibrate", action="store_true",
+                    help="no parity check in the OH smoke (C.6; with --legacy-replay: no baseline-cap calibration, cap = B)")
+    sm.add_argument("--legacy-replay", action="store_true", help="OH smoke through the pi replay (pre-C.6)")
+    sm.add_argument("--skip-judge", action="store_true", help="no judge call (saves the judge cap)")
+    sm.add_argument("--allow-shim", action="store_true", help="accept the hash/shim embedder for this smoke only")
+    cal_p = sub.add_parser("calibrate", parents=[common],
+                           help="Amendment C.6: cheap parity CHECK of the OH track on the run_longsession path (writes "
+                                "calibration.json); --legacy-replay: the C.4 baseline-cap calibration through pi")
+    cal_p.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None,
+                       help="B values to check (default [oh] budgets)")
+    cal_p.add_argument("--check-sessions", type=int, default=None, metavar="K",
+                       help="sessions of the parity check (default [oh] calibration_chains = 1)")
+    cal_p.add_argument("--legacy-replay", action="store_true", help="the pre-C.6 pi calibration with cap iteration")
+    cal_p.add_argument("--max-iterations", type=int, default=None,
+                       help="(--legacy-replay) max calibration runs per B (default [oh] calibration_max_iterations = 2)")
+    cal_p.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP]",
+                       help="(--legacy-replay) START cap (default [oh] baseline_cap, else B)")
+    cal_p.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S",
+                       help="(--legacy-replay) START scale: cap(B)=round(B*S)")
+    for name, hlp in (("oh", "OpenHands chain track"), ("beam", "BEAM long-session track"),
+                      ("cc", "Claude Code long-session track")):
+        t = sub.add_parser(name, parents=[common], help=hlp)
+        t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None,
+                       help="override the [track] budgets (comma list; the primary is 1536)")
+        t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
+        t.add_argument("--skip-judge", action="store_true", help="stop after export (no judge spend)")
+        if name == "oh":
+            t.add_argument("--legacy-replay", action="store_true",
+                           help="the pre-C.6 pi agent replay (run_chainreplay, C.4 cap calibration); NOT the decision runner")
+            t.add_argument("--skip-parity-check", action="store_true",
+                           help="C.6: do not run / consult the cheap parity check (recorded)")
+            t.add_argument("--accept-parity-fail", action="store_true",
+                           help="C.6: run although the parity check failed (recorded; the run's win_mem_token_ratio gate reports it)")
+            t.add_argument("--retries", type=int, default=None, help="(--legacy-replay) re-run invalid/missing (chain, B) cells N times")
+            t.add_argument("--baseline-cap", default=None, metavar="B:CAP[,B:CAP]",
+                           help="(--legacy-replay) EXPLICIT baseline caps, e.g. 1536:2010,1024:1340 (skips the calibration "
+                                "requirement; wins over a calibration; frozen per campaign)")
+            t.add_argument("--baseline-cap-scale", type=float, default=None, metavar="S",
+                           help="(--legacy-replay) EXPLICIT scale: cap(B)=round(B*S) for the B not in --baseline-cap")
+        if name == "cc":
+            t.add_argument("--find", default=None, metavar="TEXT",
+                           help="find the session by a substring of its title / first user message, e.g. \"HARS Experts Research\"")
+            t.add_argument("--session-id", default=None, metavar="ID", help="find the session by sessionId / uuid (cse_ or plain)")
+            t.add_argument("--list", action="store_true", help="list the longest sessions with compaction counts and exit")
+            t.add_argument("--pick", type=int, default=None, metavar="N", help="choose candidate N of --find/--session-id (non-interactive)")
+            t.add_argument("--projects-root", default=None, help="where transcripts live (default [cc] root = ~/.claude/projects)")
+            t.add_argument("--top", type=int, default=15, help="--list: how many sessions")
+    t = sub.add_parser("oh-provision", parents=[common],
+                       help="Amendment C.8: write one project dir per eval session (nc-<run id>-<sid>) into the projects dir of YOUR "
+                            "existing HARS server and tell you to restart it once; touches no server, never `default`")
+    t.add_argument("--dry-run", action="store_true", help="list the projects and stop")
+    t.add_argument("--projects-dir", default=None, metavar="DIR",
+                   help="the projects dir your server discovers (HARS_MEMORY_PROJECTS_DIR; default [hars] projects_dir or "
+                        f"{DEFAULT_PROJECTS_DIR})")
+    t.add_argument("--new-projects", action="store_true",
+                   help="mint a NEW run id (fresh nc-* projects) and move the ingest/probe/enrich/agentic results of the old "
+                        "ones to oh/void-<ts>/; use after the LightRAG workspace-isolation fix (old projects may hold mixed data)")
+    t = sub.add_parser("oh-ingest", parents=[common],
+                       help="Amendment C.8: write the dropped spans (same pieces / boundaries, the old notes) into the provisioned "
+                            "projects with memory_upsert_document; only server-side extraction is spent; run before oh-probe")
+    t.add_argument("--dry-run", action="store_true", help="print the estimate (ingest wall-clock + extraction cost) and stop")
+    t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+    t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
+    t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
+    for name, hlp in (("oh-probe", "Amendment C.7: recall probe on a FINISHED oh campaign (reuses its HARS sessions; cents; no answer model, "
+                                   "no judge): where is the anchor lost - old shape, packer, or retrieval?"),
+                      ("oh-enrich", "Amendment C.7: run ONLY nc-enriched against a FINISHED oh campaign (reuses its HARS sessions, "
+                                    "notes and judged baseline / nc-note-only rows), judge the new rows only, merge, metrics")):
+        t = sub.add_parser(name, parents=[common], help=hlp)
+        t.add_argument("--dry-run", action="store_true", help="print the estimate (zero spend, no step markers) and stop")
+        t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+        t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
+        t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
+        t.add_argument("--layout", choices=("project", "split-session"), default=None,
+                       help="project (default, Amendment C.8): the memory = the session's own project, written by oh-ingest / "
+                            "read with memory_recall(project=...). split-session: the server's session SIDE CHANNEL - "
+                            "DIAGNOSTIC ONLY, it does not measure the memory")
+        if name == "oh-probe":
+            t.add_argument("--probe-caps", default=None, metavar="N,N", help="token caps of the max_chars sweep (default 800,1536,3000,6000)")
+        else:
+            t.add_argument("--enrich-queries", type=int, default=None, help="K queries per boundary (default 8)")
+            t.add_argument("--packer", choices=("server", "legacy"), default=None,
+                           help="server (default): the server's own max_chars; legacy: packing v2 (comparison only)")
+            t.add_argument("--skip-probe", action="store_true", help="do not require the recall probe first (recorded)")
+            t.add_argument("--skip-judge", action="store_true", help="stop after export (no judge spend)")
+            t.add_argument("--accept-parity-fail", action="store_true",
+                           help="judge although the realized memory is outside the parity window (recorded)")
+    t = sub.add_parser("oh-workspaces", parents=[common],
+                       help="Amendment C.9: provision one read-only workspace per eval session (repo at base_commit [+ the session's "
+                            "final patch when supplied]; never the transcript) into a cache dir; needs network, spends nothing")
+    t.add_argument("--dry-run", action="store_true", help="print the plan and stop")
+    t.add_argument("--cache-dir", default=None, metavar="DIR", help=f"clone cache + workspaces (default [oh] workspace_cache or {DEFAULT_WORKSPACE_CACHE})")
+    t.add_argument("--instances", default=None, metavar="FILE",
+                   help="jsonl/json rows {instance_id, base_commit[, model_patch]} (the OH data holds neither; without it base_commit "
+                        "comes from the SWE-bench Verified dataset and NO final patch is applied)")
+    t.add_argument("--clone-url", default=None, metavar="TEMPLATE", help="git URL template with {repo} (default https://github.com/{repo}.git)")
+    t.add_argument("--reuse-dir", default=None, help=argparse.SUPPRESS)
+    t = sub.add_parser("oh-agentic", parents=[common],
+                       help="Amendment C.9 (PRIMARY): agents with workspace tools, with / without memory_recall, per question of the "
+                            "finished campaign; judge (outcome schema), metrics_agentic, bundle")
+    t.add_argument("--dry-run", action="store_true", help="print the steps x tokens cost estimate and the pre-run power guess; spend nothing")
+    t.add_argument("--arms", default=None, help=f"comma list of sum, sum+mem, note+mem, sum+bm25, sum+grep, oracle (default {AGENTIC_ARMS}; note+mem is "
+                                                "OPTIONAL: only if the GAIN rule of Amendment C.10 is met)")
+    t.add_argument("--controls", action="store_true",
+                   help="Amendment C.10 preset: --arms sum+mem,sum+bm25,sum+grep,oracle on the SAME questions, `sum` and the C.9 sum+mem rows "
+                        "(labelled sum+mem@uncapped) REUSED from the finished C.9 agentic run (own run dir oh/agentic-c10-run; the ingest is reused)")
+    t.add_argument("--reuse-agentic-run", default=None, metavar="DIR",
+                   help="the finished C.9 agentic run whose sum / sum+mem rows and verdicts are copied (default with --controls: <campaign>/oh/agentic-run)")
+    t.add_argument("--max-steps", type=int, default=12)
+    t.add_argument("--max-question-tokens", type=int, default=400000)
+    t.add_argument("--retrieval-max-chars", "--memory-max-chars", dest="retrieval_max_chars", type=int, default=6000,
+                   help="ONE cap for every retrieval arm (sent as memory_recall max_chars and enforced client-side; the server now bounds the whole context)")
+    t.add_argument("--bm25-passage-chars", type=int, default=1500, help="sum+bm25: retrieval unit (passages cut from the ingested pieces; 0 = whole pieces)")
+    t.add_argument("--concurrency", type=int, default=2, help="sessions in parallel")
+    t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+    t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir (default <campaign>/oh/run)")
+    t.add_argument("--accept-partial", action="store_true")
+    t.add_argument("--skip-judge", action="store_true")
+    t = sub.add_parser("oh-ingest-measure", parents=[common],
+                       help="Amendment C.10: re-ingest K sessions into FRESH THROWAWAY projects with the fixed server to MEASURE the extractor's "
+                            "tokens / USD (never the main nc-* projects); first call provisions + asks for a server restart, second ingests")
+    t.add_argument("--sessions", type=int, default=3, metavar="K", help="sessions to re-ingest (default 3, spread over the sorted sids)")
+    t.add_argument("--dry-run", action="store_true", help="print the plan, the estimate and the delete instructions; write nothing")
+    t.add_argument("--new-measure", action="store_true", help="forget the recorded throwaway ids and mint new ones (fresh projects, fresh run "
+                                                              "dir); REQUIRED to measure again, e.g. after changing the server's chunking")
+    t.add_argument("--projects-dir", default=None, metavar="DIR")
+    t.add_argument("--budgets", type=lambda s: [int(x) for x in s.split(",")], default=None)
+    t.add_argument("--reuse-dir", default=None, metavar="DIR", help="the finished run_longsession dir to reuse (default <campaign>/oh/run)")
+    t.add_argument("--accept-partial", action="store_true", help="run although the estimate exceeds the cap")
+    sub.add_parser("status", parents=[common], help="read-only: campaigns under the artifact root, or (with --resume) one "
+                                                    "campaign's steps / spend / calibration / validity")
+    b = sub.add_parser("bundle", parents=[common], help="tar.gz of what the analyst needs (redaction-scanned)")
+    b.add_argument("--include-raw", action="store_true", help="also pack raw transcripts, session stores, judge input")
+    b.add_argument("--no-redact", action="store_true", help="skip the redaction pass (scan report still written)")
+    b.add_argument("--max-raw-mb", type=float, default=DEFAULT_MAX_RAW_MB,
+                   help=f"size guard for the raw files packed by default (agentic traces, recall / probe sidecars of the OH track, gzip-compressed, "
+                        f"redacted): their compressed total stays under this (default {DEFAULT_MAX_RAW_MB:.0f}); the bundle lists what it skipped")
+    b.add_argument("--no-default-raw", action="store_true", help="do not pack the traces / recall sidecars (the C.9 behaviour)")
+    b.add_argument("--tracks", default=None, help="comma list (default all present)")
+    b.add_argument("--out", default=None)
+    return ap
+
+
+def overrides_from_args(args) -> dict:
+    g: dict = {}
+    for k_arg, k_cfg in (("root", "artifact_root"), ("profile", "profile"), ("mcp", "mcp"),
+                         ("key_env", "key_env"), ("embedder_id", "embedder_id")):
+        if getattr(args, k_arg, None):
+            g[k_cfg] = getattr(args, k_arg)
+    if getattr(args, "offline_selftest", False):
+        g["_offline"] = True
+    o: dict = {"general": g}
+    caps = {ph: getattr(args, f"{ph}_cap") for ph in PHASES if getattr(args, f"{ph}_cap", None) is not None}
+    if caps:
+        o["caps"] = caps
+    if getattr(args, "oh_dir", None):
+        o["oh"] = {"artifact_dir": args.oh_dir}
+    beam = {}
+    if getattr(args, "beam_repo", None):
+        beam["repo"] = args.beam_repo
+    if getattr(args, "beam_size", None):
+        beam["size"] = args.beam_size
+    if getattr(args, "beam_limit", None) is not None:
+        beam["limit"] = args.beam_limit
+    if beam:
+        o["beam"] = beam
+    if getattr(args, "cc_paths", None):
+        o["cc"] = {"paths": args.cc_paths}
+    if getattr(args, "beam_n", None):
+        o.setdefault("beam", {})["n_chats"] = args.beam_n
+    return o
+
+
+def project_doctor_rows(cfg: dict, probes: Probes, camp: Campaign) -> list[dict]:
+    """Amendment C.8 rows (only when the campaign was provisioned): the projects are registered on the server, the
+    eval never writes to `default`, and which of them already hold data."""
+    pj = (read_json(camp.p("campaign.json"), {}) or {}).get("c8_projects")
+    if not pj:
+        return [check_row("projects.registered", "WARN", "this campaign is not provisioned (oh-provision) - the project layout needs it",
+                          scope="oh")]
+    rows: list[dict] = []
+    pids = sorted(pj["pids"].values())
+    rows.append(check_row("projects.default_untouched", "OK" if "default" not in pids else "FAIL",
+                          f"{len(pids)} nc-* project(s); the eval writes only into them (memory_upsert_document), never into "
+                          "`default` / the global KB", scope="oh"))
+    url = cfg["general"]["mcp"]
+    try:
+        lp = probes.mcp(url, "memory_list_projects", {}, 60)
+        have = {p.get("project_id") for p in (lp or {}).get("projects", [])}
+        missing = [p for p in pids if p not in have]
+        rows.append(check_row("projects.registered", "OK" if not missing else "FAIL",
+                              f"{len(pids) - len(missing)}/{len(pids)} registered on {url}" + (
+                                  f"; MISSING {missing[:3]}{'...' if len(missing) > 3 else ''}: the server reads its projects dir at "
+                                  f"start only - restart it once (HARS_MEMORY_PROJECTS_DIR={pj.get('projects_dir')})" if missing else ""),
+                              scope="oh"))
+        if not missing:
+            # Amendment C.10: does the running server bound memory_recall's whole context by max_chars and say so (`context_cap`)? A
+            # server started before `git pull` does not: its capped arms would be client-truncated and the HARS arm not comparable.
+            try:
+                pr = probes.mcp(url, "memory_recall", {"project": pids[0], "question": "cap probe", "mode": "hybrid", "ll_keywords": ["probe"],
+                                                       "hl_keywords": ["probe"], "max_chars": 2000}, 120) or {}
+                has_cap = isinstance(pr.get("context_cap"), dict)
+                over = len(str(pr.get("context") or "")) > 2000
+                rows.append(check_row("hars.hard_cap", "OK" if has_cap and not over else "FAIL",
+                                      "memory_recall reports `context_cap` and returned <= max_chars" if has_cap and not over else
+                                      ("the server has no `context_cap` in its recall payload: it predates the C.10 hard cap - `git pull` and "
+                                       "RESTART it (HOME-RUNBOOK C.10)" if not has_cap else "the server returned more than max_chars=2000"), scope="oh"))
+            except Exception as e:  # noqa: BLE001
+                rows.append(check_row("hars.hard_cap", "WARN", f"cap probe failed: {type(e).__name__}: {str(e)[:100]}", scope="oh"))
+            filled = []
+            for pid in pids:
+                st = probes.mcp(url, "memory_status", {"project": pid}, 60) or {}
+                if int(st.get("node_count") or 0):
+                    filled.append(pid)
+            rows.append(check_row("projects.state", "OK", f"{len(filled)}/{len(pids)} already hold entities "
+                                  f"({'ingest done' if len(filled) == len(pids) else 'oh-ingest not finished' if filled else 'all empty: ready for oh-ingest'})",
+                                  scope="oh"))
+    except Exception as e:  # noqa: BLE001
+        rows.append(check_row("projects.registered", "FAIL", f"memory_list_projects failed: {type(e).__name__}: {str(e)[:120]}", scope="oh"))
+    return rows
+
+
+def cmd_doctor(cfg: dict, args, probes: Probes, offline: bool, camp: Campaign | None) -> int:
+    tracks = tuple(t for t in args.tracks.split(",") if t)
+    rows = doctor_checks(cfg, probes, live=not args.no_live, deep=args.deep, tracks=tracks, offline=offline,
+                         legacy_replay=bool(getattr(args, "legacy_replay", False)))
+    if camp is not None and not offline:
+        rows.extend(project_doctor_rows(cfg, probes, camp))
+    tbl, _ = role_model_table(cfg)
+    rep_ = {"ts": utc_iso(), "version": HOME_RUN_VERSION, "role_models": tbl, "checks": rows}
+    if camp is not None:
+        write_json(camp.p("doctor.json"), rep_)
+    else:
+        dpath = os.path.join(cfg["general"]["artifact_root"], ".doctor", f"{utc_stamp()}-doctor.json")
+        write_json(dpath, rep_)
+        print(f"[doctor] no campaign targeted: report -> {dpath} (--resume ID|PATH to store it in a campaign)")
+    print(f"home_run {HOME_RUN_VERSION} @ {BASE}\n")
+    print("\n".join(tbl) + "\n")
+    rc = print_doctor(rows)
+    print("\n# HARS server LLM env for this profile (providers.py hars-env):")
+    print("\n".join(hars_env_block(cfg)))
+    if camp is not None:
+        camp.write_manifest()
+    return rc
+
+
+def cmd_status(cfg: dict, args) -> int:
+    root = cfg["general"]["artifact_root"]
+    spec = getattr(args, "resume", None)
+    if spec is None and not cfg["general"].get("campaign_dir"):
+        cs = list_campaigns(root)
+        print(f"campaigns under {root} (newest by creation first; nothing is modified):\n" + fmt_campaigns(cs, 20))
+        print("\nTarget one: home_run.py status --resume ID|PATH   (bare --resume = the newest)")
+        return 0
+    camp = Campaign(resolve_campaign(root, spec if spec is not None else cfg["general"]["campaign_dir"]), cfg, runner=None, echo=False)
+    led = camp.ledger()["totals"]
+    cal = read_json(camp.p(CAL_FILE), None)
+    steps = sorted(f[:-5] for f in os.listdir(camp.p("steps")) if f.endswith(".json"))
+    print(f"campaign {camp.path}\n  created {(read_json(camp.p('campaign.json'), {}) or {}).get('created_utc')}  "
+          f"EVAL-VERSION {campaign_eval_version(camp.path)} (code {HOME_RUN_VERSION})")
+    print(f"  steps done ({len(steps)}): {', '.join(steps) or '-'}")
+    print(f"  spend: {led or '-'}  (total {fmt_usd(sum(led.values()))})")
+    print(f"  calibration: {('%s (Amendment %s)' % (cal.get('status'), cal.get('amendment'))) if cal else 'none yet'}")
+    why = spend_blockers(camp)
+    print("  valid for spending: " + ("yes" if not why else "NO\n    - " + "\n    - ".join(why)))
+    return 0
+
+
+def main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
+    try:
+        return _main(argv, runner=runner, probes=probes)
+    finally:
+        release_hars_locks()
+
+
+def _main(argv=None, *, runner=None, probes: Probes | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    cfg_path = getattr(args, "config", None) or ("home_run.toml" if os.path.isfile("home_run.toml") else None)
+    try:
+        cfg = load_config(cfg_path, overrides_from_args(args))
+        if cfg["general"].get("_offline"):
+            cfg["general"]["_offline"] = True
+        offline = bool(cfg["general"].get("_offline"))
+        probes = probes or Probes()
+        if getattr(args, "oh_tar", None):
+            cfg["oh"]["artifact_dir"] = extract_oh_tar(args.oh_tar, cfg["general"]["artifact_root"])
+            print(f"[oh] unpacked {args.oh_tar} -> {cfg['oh']['artifact_dir']}")
+        print(f"[config] {cfg_path or '(none: built-in defaults; caps unset)'} | profile {cfg['general']['profile']} "
+              f"| HARS {cfg['general']['mcp']} | root {cfg['general']['artifact_root']} | home_run {HOME_RUN_VERSION}")
+        if args.cmd in ("cc", "dry-run") and (getattr(args, "list", False) or getattr(args, "find", None)
+                                              or getattr(args, "session_id", None)):
+            rc, chosen = cc_discover_cmd(cfg, args)
+            if chosen is None:
+                return rc
+            cfg["cc"]["paths"] = [chosen["path"]]
+            cfg["cc"]["min_tokens"] = 0
+            cfg["_cc_selected"] = chosen
+        if args.cmd == "hars-env":
+            print("\n".join(hars_env_block(cfg)))
+            return 0
+        GUARD_CTX["force_shared"] = bool(getattr(args, "force_shared_hars", False))
+        GUARD_CTX["campaign"] = ""
+        if args.cmd == "status":
+            return cmd_status(cfg, args)
+        if args.cmd == "smoke":
+            return cmd_smoke(cfg, args, runner=runner, probes=probes)
+        if args.cmd == "doctor" and getattr(args, "resume", None) is None and not cfg["general"].get("campaign_dir"):
+            # no target: a doctor run is not a campaign; its report goes to <root>/.doctor/
+            return cmd_doctor(cfg, args, probes, offline, None)
+        camp = open_campaign(cfg, args, args.cmd, runner=runner)
+        GUARD_CTX["campaign"] = os.path.basename(camp.path)
+        camp.cfg = cfg
+        camp.probes = probes
+        camp.legacy_replay = bool(getattr(args, "legacy_replay", False))
+        if args.cmd == "doctor":
+            return cmd_doctor(cfg, args, probes, offline, camp)
+        if args.cmd == "dry-run":
+            tracks = [t for t in args.tracks.split(",") if t]
+            dry_run_report(camp, tracks)
+            camp.write_manifest()
+            return 0
+        if args.cmd in REUSE_CMDS:
+            camp.reuse_ok = True
+            return {"oh-provision": cmd_oh_provision, "oh-ingest": cmd_oh_ingest, "oh-probe": cmd_oh_probe,
+                    "oh-enrich": cmd_oh_enrich, "oh-workspaces": cmd_oh_workspaces, "oh-agentic": cmd_oh_agentic,
+                    "oh-ingest-measure": cmd_oh_ingest_measure}[args.cmd](camp, args)
+        if args.cmd == "calibrate":
+            return cmd_calibrate(camp, args)
+        if args.cmd == "oh":
+            return cmd_oh(camp, args)
+        if args.cmd == "beam":
+            return cmd_beam(camp, args)
+        if args.cmd == "cc":
+            return cmd_cc(camp, args)
+        if args.cmd == "bundle":
+            return cmd_bundle(camp, args)
+        raise HomeRunError(f"unknown subcommand {args.cmd}")
+    except HomeRunError as e:
+        print(f"\n!!! {e}", file=sys.stderr)
+        return 2
+    except P.ProviderError as e:
+        print(f"\n!!! {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

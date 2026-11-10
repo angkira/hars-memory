@@ -99,7 +99,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         finally:
             await rag.finalize_storages()
         done = [d for d in plan.to_insert if d.doc_id in set(report.inserted_ok)]
-        backfill_after_ingest(getattr(rag, "working_dir", None), done)
+        from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+        backfill_after_ingest(_rag_index_dir(rag), done)
         _invalidate_bm25_cache()
         out = {"report": report.to_dict(), "llm_usage": dict(LLM_USAGE)}
         if args.report:

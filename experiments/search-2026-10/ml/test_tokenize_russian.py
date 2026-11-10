@@ -1,8 +1,14 @@
-"""Property checks for Russian-aware BM25 tokenization on the ML corpus."""
+"""Property checks for Russian-aware BM25 tokenization on the ML corpus.
+
+The production-corpus check needs the ML clone (``kv_store_text_chunks.json``),
+which is not shipped with the repository: point ``SEARCH_EXP_ML_CLONE`` at it and
+the test runs, otherwise it skips.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import sys
@@ -10,12 +16,13 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[3]
 EXP = Path(__file__).resolve().parents[1]
 ML = Path(__file__).resolve().parent
-CLONE = Path("/tmp/search-exp/ml-clone")
+CLONE = Path(os.environ.get("SEARCH_EXP_ML_CLONE", "/tmp/search-exp/ml-clone"))
 
 for path in (REPO, EXP, ML):
     if str(path) not in sys.path:
@@ -42,6 +49,11 @@ def _latin_tokens(text: str) -> Counter[str]:
 
 def test_latin_identifier_multiset_matches_production() -> None:
     chunks_path = CLONE / "kv_store_text_chunks.json"
+    if not chunks_path.is_file():
+        pytest.skip(
+            f"ML corpus clone not available at {chunks_path} "
+            "(set SEARCH_EXP_ML_CLONE to the clone directory to enable this test)"
+        )
     chunks = json.loads(chunks_path.read_text("utf-8"))
     contents = [str(record.get("content", "")) for record in chunks.values()]
     if len(contents) < 200:

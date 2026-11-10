@@ -226,7 +226,6 @@ def main() -> None:
     start_epoch, start_step, gstep = 0, 0, 0
     if cfg["resume"]:
         state = torch.load(os.path.join(cfg["resume"], "trainer_state.pt"), map_location="cuda:0", weights_only=False)
-        from peft import PeftModel
 
         model.load_adapter(cfg["resume"], adapter_name="default")
         opt.load_state_dict(state["opt"])

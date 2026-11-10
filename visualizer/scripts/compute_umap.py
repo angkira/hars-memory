@@ -18,6 +18,7 @@ UMAP params fixed + random_state=42 for reproducibility.
 CPU-only (no GPU jobs on this box). ~minutes for 47k points.
 """
 import base64
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -54,14 +55,14 @@ def norm(xy):
 
 
 def main():
-    import umap  # noqa: fail fast if missing
+    if importlib.util.find_spec("umap") is None:
+        raise SystemExit("umap-learn is required (uv pip install umap-learn)")
 
     print("loading entity vectors...", flush=True)
     edata, X = load_matrix("vdb_entities.json")
     print("entities:", X.shape, flush=True)
     print("fitting UMAP 3D (entities)...", flush=True)
     Xe = norm(fit_umap(X, seed=42, dim=3))
-    eids = [r.get("__id__") for r in edata]
     # vdb entity ids are ent-... hashes, NOT graphml names. Join key instead:
     # data[].entity_name <-> graphml entity_id. Emit name-keyed coords.
     names = [r.get("entity_name", "") for r in edata]

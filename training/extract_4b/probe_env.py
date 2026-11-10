@@ -100,13 +100,12 @@ except Exception as e:
     rep["meta_init_error"] = f"{type(e).__name__}: {e}"
 
 # --- token length stats on prepared data ------------------------------------
-import json as _json
 lens = []
 for split in ["train.jsonl", "val.jsonl", "parity_holdout.jsonl"]:
     p = DATA_DIR / split
     if not p.exists():
         continue
-    rows = [_json.loads(l) for l in p.open()]
+    rows = [json.loads(line) for line in p.open()]
     for r in rows:
         n = len(tok(r["system"] + r["user"] + r["output"]).input_ids)
         lens.append((split, n))
@@ -119,5 +118,5 @@ for split in ["train.jsonl", "val.jsonl", "parity_holdout.jsonl"]:
                      "p95": vals[int(len(vals)*0.95)], "max": vals[-1]}
 rep["token_lens"] = by
 
-REPORT.write_text(_json.dumps(rep, indent=2))
-print(_json.dumps(rep, indent=2))
+REPORT.write_text(json.dumps(rep, indent=2))
+print(json.dumps(rep, indent=2))

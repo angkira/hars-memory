@@ -398,7 +398,7 @@ class TestMCPTools:
         return tools
 
     def test_all_tools_registered(self) -> None:
-        """Exact tool-surface assertion: all 12 `memory_*` names,
+        """Exact tool-surface assertion: all 17 `memory_*` names,
         zero legacy `graphrag_*` names."""
         tools = self._load_tools()
         names = {t.name for t in tools}  # type: ignore[attr-defined]
@@ -415,6 +415,11 @@ class TestMCPTools:
             "memory_delete_document",
             "memory_sync_status",
             "memory_list_projects",
+            "memory_compact",
+            "memory_merge_session",
+            "memory_session_status",
+            "memory_lease_acquire",
+            "memory_lease_release",
         }
         assert not any(name.startswith("graphrag_") for name in names)
 

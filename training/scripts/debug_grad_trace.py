@@ -43,8 +43,8 @@ def main() -> None:
             records.append((name, finite, mx))
         return hook
 
-    for i, l in enumerate(hs.layers):
-        l.register_full_backward_hook(grad_hook(f"layer{i:02d}"))
+    for i, layer in enumerate(hs.layers):
+        layer.register_full_backward_hook(grad_hook(f"layer{i:02d}"))
     hs.norm.register_full_backward_hook(grad_hook("final_norm"))
     hs.embed_tokens.register_full_backward_hook(grad_hook("embed_tokens"))
 

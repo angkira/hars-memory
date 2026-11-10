@@ -78,7 +78,7 @@ document, whether to call ``ainsert()`` at all this call:
 A fingerprint is only ever persisted (``store.save()``) for a doc_id once
 BOTH of the following hold: the delete+insert call for its batch completed
 without raising, AND that specific doc_id's ``doc_status`` -- queried
-afterwards via ``rag.doc_status.get_docs_by_status(DocStatus.PROCESSED)``
+afterwards via ``rag.doc_status.get_docs_by_statuses([DocStatus.PROCESSED])``
 (mirroring the doc-selection pattern
 ``LightRAG.apipeline_process_enqueue_documents`` itself uses internally) --
 came back ``PROCESSED``. The insert call not raising is necessary but NOT
@@ -134,7 +134,16 @@ class IngestResult:
     errors: list[str] = field(default_factory=list)
 
 
-def ingest_documents(docs: list[Document], *, index_dir: Path) -> IngestResult:
+def ingest_documents(
+    docs: list[Document],
+    *,
+    index_dir: Path,
+    vector_storage: str | None = None,
+    graph_storage: str | None = None,
+    batch_size: int | None = None,
+    embed_batch_size: int | None = None,
+    timeout_s: float | None = None,
+) -> IngestResult:
     """Ingest pre-built `Document` objects into the index at `index_dir`.
 
     This is the integration point for any document source that isn't a
@@ -155,11 +164,60 @@ def ingest_documents(docs: list[Document], *, index_dir: Path) -> IngestResult:
     how many incoming documents were excluded from ``ainsert()`` this call
     for exactly that reason. See this module's docstring for what "written"
     does and does not guarantee about downstream LLM extraction.
+
+    ``vector_storage`` / ``graph_storage``:
+        Optional explicit LightRAG storage backends for THIS index directory.
+        ``None`` (the default) keeps the existing env-driven behaviour
+        (``HARS_MEMORY_VECTOR_STORAGE`` / ``HARS_MEMORY_GRAPH_STORAGE``), so
+        every pre-existing caller is unaffected. Callers that write an
+        isolated sub-index (e.g. ``session_memory``'s per-session working
+        directory) pass file-backed names explicitly so a Qdrant-backed main
+        index cannot mix that data into its own collections.
+
+    ``batch_size``:
+        Documents handed to ``ainsert()`` per call. ``None`` (the default)
+        keeps reading ``HARS_MEMORY_INSERT_BATCH_SIZE`` exactly as before.
+
+    ``embed_batch_size``:
+        CPU embedding batch size for the LightRAG instance built for this
+        call. ``None`` (the default) keeps ``create_lightrag``'s own default
+        (32), so pre-existing callers are unchanged. Session compaction
+        indexing passes its own batch-size knob here.
     """
-    return asyncio.run(_ingest_documents_async(docs, index_dir))
+    coro = _ingest_documents_async(
+        docs,
+        index_dir,
+        vector_storage=vector_storage,
+        graph_storage=graph_storage,
+        batch_size=batch_size,
+        embed_batch_size=embed_batch_size,
+    )
+    if timeout_s is not None and timeout_s > 0:
+        # Cooperative hard deadline: cancels every awaiting LightRAG/LLM/embed
+        # task of THIS call so the (pool) thread returns instead of hanging in
+        # asyncio.run() forever. Raises JobTimeout (error_kind "job_timeout").
+        coro = _with_deadline(coro, timeout_s)
+    return asyncio.run(coro)
 
 
-async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> IngestResult:
+async def _with_deadline(coro: "object", timeout_s: float) -> IngestResult:
+    from hars_memory.mcp_runtime import JobTimeout
+
+    try:
+        return await asyncio.wait_for(coro, timeout_s)  # type: ignore[arg-type]
+    except (asyncio.TimeoutError, TimeoutError):
+        raise JobTimeout(timeout_s, "ingest_documents") from None
+
+
+async def _ingest_documents_async(
+    docs: list[Document],
+    index_dir: Path,
+    *,
+    vector_storage: str | None = None,
+    graph_storage: str | None = None,
+    batch_size: int | None = None,
+    embed_batch_size: int | None = None,
+) -> IngestResult:
     if not docs:
         return IngestResult(documents_written=0, documents_skipped=0, errors=[])
 
@@ -178,7 +236,12 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
     from hars_memory.server.lightrag_init import create_lightrag
     from lightrag.base import DocStatus  # type: ignore[import-not-found]
 
-    rag = create_lightrag(working_dir=str(index_dir))
+    rag = create_lightrag(
+        working_dir=str(index_dir),
+        vector_storage=vector_storage,
+        graph_storage=graph_storage,
+        **({"embed_batch_size": embed_batch_size} if embed_batch_size is not None else {}),
+    )
     written = 0
     errors: list[str] = []
     initialized = False
@@ -191,10 +254,16 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
             # LightRAG's doc_id-based dedupe cannot silently keep it.
             await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
         if to_insert:
-            batch_size = int(
-                os.environ.get(_INSERT_BATCH_SIZE_ENV, str(_DEFAULT_INSERT_BATCH_SIZE))
+            effective_batch_size = (
+                batch_size
+                if batch_size is not None
+                else int(
+                    os.environ.get(
+                        _INSERT_BATCH_SIZE_ENV, str(_DEFAULT_INSERT_BATCH_SIZE)
+                    )
+                )
             )
-            await _insert_all_batches(rag, to_insert, batch_size)
+            await _insert_all_batches(rag, to_insert, effective_batch_size)
 
             inserted_ids = [doc.doc_id for doc in to_insert]
             # _insert_all_batches()/ainsert() not raising only means the
@@ -214,11 +283,11 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
             # ``doc_status.get_by_id()``, which actually returns raw
             # ``dict[str, Any]`` records (confirmed against
             # ``JsonDocStatusStorage.get_by_ids()``), while
-            # ``get_docs_by_status(es)`` reliably normalises into typed
+            # ``get_docs_by_statuses`` reliably normalises into typed
             # ``DocProcessingStatus`` objects for every backend, per the
             # ``DocStatusStorage`` ABC's own contract.
-            processed_docs = await rag.doc_status.get_docs_by_status(  # type: ignore[attr-defined]
-                DocStatus.PROCESSED
+            processed_docs = await rag.doc_status.get_docs_by_statuses(
+                [DocStatus.PROCESSED]
             )
             processed_ids = set(processed_docs)
             for doc_id in inserted_ids:
@@ -254,7 +323,8 @@ async def _ingest_documents_async(docs: list[Document], index_dir: Path) -> Inge
             if to_insert:
                 from hars_memory.ingest.migrate import backfill_after_ingest
 
-                backfill_after_ingest(getattr(rag, "working_dir", None), to_insert)
+                from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+                backfill_after_ingest(_rag_index_dir(rag), to_insert)
 
     return IngestResult(
         documents_written=written,

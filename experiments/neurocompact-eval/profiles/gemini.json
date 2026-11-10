@@ -1,0 +1,80 @@
+{
+ "name": "gemini",
+ "description": "Google Gemini API via its OpenAI-compatible endpoint. Judge is same family (different model) -> needs --allow-same-family-judge.",
+ "family": "google",
+ "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+ "chat_path": "/chat/completions",
+ "auth": {
+  "style": "bearer",
+  "headers": {}
+ },
+ "key_env": "GEMINI_API_KEY",
+ "sampling": {
+  "policy": "allow",
+  "note": "standard chat/completions; the compat layer rejects some params (e.g. seed): never sent"
+ },
+ "pi": {
+  "provider": "google",
+  "key_env": "GEMINI_API_KEY",
+  "ctx_window": 200000,
+  "model_style": "bare"
+ },
+ "models": {
+  "agent": "gemini-3.7-flash",
+  "answer": "gemini-3.7-flash",
+  "summarizer": "gemini-3.7-flash",
+  "qa_generator": "gemini-3.7-flash",
+  "judge": "gemini-3.1-pro-preview",
+  "extractor": "gemini-3.7-flash",
+  "keyword": "gemini-3.7-flash"
+ },
+ "hars": {
+  "extractor_provider": "local",
+  "key_env": "GEMINI_API_KEY"
+ },
+ "prices": {
+  "gemini-3.7-flash": {
+   "in": 0.75,
+   "out": 3.75,
+   "status": "confirmed",
+   "source": "WebSearch 2026-10-26 (anotherwrapper, apiyi, llmgateway: agree) + pi-ai 1.4.0 catalog; Google page not fetched",
+   "as_of": "2026-10-26",
+   "cache_read": 0.075,
+   "cache_write": 0,
+   "note": "introductory rate through 2026-12-31; $1.50/$7.50 from 2027-01-01 (aggregators)"
+  },
+  "gemini-3.1-pro-preview": {
+   "in": 2.0,
+   "out": 12.0,
+   "status": "catalog_only",
+   "source": "pi-ai 1.4.0 catalog",
+   "as_of": "2026-10-26",
+   "cache_read": 0.2,
+   "cache_write": 0,
+   "tier": {
+    "input_above_tokens": 200000,
+    "in": 4.0,
+    "out": 18.0,
+    "cache_read": 0.4
+   }
+  },
+  "gemini-3.5-flash": {
+   "in": 1.5,
+   "out": 9.0,
+   "status": "catalog_only",
+   "source": "pi-ai 1.4.0 catalog",
+   "as_of": "2026-10-26",
+   "cache_read": 0.15,
+   "cache_write": 0
+  },
+  "gemini-3.8-flash": {
+   "in": 0.75,
+   "out": 3.75,
+   "status": "catalog_only",
+   "source": "pi-ai 1.4.0 catalog",
+   "as_of": "2026-10-26",
+   "cache_read": 0.075,
+   "cache_write": 0
+  }
+ }
+}

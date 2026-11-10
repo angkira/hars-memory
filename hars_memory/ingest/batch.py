@@ -712,6 +712,11 @@ class BatchState:
     batch_model: str = ""
     endpoint: str = DEFAULT_ENDPOINT
     chunker: str = "token"
+    #: Effective chunker configuration pinned at the FIRST collect (see
+    #: ``chunker_config``); ``apply`` refuses to run if the current env drifted,
+    #: because the primed cache keys would never be looked up. Empty for state
+    #: files written before this field existed (the check is then skipped).
+    chunker_config: dict[str, str] = field(default_factory=dict)
     gleaning: int = 0
     doc_ids: list[str] = field(default_factory=list)
     prices: dict[str, float] = field(default_factory=dict)
@@ -740,6 +745,47 @@ class BatchState:
 
 def batch_dir(index_dir: Path) -> Path:
     return index_dir / BATCH_DIRNAME
+
+
+#: Document source for the batch phases. ``walker`` (the default) is the
+#: historical filesystem path (``cli._batch_documents``); ``upsert-inbox``
+#: reads the MCP upsert inbox (``HARS_MEMORY_UPSERT_BATCH_MODE=queue``,
+#: ``ingest/upsert_inbox.py``) instead.
+SOURCE_WALKER: Final[str] = "walker"
+SOURCE_UPSERT_INBOX: Final[str] = "upsert-inbox"
+
+#: Env vars whose effective values define chunk boundaries and therefore the
+#: extraction prompts. Snapshotted into ``batch_state.json`` at the first
+#: ``collect`` and re-checked at ``apply``: any drift means the primed cache
+#: keys can never be looked up and LightRAG would re-extract everything
+#: synchronously at full price.
+CHUNKER_CONFIG_ENVS: Final[tuple[str, ...]] = (
+    "HARS_MEMORY_CHUNKER",
+    "HARS_MEMORY_CHUNKER_MODE",
+    "HARS_MEMORY_CHUNK_TOKEN_SIZE",
+    "HARS_MEMORY_CHUNK_OVERLAP_TOKENS",
+    "HARS_MEMORY_CHUNK_MIN_TOKENS",
+)
+
+#: Documented defaults used when an env var above is unset/empty, so the
+#: snapshot compares EFFECTIVE values ("64" vs unset-but-default-512 cannot
+#: slip through as equal). Mirrors lightrag_init / ingest.chunker defaults.
+_CHUNKER_CONFIG_DEFAULTS: Final[dict[str, str]] = {
+    "HARS_MEMORY_CHUNKER": "token",
+    "HARS_MEMORY_CHUNKER_MODE": "",
+    "HARS_MEMORY_CHUNK_TOKEN_SIZE": "512",
+    "HARS_MEMORY_CHUNK_OVERLAP_TOKENS": "64",
+    "HARS_MEMORY_CHUNK_MIN_TOKENS": "200",
+}
+
+
+def chunker_config(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Effective chunking configuration (each env value, or its documented default)."""
+    env = dict(os.environ) if env is None else env
+    return {
+        name: (env.get(name, "") or _CHUNKER_CONFIG_DEFAULTS.get(name, "")).strip()
+        for name in CHUNKER_CONFIG_ENVS
+    }
 
 
 def configured_chunker() -> str:
@@ -914,6 +960,44 @@ def pending_documents(index_dir: Path, docs: list[Any]) -> list[Any]:
     return pending
 
 
+def pending_upsert_documents(index_dir: Path, docs: list[Any]) -> tuple[list[Any], list[str]]:
+    """Inbox documents still to index, plus doc_ids whose stale version must be purged first.
+
+    Unlike ``pending_documents`` (walker), the doc ids here are authoritative —
+    the inbox was minted by this index's own MCP server — so the walker's
+    restored-index file-key heuristic must not filter them: a re-upsert of
+    changed content under the same path is exactly the case the inbox exists
+    for. A doc whose exact content is already processed (a synchronous upsert
+    won the race while it sat queued) is skipped entirely; a doc whose OLD
+    content is processed is purged before insert, mirroring the synchronous
+    upsert's ``adelete_by_doc_id``.
+    """
+    from hars_memory.ingest.change_detection import (
+        FingerprintStore,
+        compute_fingerprint,
+        default_fingerprint_store_path,
+    )
+
+    processed = _processed_doc_ids(index_dir)
+    store = FingerprintStore.load(default_fingerprint_store_path(index_dir))
+    todo: list[Any] = []
+    purge: list[str] = []
+    for doc in dedupe_documents(docs):
+        if doc.doc_id in processed:
+            if store.get(doc.doc_id) == compute_fingerprint(doc.content):
+                continue  # this exact content got indexed meanwhile
+            purge.append(doc.doc_id)
+        todo.append(doc)
+    return todo, purge
+
+
+def _source_pending_documents(index_dir: Path, docs: list[Any], source: str) -> tuple[list[Any], list[str]]:
+    """Pending docs for *source*; the purge list is only ever non-empty for the inbox."""
+    if source == SOURCE_UPSERT_INBOX:
+        return pending_upsert_documents(index_dir, docs)
+    return pending_documents(index_dir, docs), []
+
+
 
 def next_round(state: BatchState) -> int | None:
     """Next round to collect, or None when nothing is left to collect."""
@@ -933,11 +1017,14 @@ def collect(
     est_output_tokens: int = DEFAULT_EST_OUTPUT_TOKENS,
     max_cost_usd: float = DEFAULT_MAX_COST_USD,
     dry_run: bool = False,
+    source: str = SOURCE_WALKER,
 ) -> RoundState | None:
     """Collect the next round's requests; persist them unless *dry_run*.
 
     Raises CostGuardError (nothing written) when the estimate exceeds *max_cost_usd*.
-    Returns None when there is nothing to collect.
+    Returns None when there is nothing to collect.  *source* selects the pending
+    rule: the walker's (doc id + restored-index file key) or the upsert inbox's
+    (authoritative doc ids, stale purges handled at apply).
     """
     state = BatchState.load(index_dir)
     all_docs = dedupe_documents(docs)
@@ -950,7 +1037,7 @@ def collect(
     rnd = next_round(state)
     if rnd is None:
         return None
-    todo = pending_documents(index_dir, docs)
+    todo, _purge = _source_pending_documents(index_dir, docs, source)
     skipped = len(all_docs) - len(todo)
     if skipped:
         logger.info("skipping %d document(s) already in %s (doc id or file key)", skipped, index_dir)
@@ -991,6 +1078,10 @@ def collect(
         for r in requests:
             fh.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
     state.chunker = configured_chunker()
+    if not state.chunker_config:
+        # Pinned at the FIRST collect only: later rounds (or env changes between
+        # them) must not silently rewrite what apply will verify against.
+        state.chunker_config = chunker_config()
     state.gleaning = int(meta["gleaning"])
     state.model = meta["model"] or state.model
     state.doc_ids = doc_ids
@@ -1514,7 +1605,13 @@ def fallback_plan(index_dir: Path, state: BatchState, answers: dict[str, str]) -
     }
 
 
-async def _prime_and_index(index_dir: Path, docs: list[Any], answers: dict[str, str]) -> dict[str, Any]:
+async def _prime_and_index(
+    index_dir: Path,
+    docs: list[Any],
+    answers: dict[str, str],
+    *,
+    purge_doc_ids: list[str] | None = None,
+) -> dict[str, Any]:
     from lightrag.utils import statistic_data
 
     from hars_memory.server.index import _insert_all_batches
@@ -1538,6 +1635,11 @@ async def _prime_and_index(index_dir: Path, docs: list[Any], answers: dict[str, 
     if entries:
         await rag.llm_response_cache.upsert(entries)  # type: ignore[attr-defined]
         await rag.llm_response_cache.index_done_callback()  # type: ignore[attr-defined]
+    for doc_id in purge_doc_ids or ():
+        # Upsert-inbox re-upsert: drop the stale version first, exactly like the
+        # synchronous memory_upsert_document does before its reinsert.
+        logger.info("upsert-inbox: purging stale version of doc %s before reinsert", doc_id)
+        await rag.adelete_by_doc_id(doc_id)  # type: ignore[attr-defined]
     before = dict(statistic_data)
     batch_size = int(os.environ.get("HARS_MEMORY_INSERT_BATCH_SIZE", "10"))
     try:
@@ -1553,17 +1655,92 @@ async def _prime_and_index(index_dir: Path, docs: list[Any], answers: dict[str, 
     calls = statistic_data.get("llm_call", 0) - before.get("llm_call", 0)
     from hars_memory.ingest.migrate import backfill_after_ingest
 
-    backfill_after_ingest(getattr(rag, "working_dir", None), docs)
+    from hars_memory.server.lightrag_init import rag_index_dir as _rag_index_dir
+    backfill_after_ingest(_rag_index_dir(rag), docs)
     return {"primed": len(entries), "cache_hits": hits, "sync_llm_calls": calls}
 
 
-def apply(index_dir: Path, docs: list[Any], *, max_cost_usd: float | None = None) -> dict[str, Any]:
+def _inbox_batch_docs(state: BatchState, docs: list[Any]) -> list[Any]:
+    """Restrict inbox docs to the document set this batch was collected for.
+
+    The MCP server keeps queueing while a batch is in flight; newcomers have no
+    collected prompts, so indexing them now would be a full-price synchronous
+    extraction the cost guard cannot see. They stay in the inbox for the next
+    ``index-batch`` run instead.
+    """
+    if not state.doc_ids:
+        return docs
+    collected = set(state.doc_ids)
+    return [d for d in docs if d.doc_id in collected]
+
+
+def _drain_upsert_inbox(index_dir: Path, docs: list[Any]) -> dict[str, Any]:
+    """Record fingerprints and drain inbox entries for docs that really processed.
+
+    Docs whose extraction failed (or that only got enqueued) stay queued: the
+    next ``index-batch`` run retries them — the same "record after the fact"
+    contract as the synchronous upsert. Entries queued after this batch was
+    collected are not touched either (they are not part of its document set)
+    and are reported as ``deferred``. With
+    ``HARS_MEMORY_UPSERT_CONTENT_DEDUP`` on, the content-dedup mapping is
+    recorded too, mirroring the synchronous path.
+    """
+    from hars_memory.ingest.change_detection import (
+        ContentDedupStore,
+        FingerprintStore,
+        compute_fingerprint,
+        default_content_dedup_store_path,
+        default_fingerprint_store_path,
+    )
+    from hars_memory.ingest.upsert_inbox import UpsertInboxStore, default_upsert_inbox_path
+
+    inbox = UpsertInboxStore.load(default_upsert_inbox_path(index_dir))
+    if not len(inbox):
+        return {"applied": 0, "remaining": 0, "deferred": 0}
+    batch_doc_ids = {str(d.doc_id) for d in docs}
+    processed = _processed_doc_ids(index_dir)
+    fp_store = FingerprintStore.load(default_fingerprint_store_path(index_dir))
+    dedup_store = None
+    if os.environ.get("HARS_MEMORY_UPSERT_CONTENT_DEDUP", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        dedup_store = ContentDedupStore.load(default_content_dedup_store_path(index_dir))
+    applied = remaining = 0
+    for doc in docs:
+        if doc.doc_id not in processed:
+            remaining += 1
+            continue
+        fingerprint = compute_fingerprint(doc.content)
+        if fp_store.get(doc.doc_id) != fingerprint:
+            fp_store.set(doc.doc_id, fingerprint)
+        if dedup_store is not None:
+            dedup_store.set(fingerprint, doc.doc_id)
+        inbox.discard(doc.doc_id)
+        applied += 1
+    fp_store.save()
+    if dedup_store is not None:
+        dedup_store.save()
+    inbox.save()
+    deferred = sum(1 for doc_id in inbox.doc_ids() if doc_id not in batch_doc_ids)
+    return {"applied": applied, "remaining": remaining, "deferred": deferred}
+
+
+def apply(
+    index_dir: Path,
+    docs: list[Any],
+    *,
+    max_cost_usd: float | None = None,
+    source: str = SOURCE_WALKER,
+) -> dict[str, Any]:
     """Prime LightRAG's cache from downloaded answers and run the normal indexing.
 
     Requests without an answer are answered synchronously by LightRAG.  With
     *max_cost_usd* set, raises CostGuardError (before indexing anything) when
     batch spend so far plus the estimated synchronous fallback (2x batch price)
-    would exceed it.
+    would exceed it.  With ``source="upsert-inbox"`` the docs come from the MCP
+    upsert inbox: only the collected document set is indexed (latecomers stay
+    queued), stale versions are purged first, and successfully processed docs
+    get their fingerprint recorded and their inbox entry drained.
     """
     state = BatchState.load(index_dir)
     if not state.rounds:
@@ -1576,6 +1753,24 @@ def apply(index_dir: Path, docs: list[Any], *, max_cost_usd: float | None = None
             "LightRAG would re-extract everything synchronously. Re-run apply with the same extractor env "
             "(HARS_MEMORY_EXTRACTOR_PROVIDER / HARS_MEMORY_OPENROUTER_MODEL or HARS_MEMORY_EXTRACTOR_MODEL)."
         )
+    if state.chunker_config:
+        current_cfg = chunker_config()
+        drifted = {
+            name: (state.chunker_config.get(name, ""), current_cfg.get(name, ""))
+            for name in sorted(set(state.chunker_config) | set(current_cfg))
+            if state.chunker_config.get(name, "") != current_cfg.get(name, "")
+        }
+        if drifted:
+            detail = ", ".join(f"{k}: {old!r} -> {new!r}" for k, (old, new) in drifted.items())
+            raise BatchError(
+                f"chunker configuration changed since collect ({detail}); the collected prompts "
+                "were built for different chunk boundaries, so every primed cache key would miss and "
+                "LightRAG would re-extract everything synchronously at full price. Re-run apply with "
+                "the same chunker env (HARS_MEMORY_CHUNKER* / HARS_MEMORY_CHUNK_TOKEN_SIZE / ...) or "
+                "start over with a fresh --index-dir."
+            )
+    if source == SOURCE_UPSERT_INBOX:
+        docs = _inbox_batch_docs(state, docs)
     if next_round(state) is not None or not all(r.terminal() for r in state.rounds.values()):
         raise BatchError(
             "batches are not all finished (or the gleaning round is not collected yet); "
@@ -1606,7 +1801,8 @@ def apply(index_dir: Path, docs: list[Any], *, max_cost_usd: float | None = None
                 f"${cumulative:.4f} (batch ${plan['spent_usd']:.4f} + sync ${plan['sync_cost_estimated_usd']:.4f}), "
                 f"over --max-cost ${max_cost_usd:.2f}; nothing indexed (state is resumable: raise --max-cost and re-run)"
             )
-    stats = asyncio.run(_prime_and_index(index_dir, pending_documents(index_dir, docs), answers))
+    todo, purge_ids = _source_pending_documents(index_dir, docs, source)
+    stats = asyncio.run(_prime_and_index(index_dir, todo, answers, purge_doc_ids=purge_ids))
     stats.update(
         total_requests=total_requests,
         answered=counts["ok"],
@@ -1615,6 +1811,8 @@ def apply(index_dir: Path, docs: list[Any], *, max_cost_usd: float | None = None
         abandoned_parts=abandoned,
         missing_in_abandoned_parts=plan["missing_in_abandoned_parts"],
     )
+    if source == SOURCE_UPSERT_INBOX:
+        stats["inbox"] = _drain_upsert_inbox(index_dir, docs)
     state.applied = stats
     state.save(index_dir)
     return stats

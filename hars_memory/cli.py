@@ -207,6 +207,13 @@ def _cmd_extractor_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_tui(args: argparse.Namespace) -> int:
+    """Terminal UI (optional ``[tui]`` extra). Lazy import: the base install never loads Textual."""
+    from hars_memory.tui.cli import main as tui_main
+
+    return tui_main(args.tui_argv)
+
+
 def _cmd_strategy_bench(args: argparse.Namespace) -> int:
     from hars_memory.eval.strategy_bench import StrategyBenchmarkError, run_strategy_matrix
     from hars_memory.strategies import StrategyConfigurationError, load_strategy_matrix
@@ -455,6 +462,25 @@ def _batch_documents(args: argparse.Namespace) -> list:
     return docs
 
 
+def _inbox_documents(args: argparse.Namespace, index_dir: Path) -> list:
+    """Documents queued by MCP upserts (`index-batch --source upsert-inbox`).
+
+    The inbox sidecar lives in the index dir (``upsert_inbox.json``, see
+    ``ingest/upsert_inbox.py``); entries hold the FINAL content — source header
+    already applied by ``memory_upsert_document`` — so chunking reproduces the
+    synchronous upsert's prompts byte for byte.
+    """
+    from hars_memory.ingest.upsert_inbox import UpsertInboxStore, default_upsert_inbox_path
+
+    inbox = UpsertInboxStore.load(default_upsert_inbox_path(index_dir))
+    if not len(inbox):
+        raise SystemExit(
+            f"error: upsert inbox at {default_upsert_inbox_path(index_dir)} is empty; "
+            "queue documents first (HARS_MEMORY_UPSERT_BATCH_MODE=queue + memory_upsert_document)"
+        )
+    return inbox.documents()
+
+
 _LIVE_INDEX_MARKER = "kv_store_doc_status.json"
 
 
@@ -508,13 +534,57 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
     index_dir = _resolve_index_dir(args.index_dir).resolve()
     append = bool(getattr(args, "append", False))
     dry = bool(getattr(args, "dry_run", False))
+    source = getattr(args, "source", batch.SOURCE_WALKER)
+    if source not in (batch.SOURCE_WALKER, batch.SOURCE_UPSERT_INBOX):
+        raise SystemExit(f"error: unknown --source {source!r}")
     if args.batch_action not in ("status", "compare"):
-        _check_not_live_index(index_dir, append=append)
+        if source == batch.SOURCE_UPSERT_INBOX:
+            # The inbox lives IN the index the MCP server writes to, and that
+            # index is exactly what apply must extend, so the live-index refusal
+            # (a guard against accidental walker rebuilds) is deliberately
+            # skipped for this source. Make sure nothing indexes concurrently
+            # (e.g. the MCP server) while apply runs.
+            print(
+                f"upsert-inbox mode: targeting {index_dir} directly (the index holding the inbox); "
+                "stop concurrent indexing (e.g. the MCP server) while apply runs",
+                file=sys.stderr,
+            )
+        else:
+            _check_not_live_index(index_dir, append=append)
         if append and not dry and not (index_dir / batch.STATE_FILENAME).exists():
             # Append mode: create an empty state so collect can record its plan
             # against the existing index instead of rebuilding it.
             batch.BatchState().save(index_dir)
             print(f"append mode: writing batch state into the existing index {index_dir}", file=sys.stderr)
+
+    def _source_documents() -> list:
+        return (
+            _inbox_documents(args, index_dir)
+            if source == batch.SOURCE_UPSERT_INBOX
+            else _batch_documents(args)
+        )
+
+    if source == batch.SOURCE_UPSERT_INBOX and args.batch_action in ("collect", "run"):
+        state = batch.BatchState.load(index_dir)
+        if state.doc_ids and state.applied and all(r.terminal() for r in state.rounds.values()):
+            # Queue-mode cycle: the previous inbox batch was fully applied and its
+            # document set is history (successful entries were drained from the
+            # inbox). Archive its state and start a fresh one instead of failing
+            # the collect-time doc-set check — the batch phases themselves are
+            # untouched; this only automates what their error message prescribes.
+            import shutil
+
+            prev = index_dir / (batch.STATE_FILENAME + ".prev.json")
+            prev.write_text(
+                (index_dir / batch.STATE_FILENAME).read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (index_dir / batch.STATE_FILENAME).unlink()
+            shutil.rmtree(index_dir / batch.BATCH_DIRNAME, ignore_errors=True)
+            print(
+                f"previous inbox batch fully applied; state archived to {prev.name}, starting a fresh one",
+                file=sys.stderr,
+            )
+
     os.environ["HARS_MEMORY_INDEX_DIR"] = str(index_dir)
     action = args.batch_action
     try:
@@ -558,7 +628,7 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
             max_inflight_tokens=args.max_inflight_tokens,
         )
         if action == "collect":
-            rnd = batch.collect(index_dir, _batch_documents(args), dry_run=args.dry_run, **prices)
+            rnd = batch.collect(index_dir, _source_documents(), dry_run=args.dry_run, source=source, **prices)
             print("nothing to collect" if rnd is None else (
                 f"round {rnd.round}: {rnd.requests} request(s), ~{rnd.est_input_tokens} input tokens, "
                 f"estimated ${rnd.est_cost_usd:.4f}" + (" (dry run, nothing written)" if args.dry_run else "")))
@@ -568,15 +638,15 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
             print(f"submitted {len(parts)} batch(es): " + ", ".join(p.batch_id or "?" for p in parts))
             return 0
         if action == "apply":
-            print(json.dumps(batch.apply(index_dir, _batch_documents(args), max_cost_usd=args.max_cost), indent=2))
+            print(json.dumps(batch.apply(index_dir, _source_documents(), max_cost_usd=args.max_cost, source=source), indent=2))
             return 0
         # run: collect -> submit -> wait -> (gleaning round) -> apply, resumable at every step
         backend = batch.make_backend_from_env()
-        docs = _batch_documents(args)
+        docs = _source_documents()
         while True:
             state = batch.BatchState.load(index_dir)
             if batch.next_round(state) is not None:
-                rnd = batch.collect(index_dir, docs, **prices)
+                rnd = batch.collect(index_dir, docs, source=source, **prices)
                 print(f"round {rnd.round}: {rnd.requests} request(s), estimated ${rnd.est_cost_usd:.4f}")
             batch.submit(index_dir, backend, **submit_kw)
             state = batch.wait(index_dir, backend, poll_seconds=args.poll_seconds,
@@ -596,7 +666,7 @@ def _cmd_index_batch(args: argparse.Namespace) -> int:
                 return 4
             if batch.next_round(state) is None:
                 break
-        print(json.dumps(batch.apply(index_dir, docs, max_cost_usd=args.max_cost), indent=2))
+        print(json.dumps(batch.apply(index_dir, docs, max_cost_usd=args.max_cost, source=source), indent=2))
         print(json.dumps(batch.actual_cost(batch.BatchState.load(index_dir)), indent=2))
         return 0
     except batch.CostGuardError as exc:
@@ -1186,6 +1256,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     extractor_p.set_defaults(func=_cmd_extractor_bench)
 
+    tui_p = sub.add_parser(
+        "tui",
+        help="Terminal UI: health, recall trace, sessions, projects, eval results (needs the [tui] extra).",
+    )
+    tui_p.add_argument(
+        "tui_argv",
+        nargs=argparse.REMAINDER,
+        help="Arguments forwarded to memory-tui (see `memory tui --help`).",
+    )
+    tui_p.set_defaults(func=_cmd_tui)
+
     # -- Servers --
     recall_p = sub.add_parser("recall", help="Query the LightRAG knowledge graph.")
     recall_p.add_argument("question", help="Natural language query")
@@ -1302,8 +1383,13 @@ def _build_parser() -> argparse.ArgumentParser:
                       "cancel: cancel unfinished batches (manual); "
                       "compare: --other DIR vs --index-dir")
     ib_p.add_argument("--index-dir", default=None, help="Target index directory (default: $HARS_MEMORY_INDEX_DIR)")
+    ib_p.add_argument("--source", choices=["walker", "upsert-inbox"], default="walker",
+                      help="where the documents come from: walker (default: --paths / knowledge-source "
+                           "manifest) or the MCP upsert inbox (HARS_MEMORY_UPSERT_BATCH_MODE=queue; reads "
+                           "<index-dir>/upsert_inbox.json and deliberately targets the index holding it, "
+                           "so the live-index refusal is skipped for it)")
     ib_p.add_argument("--paths", nargs="+", default=None,
-                      help="Files/directories to index (default: knowledge-source manifest)")
+                      help="Files/directories to index (walker source only; default: knowledge-source manifest)")
     ib_p.add_argument("--max-docs", type=int, default=0, help="Cap the number of documents (0 = no cap)")
     ib_p.add_argument("--max-cost", type=float, default=0.50,
                       help="Abort if the estimated cost (USD, batch prices) exceeds this (default: 0.50)")
@@ -1421,6 +1507,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     _ensure_project_root()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["tui"]:
+        # argparse REMAINDER cannot forward a leading `--flag`; hand everything after `tui` over verbatim.
+        sys.exit(_cmd_tui(argparse.Namespace(tui_argv=raw[1:])))
     parser = _build_parser()
     args = parser.parse_args(argv)
     exit_code = args.func(args)

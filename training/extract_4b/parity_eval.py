@@ -118,7 +118,7 @@ def relation_metrics(student: list[dict], ref: list[dict]):
 
 
 def main() -> None:
-    rows = [json.loads(l) for l in DATA.open()]
+    rows = [json.loads(line) for line in DATA.open()]
     log(f"{len(rows)} parity prompts")
 
     tok = AutoTokenizer.from_pretrained(str(MERGED))

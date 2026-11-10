@@ -1,0 +1,1789 @@
+#!/usr/bin/env python3
+"""Metrics + numeric gates for the chained-compaction A/B experiment.
+
+Input:
+  records  runner output, one JSON object per (qid, arm) -- JSONL, a JSON list, or
+           {"records": [...]}. Recognised fields (aliases in brackets):
+             rid, qid, chain_id, session_id, span_idx [span_index], lag, slice,
+             arm, answerable, score, anchor_hit, hallucination [hallucinated],
+             abstained, latency_s [latency, wall], recall_seconds, ask_latency_s,
+             memory_tokens [mem_tokens, arm_memory_total], persisted_compaction
+             [persisted], cost_usd, tokens_in [prompt_tokens], tokens_out
+             [completion_tokens], valid, chain_invalid_reasons, recall_error
+           Data validity (B2): only rows with ``valid is True`` are used; a chain
+           with any invalid row or any non-empty recall_error is dropped whole; a
+           qid without the full (baseline, nc, nc-note-only) triplet is dropped;
+           duplicate (qid, arm) or duplicate rid is a hard error (exit 2).
+  judge    optional judge_v2.py output (JSONL). Joined on rid; when the judge ran
+           in --calibration mode its passes are averaged per rid.
+
+Output (stdout and --out):
+  per-arm means, paired per-question deltas for nc-baseline / nc-nc-note-only /
+  baseline-nc-note-only with cluster-bootstrap 95% CIs (--boot 10,000 resamples
+  over SESSIONS by default -- chain_id minus its _cN suffix, because c0/c1 of a
+  session share 2 of 3 spans; --cluster chain for comparison -- --seed 1337)
+  and paired Wilcoxon signed-rank over per-cluster means,
+  lag / HEAD-TAIL slices, and every numeric gate printed as WIN / FAIL /
+  INCONCLUSIVE together with the rule that produced it.
+
+anchor_hit is reported two ways (gate-212839 forensics, defect 2):
+  anchor_hit (raw)    runner/judge token-bounded regex hit, as before
+  primed_hit          deterministic per-record flag: raw hit whose gold anchor is
+                      ABSENT from that arm's visible_context (C3 note/summary +
+                      injected recall + post-compaction messages) -- plausibly
+                      reconstructed from the question's own phrasing
+  clean_anchor_hit    anchor_hit AND NOT primed_hit; reported everywhere the raw
+                      one is (means, paired deltas + bootstrap CIs, lag slices).
+                      Needs visible_context: pass the export file via --judge-input
+                      (records without it keep clean_anchor_hit undefined, "n/a").
+  Raw hits that are primed but not hallucinated additionally surface in the
+  report's "suspicious reconstruction" list.
+
+Deltas are always ``first arm minus second arm`` in the pair name.
+
+LONG-SESSION TRACK (Amendment C.2; records of run_longsession.py, auto-detected through
+``base_qid`` or forced with ``--track longsession``): the same machinery, plus
+  * arms may include ``orig`` (the session's own real summary; real boundaries only, reference
+    B only): kept as a descriptive side arm, never required for a complete arm set;
+  * clustering by the record's ``cluster_session`` (the sid; no ``_cN`` stripping);
+  * mid-run checkpoints carry ``qid = <qid>@c<j>``: ``checkpoint`` / ``base_qid`` are recovered
+    from the qid when the record lacks them; per-lag-bucket and end-vs-mid tables;
+  * strata by question type (BEAM ``source_qtype`` names; ``multi_session_reasoning`` is the
+    genuine multi-hop stratum) with paired nc-graph - baseline contrasts;
+  * secondary family L1-L5 (Holm, m = 5) instead of S1-S3; ``--include-sid/--exclude-sid``
+    select the analysis set (e.g. ``^beam-1M-`` : BEAM sizes are never pooled);
+  * ``--legacy-qtypes`` restores the pre-C.2 reading of ``qtype = "multihop"`` (OpenHands items
+    are otherwise analysed as ``xspan_locator``, see qtypes.py).
+
+Usage:
+  python3 metrics_v2.py --records fixtures_metrics_win.jsonl --out win.md
+  python3 metrics_v2.py --records runs/R/records.jsonl --judge runs/R/judged.jsonl \
+      --judge-input runs/R/judge-input.jsonl --out REPORT-chains.md
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import math
+import os
+import random
+import re
+import sys
+from collections import Counter, defaultdict
+
+from judge_v2 import anchor_re as token_bounded_re   # identical anchor semantics
+import qtypes as QT                                   # Amendment C.2 relabel (analysis-time)
+
+BOOT_N = 10000
+SEED = 1337
+LAGS = (1, 2, 3)
+SLICES = ("HEAD", "TAIL")
+MIN_CHAINS = 8          # distinct SESSIONS; below this no WIN/FAIL is claimed (underpowered)
+# Amendment C (2026-10-26): four arms. Legacy `nc` records (chunk-RAG, exploratory only) are
+# read as `nc-chunks`. A run without any nc-graph row is a LEGACY run: three required arms,
+# treatment = nc-chunks, flagged exploratory in the report.
+ARM_ALIASES = {"nc": "nc-chunks"}
+REQUIRED_ARMS = ("baseline", "nc-chunks", "nc-graph", "nc-note-only")
+LEGACY_REQUIRED_ARMS = ("baseline", "nc-chunks", "nc-note-only")
+# Amendment C.7 (2026-10-28): the primary treatment is nc-enriched (memory recalled at COMPACTION time with the
+# correct call shape, none at ask time). Its arm set is baseline / nc-enriched / nc-note-only; nc-chunks, nc-graph
+# (question-time recall with a mis-specified call, exploratory) and orig are descriptive side arms whose
+# validity never costs the primary a chain.
+ENRICHED_ARM = "nc-enriched"
+REQUIRED_ARMS_ENRICHED = ("baseline", ENRICHED_ARM, "nc-note-only")
+EXPLORATORY_ARMS = ("nc-chunks", "nc-graph")
+LS_ENRICHED_IDS = ("E1_enriched_vs_note_only", "E2_enriched_vs_baseline")
+PRIMARY_B = 1536                 # the only budget with a WIN/FAIL verdict
+LEGACY_B = 1536                  # records without mem_budget
+MULTIHOP_TYPES = QT.LEGACY_MULTIHOP        # stored (pre-C.2) labels; analysed as xspan_locator
+SIDE_ARMS = ("orig",)             # descriptive arms: kept when present, never required
+QTYPE_LEGACY = False              # --legacy-qtypes: read stored "multihop" as multihop (pre-C.2)
+LS_LAG_BUCKETS = ((0, 0, "0"), (1, 1, "1"), (2, 3, "2-3"), (4, 7, "4-7"), (8, 15, "8-15"),
+                  (16, 10 ** 9, "16+"))
+KEYWORD_IN_EST, KEYWORD_OUT_EST = 450.0, 80.0   # nc-graph keyword call, used only when the
+                                                # server reported no usage (flagged)
+ALPHA_ONE_SIDED = 0.025          # family-wise, = the two-sided 95% CIs used everywhere
+NI_MARGIN_ANCHOR = 0.10          # non-inferiority margins (Amendment C, frozen)
+NI_MARGIN_SCORE = 0.15
+H_GRAPH_MIN_ANCHOR = 0.05        # "graph helps" practical threshold on clean_anchor_hit
+# Amendment C.2: the chain track's Holm family is S1-S3 (m = 3); S4/S5 on the OpenHands
+# "multihop" (= xspan_locator) items are DESCRIPTIVE. The long-session track has its own
+# fixed family L1-L5 (m = 5), genuine multi-hop = BEAM multi_session_reasoning.
+SECONDARY_IDS = ("S1_graph_vs_chunks", "S2_ni_1024", "S3_ni_512")
+DESCRIPTIVE_IDS = ("S4d_xspan_locator_vs_baseline", "S5d_xspan_locator_graph_vs_chunks")
+LS_SECONDARY_IDS = ("L1_graph_vs_chunks", "L2_ni_1024", "L3_ni_512", "L4_msr_vs_baseline",
+                    "L5_msr_graph_vs_chunks")
+LS_DESCRIPTIVE_STRATA = ("knowledge_update", "temporal_reasoning", "contradiction_resolution")
+
+
+def canon_arm(arm):
+    return ARM_ALIASES.get(arm, arm)
+
+FIELD_ALIASES = {
+    "qid": ("qid", "question_id"),
+    "chain_id": ("chain_id", "chain"),
+    "session_id": ("session_id", "session"),
+    "span_idx": ("span_idx", "span_index"),
+    "lag": ("lag",),
+    "slice": ("slice",),
+    "arm": ("arm",),
+    "answerable": ("answerable", "is_answerable"),
+    "score": ("score",),
+    "anchor_hit": ("anchor_hit", "anchor"),
+    "hallucination": ("hallucination", "hallucinated"),
+    "abstained": ("abstained",),
+    "latency_s": ("latency_s", "latency", "wall"),
+    "ask_latency_s": ("ask_latency_s",),     # explicit end-to-end ask time, if emitted
+    "recall_seconds": ("recall_seconds",),
+    # realized ask-time memory = note/summary + injected recall (runner: arm_memory_total);
+    # memory_tokens_injected is the recall part only and is NOT an alias.
+    "memory_tokens": ("memory_tokens", "mem_tokens", "memory_token_count",
+                      "arm_memory_total"),
+    "persisted_compaction": ("persisted_compaction", "persisted"),
+    "cost_usd": ("cost_usd", "cost"),
+    "tokens_in": ("tokens_in", "input_tokens", "prompt_tokens"),
+    "tokens_out": ("tokens_out", "output_tokens", "completion_tokens"),
+    "rid": ("rid",),
+    "gold_anchor": ("gold_anchor",),
+    "visible_context": ("visible_context",),
+    "primed_hit": ("primed_hit",),
+    "mem_budget": ("mem_budget",),
+    "qtype": ("qtype", "question_type"),
+    "base_qid": ("base_qid",),
+    "checkpoint": ("checkpoint",),
+}
+
+
+def pick(rec: dict, field: str, default=None):
+    for k in FIELD_ALIASES.get(field, (field,)):
+        if k in rec and rec[k] is not None:
+            return rec[k]
+    return default
+
+
+def as_bool(v):
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    return str(v).strip().lower() in ("1", "true", "yes", "y")
+
+
+def as_float(v):
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------- loading
+
+def load_json_records(pattern: str) -> list[dict]:
+    out = []
+    for path in sorted(glob.glob(pattern)) or ([pattern] if os.path.exists(pattern) else []):
+        text = open(path).read()
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and "records" in obj:
+                out.extend(obj["records"])
+            elif isinstance(obj, list):
+                out.extend(obj)
+            else:
+                out.append(obj)
+            continue
+        except json.JSONDecodeError:
+            pass
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def raw_rid(rec: dict) -> str:
+    return pick(rec, "rid") or f"{pick(rec, 'qid')}::{pick(rec, 'arm')}"
+
+
+def session_of(chain_id) -> str:
+    """Cluster key: the source session a chain was cut from (chain_qq8Vqbow_c1 ->
+    chain_qq8Vqbow). NOT the record's session_id, which is the per-arm HARS id."""
+    return re.sub(r"_c\d+$", "", str(chain_id))
+
+
+def row_budget(rec: dict) -> int:
+    """Budget cell of a raw record (legacy records without mem_budget = 1536)."""
+    try:
+        return int(pick(rec, "mem_budget", LEGACY_B))
+    except (TypeError, ValueError):
+        return LEGACY_B
+
+
+def required_arms_for(rows: list[dict]) -> tuple:
+    """C.7: baseline / nc-enriched / nc-note-only when any nc-enriched row exists; else 4 arms when any nc-graph
+    row exists, else the 3 legacy arms (exploratory)."""
+    if any(canon_arm(pick(r, "arm")) == ENRICHED_ARM for r in rows):
+        return REQUIRED_ARMS_ENRICHED
+    has_graph = any(canon_arm(pick(r, "arm")) == "nc-graph" for r in rows)
+    return REQUIRED_ARMS if has_graph else LEGACY_REQUIRED_ARMS
+
+
+def validate_rows(rows: list[dict], arms=None) -> tuple[list[dict], dict]:
+    """B2 data-validity filter, shared with export_judge_input.py.
+
+    Hard-fails (SystemExit, exit 2) on duplicate (qid, arm) or duplicate rid across
+    ALL loaded rows (valid or not: a merge that concatenates an invalid batch with
+    its re-run must be fixed at the merge, not silently resolved here). Then drops
+    whole chains with any row whose ``valid`` is not True or that carries a
+    recall_error, and finally every qid lacking the full arm triplet."""
+    arms = tuple(arms) if arms else required_arms_for(rows)
+    keys = Counter((pick(r, "qid"), canon_arm(pick(r, "arm")), row_budget(r)) for r in rows)
+    rids = Counter(raw_rid(r) for r in rows)
+    dup_k = sorted(str(k) for k, v in keys.items() if v > 1)   # (qid, arm, mem_budget)
+    dup_r = sorted(k for k, v in rids.items() if v > 1)
+    if dup_k or dup_r:
+        print(f"ERROR duplicate rows: {len(dup_k)} duplicate (qid, arm) {dup_k[:5]}; "
+              f"{len(dup_r)} duplicate rid {dup_r[:5]} -- fix the merge (one row per "
+              f"(qid, arm)); refusing to average or pick one", file=sys.stderr)
+        raise SystemExit(2)
+    expl = EXPLORATORY_ARMS if tuple(arms) == REQUIRED_ARMS_ENRICHED else ()
+    bad: dict[tuple, set] = defaultdict(set)
+    for r in rows:
+        if canon_arm(pick(r, "arm")) in expl:       # C.7: exploratory arms never invalidate the primary's chain
+            continue
+        cid = (str(pick(r, "chain_id")), row_budget(r))   # a chain is valid PER budget cell
+        v = r.get("valid")
+        if v is not True:
+            why = (r.get("chain_invalid_reasons") or []) if v is False else []
+            bad[cid].add(f"valid={json.dumps(v)}" + (f": {'; '.join(map(str, why))}"
+                                                      if why else ""))
+        if r.get("recall_error"):
+            bad[cid].add(f"recall_error={str(r['recall_error'])[:60]} ({pick(r, 'arm')})")
+    kept = [r for r in rows if (str(pick(r, "chain_id")), row_budget(r)) not in bad
+            and (canon_arm(pick(r, "arm")) not in expl or (r.get("valid") is True and not r.get("recall_error")))]
+    have: dict = defaultdict(set)
+    for r in kept:
+        have[(pick(r, "qid"), row_budget(r))].add(canon_arm(pick(r, "arm")))
+    incomplete = {q: sorted(set(arms) - a) for q, a in have.items() if set(arms) - a}
+    final = [r for r in kept if (pick(r, "qid"), row_budget(r)) not in incomplete
+             and canon_arm(pick(r, "arm")) in tuple(arms) + SIDE_ARMS + expl]
+    budgets_in = {row_budget(r) for r in rows}
+    report = {
+        "rows_in": len(rows), "rows_kept": len(final),
+        "rows_dropped_invalid_chain": len(rows) - len(kept),
+        "rows_dropped_incomplete_triplet": len(kept) - len(final),
+        "chains_in": len({str(pick(r, "chain_id")) for r in rows}),
+        "chains_kept": len({str(pick(r, "chain_id")) for r in final}),
+        "sessions_kept": len({session_of(pick(r, "chain_id")) for r in final}),
+        "dropped_chains": {(c if b == LEGACY_B and len(budgets_in) == 1 else f"{c}@B{b}"): sorted(w)
+                           for (c, b), w in sorted(bad.items())},
+        "incomplete_qids": dict(sorted(
+            ((str(q) if b == LEGACY_B and len(budgets_in) == 1 else f"{q}@B{b}"), m)
+            for (q, b), m in incomplete.items())),
+        "required_arms": list(arms),
+        "side_arms_kept": sorted({canon_arm(pick(r, "arm")) for r in final} & set(SIDE_ARMS + expl)),
+        "legacy_arm_set": tuple(arms) == LEGACY_REQUIRED_ARMS,
+        "enriched_arm_set": tuple(arms) == REQUIRED_ARMS_ENRICHED,
+        "budgets": sorted(budgets_in),
+    }
+    return final, report
+
+
+def validity_lines(rep: dict) -> list[str]:
+    out = [f"rows kept {rep['rows_kept']}/{rep['rows_in']} | chains kept "
+           f"{rep['chains_kept']}/{rep['chains_in']} ({rep['sessions_kept']} sessions) | "
+           f"dropped: {rep['rows_dropped_invalid_chain']} rows in invalid chains, "
+           f"{rep['rows_dropped_incomplete_triplet']} rows in incomplete arm triplets"]
+    for c, why in rep["dropped_chains"].items():
+        out.append(f"  dropped chain {c}: {', '.join(why)}")
+    for q, missing in rep["incomplete_qids"].items():
+        out.append(f"  dropped qid {q}: missing arm(s) {', '.join(map(str, missing))}")
+    return out
+
+
+_CP_RE = re.compile(r"@c(\d+)$")
+
+
+def split_qid(qid, rec: dict | None = None) -> tuple[str | None, int | None]:
+    """(base_qid, checkpoint j) of a long-session qid: ``<qid>@c<j>`` is a mid-run checkpoint
+    row; a plain qid is the end row (checkpoint taken from the record, else None)."""
+    rec = rec or {}
+    q = None if qid is None else str(qid)
+    m = _CP_RE.search(q) if q else None
+    base = pick(rec, "base_qid") or (q[:m.start()] if m else q)
+    cp = pick(rec, "checkpoint")
+    if cp is None and m:
+        cp = int(m.group(1))
+    try:
+        cp = None if cp is None else int(cp)
+    except (TypeError, ValueError):
+        cp = None
+    return base, cp
+
+
+def normalize(rec: dict) -> dict:
+    raw_arm = pick(rec, "arm", "unknown")
+    arm = canon_arm(raw_arm)
+    qid = pick(rec, "qid")
+    rid = pick(rec, "rid") or f"{qid}::{raw_arm}"
+    # question-priming check (gate-212839 defect 2): a raw anchor_hit whose gold
+    # anchor is provably absent from the arm's own visible_context is a primed
+    # reconstruction (e.g. echoed from the question's phrasing), not a memory hit.
+    ctx = rec.get("visible_context")
+    anchor = (pick(rec, "gold_anchor") or "").strip() if isinstance(
+        pick(rec, "gold_anchor"), str) else ""
+    anchor_hit = as_bool(pick(rec, "anchor_hit"))
+    ctx_ok = isinstance(ctx, str) and bool(ctx.strip())
+    primed = clean = None
+    if anchor_hit and anchor and ctx_ok:
+        primed = token_bounded_re(anchor).search(ctx) is None
+    if anchor_hit is True:
+        clean = (primed is not True) if primed is not None else None
+    elif anchor_hit is False:
+        clean = False
+    chain_id = pick(rec, "chain_id") or pick(rec, "session_id") or str(qid)
+    # ask latency = the ask wall time PLUS the nc recall call that precedes it
+    # (the runner measures recall once per qid outside latency_s); an explicit
+    # ask_latency_s wins when the runner emits the end-to-end figure itself.
+    lat = as_float(pick(rec, "latency_s"))
+    rsec = as_float(pick(rec, "recall_seconds"))
+    ask_lat = as_float(pick(rec, "ask_latency_s"))
+    if ask_lat is None and lat is not None:
+        ask_lat = lat + (rsec or 0.0)
+    base_qid, checkpoint = split_qid(qid, rec)
+    nb = rec.get("n_boundaries")
+    sparse = {
+        "rid": rid, "qid": qid, "arm": arm,
+        "chain_id": chain_id,
+        # long-session records name their cluster explicitly (the sid); chain records strip _cN
+        "cluster_session": (str(rec["cluster_session"]) if rec.get("cluster_session")
+                            else (str(chain_id) if "base_qid" in rec else session_of(chain_id))),
+        "base_qid": base_qid, "checkpoint": checkpoint,
+        "n_boundaries": int(nb) if isinstance(nb, (int, float)) else None,
+        "is_end": (as_bool(rec.get("is_end")) if rec.get("is_end") is not None
+                   else ((not _CP_RE.search(str(qid))) if "base_qid" in rec else None)),
+        "source": rec.get("source"),
+        "rubric_hit_frac": as_float(rec.get("rubric_hit_frac")),
+        "session_id": pick(rec, "session_id"),
+        "span_idx": pick(rec, "span_idx"), "lag": pick(rec, "lag"),
+        "slice": (pick(rec, "slice") or "").upper() or None,
+        "answerable": as_bool(pick(rec, "answerable", True)),
+        "score": as_float(pick(rec, "score")),
+        "anchor_hit": anchor_hit,
+        "primed_hit": primed,
+        "clean_anchor_hit": clean,
+        "gold_anchor": anchor or None,
+        "ctx_present": ctx_ok,
+        "hallucination": as_bool(pick(rec, "hallucination")),
+        "abstained": as_bool(pick(rec, "abstained")),
+        "latency_s": ask_lat,
+        "recall_seconds": rsec,
+        "memory_tokens": as_float(pick(rec, "memory_tokens")),
+        "persisted_compaction": as_bool(pick(rec, "persisted_compaction")),
+        "cost_usd": as_float(pick(rec, "cost_usd")),
+        "tokens_in": as_float(pick(rec, "tokens_in")),
+        "tokens_out": as_float(pick(rec, "tokens_out")),
+        "cost_source": "usd" if as_float(pick(rec, "cost_usd")) is not None else None,
+        "mem_budget": row_budget(rec),
+        # Amendment C.2: stored "multihop" (OpenHands) is analysed as xspan_locator; BEAM items
+        # carry their source_qtype as the stratum; --legacy-qtypes restores the stored label
+        "qtype": QT.canon_qtype(pick(rec, "qtype"), rec.get("source_qtype"), QTYPE_LEGACY),
+        "qtype_stored": (str(pick(rec, "qtype")).strip().lower() if pick(rec, "qtype") else None),
+        # nc-graph readout (None on the other arms)
+        "keyword_source": rec.get("keyword_source"),
+        "kg_empty": as_bool(rec.get("kg_empty")),
+        "session_graph_status": rec.get("session_graph_status"),
+        "anchor_in_recall": as_bool(rec.get("anchor_in_recall")),
+        "anchor_in_recall_raw": as_bool(rec.get("anchor_in_recall_raw")),
+        "anchor_in_enriched": as_bool(rec.get("anchor_in_enriched")),
+        "anchor_in_enriched_raw": as_bool(rec.get("anchor_in_enriched_raw")),
+        "enrich_cost_usd": as_float(rec.get("enrich_cost_usd")),
+        "enrich_queries": as_float(rec.get("enrich_queries")),
+        "enrich_keywords_rate": as_float(rec.get("enrich_keywords_rate")),
+        "enrich_graph_branch_enabled_rate": as_float(rec.get("enrich_graph_branch_enabled_rate")),
+        "enrich_duplicates_removed": as_float(rec.get("enrich_duplicates_removed")),
+        "enrich_chunks_unique": as_float(rec.get("enrich_chunks_unique")),
+        "recall_packed_tokens": as_float(rec.get("recall_packed_tokens")),
+        "reused_from": rec.get("reused_from"),
+        "anchor_in_kg_recall": as_bool(rec.get("anchor_in_kg_recall")),
+        "anchor_in_chunk_recall": as_bool(rec.get("anchor_in_chunk_recall")),
+    }
+    # the nc-graph keyword LLM call is part of the ask's cost (Amendment C item 13): add the
+    # server-reported usage; when the server reported none, add a flagged estimate so the
+    # cost/question of nc-graph is never silently understated.
+    if arm == "nc-graph":
+        kin, kout = as_float(rec.get("keyword_tokens_in")), as_float(rec.get("keyword_tokens_out"))
+        kusd = as_float(rec.get("keyword_cost_usd"))
+        sparse["keyword_cost_estimated"] = False
+        if rec.get("keyword_source") != "caller":
+            if kin is None and kout is None and kusd is None:
+                kin, kout = KEYWORD_IN_EST, KEYWORD_OUT_EST
+                sparse["keyword_cost_estimated"] = True
+        if sparse["cost_usd"] is not None and sparse["cost_source"] == "usd" and kusd:
+            sparse["cost_usd"] += kusd
+        elif kin or kout:
+            sparse["tokens_in"] = (sparse["tokens_in"] or 0) + (kin or 0)
+            sparse["tokens_out"] = (sparse["tokens_out"] or 0) + (kout or 0)
+    if arm == ENRICHED_ARM and sparse["enrich_cost_usd"] and sparse["cost_usd"] is not None and sparse["cost_source"] == "usd":
+        sparse["cost_usd"] += sparse["enrich_cost_usd"]       # the compaction-time query-generation call, amortised per question
+    if sparse["cost_usd"] is None and (sparse["tokens_in"] or sparse["tokens_out"]):
+        # token-cost proxy so "cost per question" still works without $ fields
+        # (agent prompt+completion tokens only; HARS compaction/extractor spend is
+        # not in the records)
+        sparse["cost_usd"] = (sparse["tokens_in"] or 0) + (sparse["tokens_out"] or 0)
+        sparse["cost_source"] = "tokens"
+    return sparse
+
+
+def merge_judge(records: list[dict], judged: list[dict], mapping: dict | None) -> dict:
+    """Attach judge verdicts to records on rid; calibration passes are averaged."""
+    by_rid: dict[str, list[dict]] = defaultdict(list)
+    for j in judged:
+        rid = j.get("rid")
+        if not rid and mapping:
+            pid = j.get("present_id")
+            rid = (mapping.get("map", {}).get(pid) or {}).get("rid")
+        if rid:
+            by_rid[rid].append(j)
+    merged = {}
+    for r in records:
+        rid = r["rid"]
+        js = by_rid.get(rid) or []
+        if js:
+            scores = [j["score"] for j in js if j.get("score") is not None]
+            if scores:
+                r["score"] = sum(scores) / len(scores)
+            for f in ("anchor_hit", "hallucination", "abstained"):
+                vals = [as_bool(j.get(f)) for j in js if j.get(f) is not None]
+                if vals:
+                    r[f] = sum(1 for v in vals if v) / len(vals)
+            r["judge_passes"] = len(js)
+        merged[rid] = r
+    return merged
+
+
+# -------------------------------------------------------------------- stats
+
+def mean(xs):
+    return sum(xs) / len(xs) if xs else None
+
+
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def percentile(sorted_xs, p):
+    if not sorted_xs:
+        return None
+    if len(sorted_xs) == 1:
+        return sorted_xs[0]
+    k = (len(sorted_xs) - 1) * p
+    lo, hi = math.floor(k), math.ceil(k)
+    if lo == hi:
+        return sorted_xs[int(k)]
+    return sorted_xs[lo] * (hi - k) + sorted_xs[hi] * (k - lo)
+
+
+def resample_indices(n_chains: int, n_boot: int = BOOT_N, seed: int = SEED):
+    """One shared index matrix per (n_chains, seed): the same resamples are used for
+    every metric of a pair, so the CIs stay jointly interpretable."""
+    rng = random.Random(seed)
+    return [[rng.randrange(n_chains) for _ in range(n_chains)] for _ in range(n_boot)]
+
+
+def boot_ci(values_by_chain: dict, idx: list[list[int]]) -> tuple[float | None, float | None, float]:
+    chains = sorted(values_by_chain)
+    vals = [values_by_chain[c] for c in chains]
+    if not vals:
+        return None, None, 0.0
+    point = mean(vals)
+    means = sorted(mean([vals[i] for i in draw]) for draw in idx)
+    return percentile(means, 0.025), percentile(means, 0.975), point
+
+
+def wilcoxon_signed_rank(diffs: list[float]) -> dict:
+    """Two-sided signed-rank test on per-chain means, no scipy.
+
+    Exact null distribution by DP over rank sums when n <= 25 (no zeros, ties
+    averaged), normal approximation with tie correction otherwise."""
+    d = [x for x in diffs if x is not None and abs(x) > 1e-12]
+    n = len(d)
+    if n == 0:
+        return {"n": 0, "W": None, "p": None, "method": "empty"}
+    order = sorted(range(n), key=lambda i: abs(d[i]))
+    ranks = [0.0] * n
+    i = 0
+    ties = []
+    while i < n:
+        j = i
+        while j + 1 < n and abs(abs(d[order[j + 1]]) - abs(d[order[i]])) < 1e-12:
+            j += 1
+        avg = (i + j + 2) / 2          # ranks are 1-based
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        if j > i:
+            ties.append(j - i + 1)
+        i = j + 1
+    w_plus = sum(r for r, x in zip(ranks, d) if x > 0)
+    w_minus = sum(r for r, x in zip(ranks, d) if x < 0)
+    w = min(w_plus, w_minus)
+    if n <= 25:
+        # exact: DP counts of subset sums of the (possibly tied) ranks
+        counts = [1.0] + [0.0] * int(sum(ranks) + 1)
+        for r in ranks:
+            r_int = int(round(r))
+            for s in range(len(counts) - 1, r_int - 1, -1):
+                counts[s] += counts[s - r_int]
+        total = 2 ** n
+        p = sum(c for s, c in enumerate(counts) if s <= w + 1e-9) / total
+        return {"n": n, "W": w, "p": min(1.0, 2 * p), "method": "exact", "ties": ties}
+    mean_w = n * (n + 1) / 4
+    var = n * (n + 1) * (2 * n + 1) / 24 - sum(t ** 3 - t for t in ties) / 48
+    if var <= 0:
+        return {"n": n, "W": w, "p": None, "method": "degenerate", "ties": ties}
+    z = (w - mean_w + 0.5) / math.sqrt(var)
+    p = math.erfc(abs(z) / math.sqrt(2))
+    return {"n": n, "W": w, "p": p, "method": "normal", "ties": ties}
+
+
+# ------------------------------------------------------------ paired deltas
+
+def paired(records: dict, arm_a: str, arm_b: str, cluster: str = "session",
+           n_boot: int = BOOT_N, seed: int = SEED) -> dict:
+    """rid-indexed records -> per-question paired deltas, cluster-bootstrapped over
+    sessions (default) or chains (``cluster="chain"``, comparison only)."""
+    ckey = "cluster_session" if cluster == "session" else "chain_id"
+    by_arm: dict[str, dict] = defaultdict(dict)
+    for r in records.values():
+        if r["qid"] is None:
+            continue
+        key = (r["qid"], r["arm"])
+        by_arm[r["arm"]][key] = r
+    out = {"metrics": {}, "n_questions": 0, "chains": 0, "cluster_by": cluster}
+    per_chain: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    n_pairs = 0
+    for (qid, _), ra in by_arm.get(arm_a, {}).items():
+        rb = by_arm.get(arm_b, {}).get((qid, arm_b))
+        if rb is None:
+            continue
+        used = False
+        answerable = ra["answerable"] is not False and rb["answerable"] is not False
+        for metric in ("score", "anchor_hit", "clean_anchor_hit"):
+            if not answerable:
+                continue
+            va, vb = ra.get(metric), rb.get(metric)
+            if va is None or vb is None:
+                continue
+            per_chain[ra[ckey]][metric].append(float(va) - float(vb))
+            used = True
+        for metric in ("hallucination", "abstained"):
+            va, vb = ra.get(metric), rb.get(metric)
+            if va is None or vb is None:
+                continue
+            per_chain[ra[ckey]][metric].append(float(va) - float(vb))
+            if ra["answerable"] is False and rb["answerable"] is False \
+                    and metric == "hallucination":
+                # unanswerable false-answer rate (non-abstaining concrete answer)
+                per_chain[ra[ckey]]["false_answer"].append(float(va) - float(vb))
+            elif answerable and metric == "hallucination":
+                per_chain[ra[ckey]]["hallucination_answerable"].append(float(va) - float(vb))
+            used = True
+        n_pairs += used
+    out["n_questions"] = n_pairs
+    out["chains"] = len(per_chain)
+    idx = resample_indices(max(1, len(per_chain)), n_boot, seed)
+    for metric in ("score", "anchor_hit", "clean_anchor_hit", "hallucination",
+                   "abstained", "false_answer", "hallucination_answerable"):
+        vbc = {c: mean(v[metric]) for c, v in per_chain.items() if v[metric]}
+        vbc = {c: m for c, m in vbc.items() if m is not None}
+        if not vbc:
+            continue
+        # the resample matrix is sized to THIS metric's cluster count (clusters without
+        # data for a metric, e.g. a stratum, must not index past the end); for equal
+        # counts it is identical to the shared matrix
+        if len(vbc) != len(per_chain):
+            idx_m = resample_indices(len(vbc), n_boot, seed)
+        else:
+            idx_m = idx
+        lo, hi, point = boot_ci(vbc, idx_m)
+        w = wilcoxon_signed_rank(list(vbc.values()))
+        out["metrics"][metric] = {
+            "point": point, "ci_lo": lo, "ci_hi": hi,
+            "n_chains": len(vbc), "wilcoxon_p": w["p"], "wilcoxon_W": w["W"],
+            "wilcoxon_method": w["method"],
+            "per_chain": {c: round(m, 4) for c, m in sorted(vbc.items())},
+            "values": dict(sorted(vbc.items())),     # unrounded, for contrast p-values
+        }
+    return out
+
+
+def arm_summary(records: list[dict]) -> dict:
+    out = {}
+    for arm in sorted({r["arm"] for r in records}):
+        rs = [r for r in records if r["arm"] == arm]
+        ans = [r for r in rs if r["answerable"] is not False]
+        una = [r for r in rs if r["answerable"] is False]
+        out[arm] = {
+            "n": len(rs), "n_answerable": len(ans), "n_unanswerable": len(una),
+            "score": mean([r["score"] for r in ans if r["score"] is not None]),
+            "anchor_hit": mean([float(r["anchor_hit"]) for r in ans
+                                if r["anchor_hit"] is not None]),
+            "clean_anchor_hit": mean([float(r["clean_anchor_hit"]) for r in ans
+                                      if r.get("clean_anchor_hit") is not None]),
+            "primed_hits": sum(1 for r in ans if r.get("primed_hit") is True),
+            "n_ctx_present": sum(1 for r in rs if r.get("ctx_present")),
+            "hallucination": mean([float(r["hallucination"]) for r in rs
+                                   if r["hallucination"] is not None]),
+            "hallucination_answerable": mean([float(r["hallucination"]) for r in ans
+                                              if r["hallucination"] is not None]),
+            "hallucination_unanswerable": mean([float(r["hallucination"]) for r in una
+                                                if r["hallucination"] is not None]),
+            "halluc_counts": {
+                "answerable": [sum(1 for r in ans if r["hallucination"]), sum(1 for r in ans if r["hallucination"] is not None)],
+                "unanswerable": [sum(1 for r in una if r["hallucination"]), sum(1 for r in una if r["hallucination"] is not None)]},
+            "abstained": mean([float(r["abstained"]) for r in rs
+                               if r["abstained"] is not None]),
+            "abstain_on_unanswerable": mean([float(r["abstained"]) for r in una
+                                             if r["abstained"] is not None]),
+            "latency_median": median([r["latency_s"] for r in rs]),
+            "latency_mean": mean([r["latency_s"] for r in rs if r["latency_s"] is not None]),
+            "memory_tokens_median": median([r["memory_tokens"] for r in rs]),
+            "memory_tokens_mean": mean([r["memory_tokens"] for r in rs
+                                        if r["memory_tokens"] is not None]),
+            "persisted_compaction_rate": mean([float(r["persisted_compaction"]) for r in rs
+                                               if r["persisted_compaction"] is not None]),
+            "cost_per_question": mean([r["cost_usd"] for r in rs
+                                       if r["cost_usd"] is not None]),
+            "cost_sources": sorted({r["cost_source"] for r in rs
+                                    if r.get("cost_source")}),
+        }
+    return out
+
+
+def slices(records: list[dict]) -> dict:
+    out = {}
+    for arm in sorted({r["arm"] for r in records}):
+        rs = [r for r in records if r["arm"] == arm and r["answerable"] is not False]
+        out[arm] = {}
+        for lag in LAGS:
+            grp = [r for r in rs if r["lag"] == lag]
+            out[arm][f"lag={lag}"] = {
+                "n": len(grp),
+                "score": mean([r["score"] for r in grp if r["score"] is not None]),
+                "anchor_hit": mean([float(r["anchor_hit"]) for r in grp
+                                    if r["anchor_hit"] is not None]),
+                "clean_anchor_hit": mean([float(r["clean_anchor_hit"]) for r in grp
+                                          if r.get("clean_anchor_hit") is not None]),
+            }
+        for sl in SLICES:
+            grp = [r for r in rs if r["slice"] == sl]
+            out[arm][sl] = {
+                "n": len(grp),
+                "score": mean([r["score"] for r in grp if r["score"] is not None]),
+                "anchor_hit": mean([float(r["anchor_hit"]) for r in grp
+                                    if r["anchor_hit"] is not None]),
+                "clean_anchor_hit": mean([float(r["clean_anchor_hit"]) for r in grp
+                                          if r.get("clean_anchor_hit") is not None]),
+            }
+    return out
+
+
+# --------------------------------------------------------------------- gates
+
+def fmt(v, nd=3):
+    if v is None:
+        return "n/a"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        return f"{v:.{nd}f}"
+    return str(v)
+
+
+def evaluate_gates(deltas: dict, summary: dict, arms: dict,
+                   mem_ratio_pair: tuple[str, str], anchor_key: str = "anchor_hit",
+                   n_sessions: int | None = None, warnings: list | None = None,
+                   treat: str = "nc") -> dict:
+    """Every rule is printed with its observed value; FAIL wins over WIN.
+
+    A rule whose inputs are missing evaluates to None ("n/a"): a WIN rule that is
+    n/a cannot be met, a FAIL rule that is n/a does not fire, and any n/a FAIL rule
+    also blocks WIN (FAIL cannot be excluded) -> INCONCLUSIVE, never FAIL."""
+    warnings = list(warnings or [])
+    # `treat` = the arm entering the WIN/FAIL rules against `baseline` and `nc-note-only`
+    # (Amendment C: nc-graph; legacy runs: nc-chunks / old name "nc")
+    nb, nn, bn = f"{treat}-baseline", f"{treat}-nc-note-only", "baseline-nc-note-only"
+    d_score = deltas.get(nb, {}).get("metrics", {}).get("score", {})
+    d_anchor = deltas.get(nb, {}).get("metrics", {}).get(anchor_key, {})
+    d_halluc = deltas.get(nb, {}).get("metrics", {}).get("hallucination", {})
+    d_false = deltas.get(nb, {}).get("metrics", {}).get("false_answer", {})
+    s_score = deltas.get(nn, {}).get("metrics", {}).get("score", {})
+    s_anchor = deltas.get(nn, {}).get("metrics", {}).get(anchor_key, {})
+    nc, base, note = arms.get(treat, {}), arms.get("baseline", {}), arms.get("nc-note-only", {})
+    tn = treat
+    al = "d_clean_anchor" if anchor_key == "clean_anchor_hit" else "d_anchor(raw)"
+
+    def known(*xs):
+        return all(x is not None for x in xs)
+
+    def cmp(ok_fn, *xs):
+        return ok_fn(*xs) if known(*xs) else None
+
+    # realized memory-token ratio: run-MEAN nc / run-MEAN baseline (RUNBOOK: the
+    # gate is the run-mean ratio, nc = note + recall, baseline = summary)
+    a, b = mem_ratio_pair
+    mem_a = arms.get(a, {}).get("memory_tokens_mean")
+    mem_b = arms.get(b, {}).get("memory_tokens_mean")
+    mem_ratio = (mem_a / mem_b) if (mem_a is not None and mem_b not in (None, 0)) else None
+    persisted = nc.get("persisted_compaction_rate")
+    med_lat = nc.get("latency_median")
+    c_nc, c_base = nc.get("cost_per_question"), base.get("cost_per_question")
+    src_nc, src_base = nc.get("cost_sources") or [], base.get("cost_sources") or []
+    cost_comparable = len(src_nc) == 1 and src_nc == src_base
+    cost_ratio = (c_nc / c_base) if (cost_comparable and c_nc is not None
+                                     and c_base not in (None, 0)) else None
+    if c_nc is not None and not cost_comparable:
+        warnings.append(f"cost/Q not comparable (nc source {src_nc} vs baseline "
+                        f"{src_base}) -> fail_cost n/a")
+    fa_nc, fa_base = nc.get("hallucination_unanswerable"), base.get("hallucination_unanswerable")
+
+    def gate(name, ok, rule, observed):
+        return {"name": name, "ok": None if ok is None else bool(ok),
+                "rule": rule, "observed": observed}
+
+    def win_vs_note():
+        legs = []
+        for d, thr in ((s_score, 0.15), (s_anchor, 0.10)):
+            p, lo = d.get("point"), d.get("ci_lo")
+            legs.append(None if not known(p, lo) else (p >= thr and lo > 0))
+        if any(x is True for x in legs):
+            return True
+        return None if any(x is None for x in legs) else False
+
+    win_rules = [
+        gate("win_score_ci", cmp(lambda lo: lo >= -0.05, d_score.get("ci_lo")),
+             f"CI lower of paired d_score({tn}-baseline) >= -0.05",
+             f"ci_lo={fmt(d_score.get('ci_lo'))} point={fmt(d_score.get('point'))}"),
+        gate("win_anchor_ci",
+             cmp(lambda lo, p: lo >= -0.02 and p >= 0, d_anchor.get("ci_lo"),
+                 d_anchor.get("point")),
+             f"CI lower of paired {al}({tn}-baseline) >= -0.02 AND point >= 0",
+             f"ci_lo={fmt(d_anchor.get('ci_lo'))} point={fmt(d_anchor.get('point'))}"),
+        gate("win_halluc_ci",
+             cmp(lambda p, hi: p <= -0.10 and hi < 0, d_halluc.get("point"),
+                 d_halluc.get("ci_hi")),
+             f"d_halluc({tn}-baseline) <= -0.10 with CI upper < 0",
+             f"point={fmt(d_halluc.get('point'))} ci_hi={fmt(d_halluc.get('ci_hi'))}"),
+        gate("win_unanswerable_false_answer",
+             cmp(lambda d, fb, fn: d <= -0.10 or (fb <= 0.30 and fn <= 0.25),
+                 d_false.get("point"), fa_base, fa_nc),
+             f"unanswerable false-answer d({tn}-baseline) <= -0.10, or {tn} <= 0.25 "
+             "absolute if baseline <= 0.30",
+             f"d={fmt(d_false.get('point'))} nc={fmt(fa_nc)} baseline={fmt(fa_base)}"),
+        gate("win_vs_note_only", win_vs_note(),
+             f"(d_score({tn}-nc-note-only) >= +0.15 or {al} >= +0.10) with CI lower > 0",
+             f"score point={fmt(s_score.get('point'))} ci_lo={fmt(s_score.get('ci_lo'))}; "
+             f"anchor point={fmt(s_anchor.get('point'))} ci_lo={fmt(s_anchor.get('ci_lo'))}"),
+        gate("win_mem_token_ratio",
+             cmp(lambda r: 0.80 <= r <= 1.05, mem_ratio),
+             f"realized mem-token ratio run-mean({a})/run-mean({b}) within [0.80, 1.05]",
+             f"ratio={fmt(mem_ratio)} ({fmt(mem_a, 1)}/{fmt(mem_b, 1)})"),
+        gate("win_persisted_rate", cmp(lambda x: x >= 0.95, persisted),
+             f"persisted_compaction_rate({tn}) >= 0.95", f"rate={fmt(persisted)}"),
+        gate("win_latency", cmp(lambda x: x <= 20, med_lat),
+             f"median ask latency({tn}, incl. recall + keyword call) <= 20 s", f"median={fmt(med_lat, 1)} s"),
+    ]
+    fail_rules = [
+        gate("fail_score_bad", cmp(lambda p: p < -0.10, d_score.get("point")),
+             f"d_score({tn}-baseline) < -0.10", f"point={fmt(d_score.get('point'))}"),
+        gate("fail_anchor_bad", cmp(lambda p: p < -0.05, d_anchor.get("point")),
+             f"{al}({tn}-baseline) < -0.05", f"point={fmt(d_anchor.get('point'))}"),
+        gate("fail_halluc_bad", cmp(lambda p: p > -0.05, d_halluc.get("point")),
+             f"d_halluc({tn}-baseline) > -0.05", f"point={fmt(d_halluc.get('point'))}"),
+        gate("fail_dead_memory",
+             cmp(lambda ps, pa: abs(ps) < 0.05 and abs(pa) < 0.03,
+                 s_score.get("point"), s_anchor.get("point")),
+             f"dead memory: |d_score({tn}-nc-note-only)| < 0.05 AND |{al}| < 0.03",
+             f"score={fmt(s_score.get('point'))} anchor={fmt(s_anchor.get('point'))}"),
+        gate("fail_latency_bad", cmp(lambda x: x > 30, med_lat),
+             f"median ask latency({tn}, incl. recall + keyword call) > 30 s", f"median={fmt(med_lat, 1)} s"),
+        gate("fail_cost", cmp(lambda x: x > 3, cost_ratio),
+             f"cost per question({tn}, incl. keyword call) > 3x baseline",
+             f"ratio={fmt(cost_ratio)} ({fmt(c_nc, 5)}/{fmt(c_base, 5)}; "
+             f"source nc={','.join(src_nc) or 'n/a'} baseline={','.join(src_base) or 'n/a'})"),
+    ]
+
+    n_chains = deltas.get(nb, {}).get("chains", 0)
+    # power is counted in distinct SESSIONS whatever --cluster says: c0/c1 chains
+    # of one session share 2 of 3 spans and are not independent units
+    n_units = n_sessions if n_sessions is not None else n_chains
+    underpowered = n_units < MIN_CHAINS
+    failed = [g for g in fail_rules if g["ok"] is True]
+    fail_na = [g["name"] for g in fail_rules if g["ok"] is None]
+    win_na = [g["name"] for g in win_rules if g["ok"] is None]
+    all_win = all(g["ok"] is True for g in win_rules) and not fail_na
+    # An underpowered run (fewer than MIN_CHAINS sessions) is never given a
+    # directional label at all: neither WIN nor FAIL -- the cluster bootstrap has
+    # no power, so WIN/FAIL rules below are printed as diagnostics only.
+    if underpowered:
+        verdict = "INCONCLUSIVE"
+        why = (f"underpowered: {n_units} session(s) (< {MIN_CHAINS}) -> no WIN/FAIL "
+               f"verdict claimed; the rule tables below are diagnostics only")
+    elif failed:
+        verdict = "FAIL"
+        why = "FAIL fired: " + "; ".join(f"{g['name']} ({g['observed']})" for g in failed)
+    elif all_win:
+        verdict = "WIN"
+        why = "every WIN rule met, no FAIL rule fired, every FAIL rule evaluable"
+    else:
+        failed_win = [g["name"] for g in win_rules if g["ok"] is False]
+        verdict = "INCONCLUSIVE"
+        why = "not all WIN conditions met (" + ", ".join(
+            failed_win + [f"{n}=n/a" for n in win_na]
+            + [f"{n}=n/a (FAIL not excludable)" for n in fail_na]) + ")"
+    if warnings:
+        why += " | WARN: " + "; ".join(warnings)
+    return {"verdict": verdict, "why": why, "win_rules": win_rules,
+            "fail_rules": fail_rules, "n_chains": n_chains, "n_sessions": n_units,
+            "underpowered": underpowered, "anchor_metric": anchor_key,
+            "warnings": warnings,
+            "mem_token_ratio": mem_ratio, "cost_ratio": cost_ratio,
+            "median_latency_s": med_lat}
+
+
+# ------------------------------------------------- Amendment C: secondaries, sweep
+
+def boot_p_le(values_by_cluster: dict, theta0: float, n_boot: int = BOOT_N,
+              seed: int = SEED) -> float | None:
+    """One-sided cluster-bootstrap p-value for H0: delta <= theta0 (H1: delta > theta0):
+    (1 + #{bootstrap means <= theta0}) / (n_boot + 1), on the SAME resample matrix as the
+    CIs (so p <= 0.025 iff the 95% two-sided CI lower bound is above theta0, up to the
+    +1 smoothing)."""
+    vals = [values_by_cluster[c] for c in sorted(values_by_cluster)]
+    if not vals:
+        return None
+    idx = resample_indices(len(vals), n_boot, seed)
+    k = sum(1 for draw in idx if mean([vals[i] for i in draw]) <= theta0 + 1e-12)
+    return (1 + k) / (n_boot + 1)
+
+
+def holm_adjust(pvals: dict) -> dict:
+    """Holm step-down adjusted p-values over the FIXED family (n/a counts as p = 1:
+    the family size never shrinks because a cell is missing)."""
+    m = len(pvals)
+    order = sorted(pvals, key=lambda k: (1.0 if pvals[k] is None else pvals[k], k))
+    adj, running = {}, 0.0
+    for i, k in enumerate(order):
+        p = 1.0 if pvals[k] is None else pvals[k]
+        running = max(running, min(1.0, (m - i) * p))
+        adj[k] = None if pvals[k] is None else running
+    return adj
+
+
+def cell(recs: list[dict], arm: str, budget: int, qtypes=None) -> dict:
+    """qid -> record for one (arm, mem_budget) cell, optionally a question-type stratum."""
+    out = {}
+    for r in recs:
+        if r["arm"] == arm and r["mem_budget"] == budget and r["qid"] is not None:
+            if qtypes is None or (r.get("qtype") in qtypes):
+                out[r["qid"]] = r
+    return out
+
+
+def paired_cells(recs: list[dict], a: tuple, b: tuple, cluster: str = "session",
+                 n_boot: int = BOOT_N, seed: int = SEED, qtypes=None) -> dict:
+    """paired() between two (arm, budget) cells (possibly different budgets), via relabelled
+    copies so the cells never collide on (qid, arm)."""
+    synth = {}
+    ca, cb = cell(recs, a[0], a[1], qtypes), cell(recs, b[0], b[1], qtypes)
+    for tag, c in (("A", ca), ("B", cb)):
+        for qid, r in c.items():
+            synth[f"{qid}::{tag}"] = {**r, "arm": tag, "rid": f"{qid}::{tag}"}
+    out = paired(synth, "A", "B", cluster, n_boot, seed)
+    out["cells"] = {"A": list(a), "B": list(b)}
+    out["n_a"], out["n_b"] = len(ca), len(cb)
+    return out
+
+
+def h_graph_label(d_anchor: dict, d_score: dict) -> str:
+    """Descriptive label of the nc-graph - nc-chunks contrast (plan thresholds)."""
+    pa, la, ha = d_anchor.get("point"), d_anchor.get("ci_lo"), d_anchor.get("ci_hi")
+    ps, ls = d_score.get("point"), d_score.get("ci_lo")
+    if pa is None and ps is None:
+        return "n/a"
+    helps = ((pa is not None and la is not None and pa >= H_GRAPH_MIN_ANCHOR and la > 0)
+             or (ps is not None and ls is not None and ps >= 0.10 and ls > 0))
+    if helps:
+        return "graph helps"
+    if ha is not None and ha < 0:
+        return "graph harms"
+    if pa is not None and ps is not None and abs(pa) < 0.03 and abs(ps) < 0.05:
+        return "graph dead"
+    return "indeterminate"
+
+
+def secondary_family(recs: list[dict], anchor_key: str, cluster: str, n_boot: int,
+                     seed: int, n_sessions: int, primary_b: int = PRIMARY_B,
+                     track: str = "chains", ls_family: str = "full") -> dict:
+    """The pre-registered secondary family, Holm-corrected at one-sided ALPHA_ONE_SIDED.
+    All tests use cluster bootstrap over sessions and the SAME metric (clean_anchor_hit; raw
+    anchor_hit only on the loud fallback), except the non-inferiority tests, which are
+    intersection-union over anchor AND score (p = max of the two).
+
+    track "chains" (Amendment C + C.2): S1-S3 (m = 3); S4d/S5d are DESCRIPTIVE contrasts on the
+    xspan_locator stratum (the OpenHands "multihop" items) and never enter the correction.
+    track "longsession" (C.2): L1-L5 (m = 5), genuine multi-hop = multi_session_reasoning;
+    knowledge_update / temporal_reasoning / contradiction_resolution strata are descriptive.
+    ls_family "oh" (Amendment C.6-3a): the OpenHands track has no multi_session_reasoning items, so its
+    fixed family is L1-L3 (m = 3); L4/L5 are not computed."""
+    G, C, Bz = "nc-graph", "nc-chunks", "baseline"
+    tests: dict[str, dict] = {}
+    ls = track == "longsession"
+    msr = QT.GENUINE_MULTIHOP
+    # C.2: only ~10% of BEAM items carry a deterministic gold_anchor (and 1 of 70 multi_session_reasoning
+    # items), so the long-session family tests the rubric-graded judge SCORE (non-inferiority: the
+    # score leg only); the chain family keeps clean_anchor_hit
+    test_metric = "score" if ls else anchor_key
+
+    def sup(tid, desc, a, b, qtypes=None, metric=None, theta0=0.0):
+        metric = metric or test_metric
+        d = paired_cells(recs, a, b, cluster, n_boot, seed, qtypes)
+        m = d["metrics"].get(metric)
+        sc = d["metrics"].get("score")
+        tests[tid] = {
+            "id": tid, "kind": "superiority", "desc": desc, "contrast": f"{a[0]}@{a[1]} - {b[0]}@{b[1]}",
+            "metric": metric, "theta0": theta0,
+            "point": m and m["point"], "ci_lo": m and m["ci_lo"], "ci_hi": m and m["ci_hi"],
+            "n_clusters": m["n_chains"] if m else 0, "n_pairs": d["n_questions"],
+            "score_point": sc and sc["point"], "score_ci_lo": sc and sc["ci_lo"],
+            "p": boot_p_le(m["values"], theta0, n_boot, seed) if m else None,
+            "label": h_graph_label(d["metrics"].get(anchor_key, {}), d["metrics"].get("score", {}))
+            if tid in ("S1_graph_vs_chunks", "L1_graph_vs_chunks") else None,
+        }
+
+    def ni(tid, desc, a, b):
+        d = paired_cells(recs, a, b, cluster, n_boot, seed)
+        legs, ps = {}, []
+        legs_def = [("clean_anchor_hit" if anchor_key == "clean_anchor_hit"
+                     else "anchor_hit", NI_MARGIN_ANCHOR), ("score", NI_MARGIN_SCORE)]
+        if ls:
+            legs_def = legs_def[1:]
+        for metric, margin in legs_def:
+            m = d["metrics"].get(metric)
+            if not m:
+                legs[metric] = None
+                ps.append(None)
+                continue
+            p = boot_p_le(m["values"], -margin, n_boot, seed)
+            legs[metric] = {"point": m["point"], "ci_lo": m["ci_lo"], "margin": margin, "p": p}
+            ps.append(p)
+        tests[tid] = {
+            "id": tid, "kind": "non-inferiority", "desc": desc,
+            "contrast": f"{a[0]}@{a[1]} - {b[0]}@{b[1]}",
+            "legs": legs, "n_pairs": d["n_questions"],
+            "p": (None if any(x is None for x in ps) else max(ps)),
+            "margins": ({"score": NI_MARGIN_SCORE} if ls else
+                        {"anchor": NI_MARGIN_ANCHOR, "score": NI_MARGIN_SCORE}),
+        }
+
+    ids = (LS_SECONDARY_IDS[:3] if ls_family == "oh" else LS_SECONDARY_IDS) if ls else SECONDARY_IDS
+    p1 = ids[0]
+    sup(p1, "H-graph: nc-graph - nc-chunks, B=1536, anchor, H0 delta<=0",
+        (G, primary_b), (C, primary_b))
+    ni(ids[1], "token saving: nc-graph@1024 non-inferior to baseline@1536",
+       (G, 1024), (Bz, primary_b))
+    ni(ids[2], "token saving: nc-graph@512 non-inferior to baseline@1536",
+       (G, 512), (Bz, primary_b))
+    descriptive: list[str] = []
+    if ls and len(ids) == 5:
+        sup(ids[3], "genuine multi-hop (multi_session_reasoning): nc-graph - baseline, B=1536, anchor",
+            (G, primary_b), (Bz, primary_b), qtypes=msr)
+        sup(ids[4], "genuine multi-hop (multi_session_reasoning): nc-graph - nc-chunks, B=1536, anchor",
+            (G, primary_b), (C, primary_b), qtypes=msr)
+    if ls:
+        for qt in LS_DESCRIPTIVE_STRATA:
+            tid = f"D_{qt}_vs_baseline"
+            sup(tid, f"descriptive stratum {qt}: nc-graph - baseline, B=1536, anchor",
+                (G, primary_b), (Bz, primary_b), qtypes=(qt,))
+            descriptive.append(tid)
+    if not ls or ls_family == "oh":
+        sup(DESCRIPTIVE_IDS[0], "DESCRIPTIVE xspan_locator stratum (OpenHands 'multihop'): "
+            "nc-graph - baseline, B=1536, anchor", (G, primary_b), (Bz, primary_b),
+            qtypes=(QT.XSPAN_LOCATOR,))
+        sup(DESCRIPTIVE_IDS[1], "DESCRIPTIVE xspan_locator stratum: nc-graph - nc-chunks, B=1536, "
+            "anchor", (G, primary_b), (C, primary_b), qtypes=(QT.XSPAN_LOCATOR,))
+        descriptive += list(DESCRIPTIVE_IDS)
+    adj = holm_adjust({k: tests[k]["p"] for k in ids})
+    under = n_sessions < MIN_CHAINS
+    for k in ids:
+        t = tests[k]
+        t["p_holm"] = adj[k]
+        if t["p"] is None:
+            t["decision"] = "n/a (no data for this cell)"
+        elif under:
+            t["decision"] = f"INCONCLUSIVE (underpowered: {n_sessions} < {MIN_CHAINS} sessions)"
+        else:
+            t["decision"] = ("SUPPORTED" if adj[k] <= ALPHA_ONE_SIDED
+                             else "not supported")
+    for k in descriptive:
+        tests[k]["p_holm"] = None
+        tests[k]["decision"] = "descriptive (outside the Holm family; no inference claimed)"
+    return {"family": list(ids), "descriptive": descriptive, "track": track,
+            "alpha_one_sided": ALPHA_ONE_SIDED,
+            "correction": f"Holm step-down over the fixed family of {len(ids)}", "tests": tests,
+            "underpowered": under, "anchor_metric": anchor_key, "metric": test_metric}
+
+
+def secondary_family_enriched(recs: list[dict], anchor_key: str, cluster: str, n_boot: int, seed: int,
+                              n_sessions: int, primary_b: int = PRIMARY_B, track: str = "longsession") -> dict:
+    """Amendment C.7 secondary family (m = 2, Holm, one-sided alpha 0.025), cluster bootstrap over sessions, on the
+    judged SCORE of answerable items: E1 nc-enriched - nc-note-only (key secondary: does the recalled-fact block add
+    anything beyond the same note?), E2 nc-enriched - baseline (superiority; the PRIMARY contrast is the WIN/FAIL gate
+    table, this is its one-sided superiority companion). Strata (knowledge_update, temporal_reasoning,
+    contradiction_resolution, xspan_locator) are descriptive."""
+    T, N, Bz = ENRICHED_ARM, "nc-note-only", "baseline"
+    tests: dict[str, dict] = {}
+
+    def sup(tid, desc, a, b, qtypes=None, metric="score", theta0=0.0):
+        d = paired_cells(recs, a, b, cluster, n_boot, seed, qtypes)
+        m = d["metrics"].get(metric)
+        sc = d["metrics"].get("score")
+        tests[tid] = {"id": tid, "kind": "superiority", "desc": desc, "contrast": f"{a[0]}@{a[1]} - {b[0]}@{b[1]}",
+                      "metric": metric, "theta0": theta0, "point": m and m["point"], "ci_lo": m and m["ci_lo"],
+                      "ci_hi": m and m["ci_hi"], "n_clusters": m["n_chains"] if m else 0, "n_pairs": d["n_questions"],
+                      "score_point": sc and sc["point"], "score_ci_lo": sc and sc["ci_lo"],
+                      "p": boot_p_le(m["values"], theta0, n_boot, seed) if m else None, "label": None}
+
+    ids = LS_ENRICHED_IDS
+    sup(ids[0], "nc-enriched - nc-note-only, B=1536, score (the recalled facts beyond the same note)", (T, primary_b), (N, primary_b))
+    sup(ids[1], "nc-enriched - baseline, B=1536, score (superiority)", (T, primary_b), (Bz, primary_b))
+    descriptive: list[str] = []
+    for qt in LS_DESCRIPTIVE_STRATA + (QT.XSPAN_LOCATOR,):
+        tid = f"D_{qt}_vs_baseline"
+        sup(tid, f"descriptive stratum {qt}: nc-enriched - baseline, B=1536, score", (T, primary_b), (Bz, primary_b), qtypes=(qt,))
+        descriptive.append(tid)
+    adj = holm_adjust({k: tests[k]["p"] for k in ids})
+    under = n_sessions < MIN_CHAINS
+    for k in ids:
+        t = tests[k]
+        t["p_holm"] = adj[k]
+        t["decision"] = ("n/a (no data for this cell)" if t["p"] is None else
+                         f"INCONCLUSIVE (underpowered: {n_sessions} < {MIN_CHAINS} sessions)" if under else
+                         ("SUPPORTED" if adj[k] <= ALPHA_ONE_SIDED else "not supported"))
+    for k in descriptive:
+        tests[k]["p_holm"] = None
+        tests[k]["decision"] = "descriptive (outside the Holm family; no inference claimed)"
+    return {"family": list(ids), "descriptive": descriptive, "track": track, "alpha_one_sided": ALPHA_ONE_SIDED,
+            "correction": f"Holm step-down over the fixed family of {len(ids)}", "tests": tests, "underpowered": under,
+            "anchor_metric": anchor_key, "metric": "score", "regime": "C.7"}
+
+
+def enrich_diag(recs: list[dict], budget: int) -> dict:
+    """nc-enriched mechanism readout for one budget cell (descriptive): was the anchor retrieved, was it kept by the
+    budget, did the model use it?"""
+    g = [r for r in recs if r["arm"] == ENRICHED_ARM and r["mem_budget"] == budget]
+    if not g:
+        return {}
+    ans = [r for r in g if r["answerable"] is not False and r.get("gold_anchor")]
+
+    def rate(xs):
+        xs = [x for x in xs if x is not None]
+        return (sum(1 for x in xs if x) / len(xs)) if xs else None
+    hit_in = [r for r in ans if r.get("anchor_in_enriched")]
+    hit_out = [r for r in ans if r.get("anchor_in_enriched") is False]
+    return {"n": len(g), "n_anchored_answerable": len(ans),
+            "anchor_in_enriched_raw": rate([r.get("anchor_in_enriched_raw") for r in ans]),
+            "anchor_in_enriched_budgeted": rate([r.get("anchor_in_enriched") for r in ans]),
+            "p_hit_given_in_block": rate([r.get("anchor_hit") for r in hit_in]),
+            "p_hit_given_not_in_block": rate([r.get("anchor_hit") for r in hit_out]),
+            "keywords_rate": mean([r["enrich_keywords_rate"] for r in g if r.get("enrich_keywords_rate") is not None]),
+            "graph_branch_enabled_rate": mean([r["enrich_graph_branch_enabled_rate"] for r in g
+                                               if r.get("enrich_graph_branch_enabled_rate") is not None]),
+            "queries_mean": mean([r["enrich_queries"] for r in g if r.get("enrich_queries") is not None]),
+            "unique_chunks_mean": mean([r["enrich_chunks_unique"] for r in g if r.get("enrich_chunks_unique") is not None]),
+            "duplicates_removed_mean": mean([r["enrich_duplicates_removed"] for r in g
+                                             if r.get("enrich_duplicates_removed") is not None]),
+            "block_tokens_mean": mean([r["recall_packed_tokens"] for r in g if r.get("recall_packed_tokens") is not None]),
+            "rows_reused_from_old_run": sum(1 for r in recs if r.get("reused_from") and r["mem_budget"] == budget)}
+
+
+def graph_diag(recs: list[dict], budget: int) -> dict:
+    """nc-graph mechanism readout for one budget cell."""
+    g = [r for r in recs if r["arm"] == "nc-graph" and r["mem_budget"] == budget]
+    if not g:
+        return {}
+    ks = Counter(str(r.get("keyword_source")) for r in g)
+    st = Counter(str(r.get("session_graph_status")) for r in g)
+    ans = [r for r in g if r["answerable"] is not False]
+
+    def rate(xs):
+        xs = [x for x in xs if x is not None]
+        return (sum(1 for x in xs if x) / len(xs)) if xs else None
+
+    kg_only = [r for r in ans if r.get("anchor_in_kg_recall") and not r.get("anchor_in_chunk_recall")]
+    return {
+        "n": len(g), "keyword_source": dict(ks), "session_graph_status": dict(st),
+        "kg_empty_rate": rate([r.get("kg_empty") for r in g]),
+        "graph_not_exercised": (rate([r.get("kg_empty") for r in g]) or 0.0) > 0.30,
+        "anchor_in_recall": rate([r.get("anchor_in_recall") for r in ans]),
+        "anchor_in_kg_recall": rate([r.get("anchor_in_kg_recall") for r in ans]),
+        "anchor_in_chunk_recall": rate([r.get("anchor_in_chunk_recall") for r in ans]),
+        "anchor_only_in_kg": len(kg_only),
+        "p_hit_given_anchor_only_in_kg": rate([r.get("anchor_hit") for r in kg_only]),
+        "cost_estimated_rows": sum(1 for r in g if r.get("keyword_cost_estimated")),
+    }
+
+
+def budget_views(recs: list[dict], treat: str, legacy: bool, cluster: str, n_boot: int,
+                 seed: int, enriched: bool = False) -> dict:
+    """Per-budget analysis cells: arm summary, slices and paired deltas (always within the
+    same B). Gates are evaluated only on the primary cell by the caller."""
+    views = {}
+    for B in sorted({r["mem_budget"] for r in recs}, reverse=True):
+        rb = [r for r in recs if r["mem_budget"] == B]
+        final = {r["rid"]: r for r in rb}
+        present = {r["arm"] for r in rb}
+        pair_defs = [(treat, "baseline"), (treat, "nc-note-only"), ("baseline", "nc-note-only")]
+        if enriched:        # C.7: the question-time arms are descriptive side arms
+            pair_defs += [(treat, x) for x in EXPLORATORY_ARMS] + [(x, "baseline") for x in EXPLORATORY_ARMS]
+        elif not legacy:
+            pair_defs += [(treat, "nc-chunks"), ("nc-chunks", "baseline")]
+        if "orig" in present:       # descriptive side arm (real summary, long-session only)
+            pair_defs += [(treat, "orig"), ("baseline", "orig")]
+        deltas = {}
+        for a, b in pair_defs:
+            if a in present and b in present:
+                deltas[f"{a}-{b}"] = paired(final, a, b, cluster, n_boot, seed)
+        views[B] = {"records": rb, "summary": arm_summary(rb), "slices": slices(rb),
+                    "deltas": deltas}
+    return views
+
+
+# ------------------------------------------------------- long-session analysis (C.2)
+
+def lag_bucket(lag) -> str:
+    if lag is None:
+        return "n/a"
+    try:
+        v = int(lag)
+    except (TypeError, ValueError):
+        return "n/a"
+    for lo, hi, name in LS_LAG_BUCKETS:
+        if lo <= v <= hi:
+            return name
+    return "n/a"
+
+
+def _group_stats(rs: list[dict]) -> dict:
+    ans = [r for r in rs if r["answerable"] is not False]
+    return {"n": len(rs), "n_answerable": len(ans),
+            "score": mean([r["score"] for r in ans if r["score"] is not None]),
+            "anchor_hit": mean([float(r["anchor_hit"]) for r in ans if r["anchor_hit"] is not None]),
+            "clean_anchor_hit": mean([float(r["clean_anchor_hit"]) for r in ans
+                                      if r.get("clean_anchor_hit") is not None]),
+            "rubric_hit_frac": mean([r["rubric_hit_frac"] for r in ans
+                                     if r.get("rubric_hit_frac") is not None])}
+
+
+def longsession_views(recs: list[dict], treat: str, primary_b: int, cluster: str, n_boot: int,
+                      seed: int, enriched: bool = False) -> dict:
+    """Long-session readouts at the primary budget: strata by question type, lag buckets,
+    end-vs-mid checkpoints, checkpoint counts. Descriptive except where the family L4/L5 says
+    otherwise; `paired` deltas carry the same cluster-bootstrap CIs as everywhere."""
+    rb = [r for r in recs if r["mem_budget"] == primary_b]
+    arms = sorted({r["arm"] for r in rb})
+    pairs = ([(treat, "baseline"), (treat, "nc-note-only"), (treat, "nc-chunks"), (treat, "nc-graph")] if enriched
+             else [(treat, "baseline"), (treat, "nc-chunks"), ("nc-chunks", "baseline")])
+
+    def deltas_of(sub: list[dict]) -> dict:
+        final = {r["rid"]: r for r in sub}
+        present = {r["arm"] for r in sub}
+        return {f"{a}-{b}": paired(final, a, b, cluster, n_boot, seed)
+                for a, b in pairs if a in present and b in present}
+
+    out: dict = {"primary_b": primary_b, "arms": arms, "strata": {}, "lag": {}, "position": {}}
+    for qt in sorted({r.get("qtype") for r in rb if r.get("qtype")}):
+        sub = [r for r in rb if r.get("qtype") == qt]
+        out["strata"][qt] = {
+            "n_items": len({r["qid"] for r in sub if r["arm"] == treat}),
+            "n_sessions": len({r["cluster_session"] for r in sub}),
+            "per_arm": {a: _group_stats([r for r in sub if r["arm"] == a]) for a in arms},
+            "deltas": deltas_of(sub),
+            "declared": ("genuine multi-hop (L4/L5)" if qt in QT.GENUINE_MULTIHOP else
+                         "declared stratum (descriptive)" if qt in QT.DECLARED_STRATA else
+                         "descriptive")}
+    for _, _, name in LS_LAG_BUCKETS + ((None, None, "n/a"),):
+        sub = [r for r in rb if lag_bucket(r.get("lag")) == name]
+        if sub:
+            out["lag"][name] = {"per_arm": {a: _group_stats([r for r in sub if r["arm"] == a])
+                                            for a in arms},
+                                "deltas": deltas_of(sub)}
+    for name, sel in (("end", lambda r: r.get("is_end") is True),
+                      ("mid", lambda r: r.get("is_end") is False)):
+        sub = [r for r in rb if sel(r)]
+        if sub:
+            out["position"][name] = {"per_arm": {a: _group_stats([r for r in sub if r["arm"] == a])
+                                                 for a in arms},
+                                     "deltas": deltas_of(sub)}
+    base_ids = {r["base_qid"] for r in rb if r.get("base_qid")}
+    cps = Counter(r["base_qid"] for r in rb if r["arm"] == treat and r.get("base_qid"))
+    out["checkpoints"] = {"distinct_questions": len(base_ids),
+                          "questions_asked_at_multiple_checkpoints": sum(1 for v in cps.values() if v > 1),
+                          "treatment_rows": sum(cps.values())}
+    return out
+
+
+def render_longsession(ls: dict, treat: str, meta: dict) -> str:
+    L = ["## Long-session track (Amendment C.2)", ""]
+    L.append(f"analysis set: {meta.get('sid_filter') or 'all sessions in the records'} | "
+             f"sessions {meta['sessions']} | cluster unit: session (sid) | primary cell B={ls['primary_b']} | "
+             f"treatment {treat}. Questions asked at several checkpoints appear once per checkpoint "
+             f"(qid = <qid>@c<j>); a session's questions are averaged within the session first, so "
+             f"every session has equal weight. Checkpoints: {json.dumps(ls['checkpoints'])}.")
+    L.append("")
+    if "orig" in ls["arms"]:
+        L += ["`orig` (the session's own real summary) is a DESCRIPTIVE side arm: real boundaries, "
+              "reference B only, never part of an inference.", ""]
+    L.append("### Strata by question type (B=%d)" % ls["primary_b"])
+    L.append("")
+    rows = []
+    for qt, v in ls["strata"].items():
+        for arm in ls["arms"]:
+            g = v["per_arm"].get(arm)
+            if g and g["n"]:
+                rows.append([qt, v["declared"], arm, g["n"], fmt(g["score"]), fmt(g["clean_anchor_hit"]),
+                             fmt(g["anchor_hit"]), fmt(g["rubric_hit_frac"])])
+    L += table(["stratum", "status", "arm", "n", "score", "clean_anchor_hit", "anchor_hit (raw)",
+                "rubric proxy"], rows)
+    L.append("")
+    rows = []
+    for qt, v in ls["strata"].items():
+        for pair, d in v["deltas"].items():
+            for metric in ("score", "clean_anchor_hit", "anchor_hit"):
+                m = d["metrics"].get(metric)
+                if m:
+                    rows.append([qt, pair, metric, fmt(m["point"]), fmt(m["ci_lo"]), fmt(m["ci_hi"]),
+                                 m["n_chains"], d["n_questions"]])
+    L += table(["stratum", "pair (A-B)", "metric", "delta", "CI2.5", "CI97.5", "sessions", "paired q"], rows)
+    L.append("")
+    L.append("### By lag (boundaries between the oldest evidence and the ask; 0 = still in the tail)")
+    L.append("")
+    rows = []
+    for name, v in ls["lag"].items():
+        for arm in ls["arms"]:
+            g = v["per_arm"].get(arm)
+            if g and g["n"]:
+                rows.append([name, arm, g["n"], fmt(g["score"]), fmt(g["clean_anchor_hit"]),
+                             fmt(g["rubric_hit_frac"])])
+    L += table(["lag", "arm", "n", "score", "clean_anchor_hit", "rubric proxy"], rows)
+    L.append("")
+    rows = []
+    for name, v in ls["lag"].items():
+        d = v["deltas"].get(f"{treat}-baseline")
+        for metric in ("score", "clean_anchor_hit"):
+            m = d and d["metrics"].get(metric)
+            if m:
+                rows.append([name, f"{treat}-baseline", metric, fmt(m["point"]), fmt(m["ci_lo"]),
+                             fmt(m["ci_hi"]), m["n_chains"]])
+    L += table(["lag", "pair", "metric", "delta", "CI2.5", "CI97.5", "sessions"], rows)
+    L.append("")
+    L.append("### Checkpoint position (end = the final boundary, mid = earlier checkpoints)")
+    L.append("")
+    rows = []
+    for name, v in ls["position"].items():
+        for arm in ls["arms"]:
+            g = v["per_arm"].get(arm)
+            if g and g["n"]:
+                rows.append([name, arm, g["n"], fmt(g["score"]), fmt(g["clean_anchor_hit"]),
+                             fmt(g["rubric_hit_frac"])])
+    L += table(["position", "arm", "n", "score", "clean_anchor_hit", "rubric proxy"], rows)
+    L.append("")
+    return "\n".join(L) + "\n"
+
+
+def filter_sids(rows: list[dict], include: str, exclude: str) -> tuple[list[dict], dict]:
+    """Analysis-set selection by chain_id / sid regex (BEAM sizes and Claude Code sessions are
+    never pooled by accident). Applied BEFORE the validity filter."""
+    inc = re.compile(include) if include else None
+    exc = re.compile(exclude) if exclude else None
+    keep = []
+    for r in rows:
+        sid = str(pick(r, "chain_id") or pick(r, "session_id") or "")
+        if inc and not inc.search(sid):
+            continue
+        if exc and exc.search(sid):
+            continue
+        keep.append(r)
+    return keep, {"include": include or None, "exclude": exclude or None,
+                  "rows_in": len(rows), "rows_kept": len(keep)}
+
+
+# ---------------------------------------------------------------------- render
+
+def table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    out = ["| " + " | ".join(headers) + " |",
+           "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows:
+        out.append("| " + " | ".join(str(c).replace("|", "\\|") for c in r) + " |")
+    return out
+
+
+def judge_limitation_lines(meta: dict) -> list[str]:
+    """Report-header lines about judge independence (Amendment C.1): a same-family judge is a
+    stated limitation of every number; an unrecorded judge is flagged."""
+    L: list[str] = []
+    if meta.get("judge_same_family"):
+        L += ["> **LIMITATION - SAME-FAMILY JUDGE**: the judge "
+              f"`{meta.get('judge_model')}` is of the same model family as the agent side "
+              "(run with `--allow-same-family-judge`; the judge MODEL differs from the agent "
+              "model). Self-preference / shared-bias is NOT controlled, so every score, "
+              "hallucination and anchor-judged number below carries that limitation and the "
+              "verdict must be read as 'same-family judged'. "
+              f"Reason recorded: {meta.get('judge_same_family_reason') or 'n/a'}", ""]
+    elif meta.get("judge_same_family") is None and meta.get("judge_model") is None:
+        L += ["> judge independence not recorded (no `--mapping`): cannot state whether the "
+              "judge is cross-family.", ""]
+    return L
+
+
+def render(summary: dict, deltas: dict, slice_data: dict, gates: dict,
+           meta: dict, suspicious: list | None = None) -> str:
+    L = [f"# Chained-compaction metrics (v2)", ""]
+    if meta.get("legacy"):
+        L += ["> **LEGACY / EXPLORATORY**: no nc-graph rows. `nc` is chunk-RAG over the "
+              "compaction documents (M2) and, per Protocol Amendment C, is excluded from "
+              "the decision set.", ""]
+    if meta.get("enriched"):
+        L += ["> **Amendment C.7 (2026-10-28)**: the PRIMARY treatment is `nc-enriched` - facts recalled from HARS at "
+              "COMPACTION time (query + ll/hl keywords written by the summariser from the note and the kept recent "
+              "context, mode hybrid, server-default top_k, budget via the server's max_chars) folded into the "
+              "post-compaction context; NO memory access at ask time. Primary contrast: nc-enriched vs baseline "
+              "(plain summary of the same token budget). Key secondary: nc-enriched vs nc-note-only (the same note "
+              "without the recalled facts). `nc-chunks` / `nc-graph` (question-time recall) are EXPLORATORY: they were "
+              "run with a mis-specified call (no keywords, top_k=8, external packer), so they say nothing about the "
+              "memory used correctly.", ""]
+    L += judge_limitation_lines(meta)
+    L.append(f"analysis cell: mem_budget B={meta.get('primary_b')} (budgets present: "
+             f"{meta.get('budgets')}); treatment arm: {meta.get('treatment')}")
+    L.append("")
+    L.append(f"records: {meta['records']} | chains: {meta['chains']} | "
+             f"sessions: {meta['sessions']} | "
+             f"questions: {meta['questions']} | seed: {meta['seed']} | "
+             f"bootstrap: {meta['boot_n']} resamples over {meta['cluster']}s | "
+             f"memory-token ratio pair: {meta['mem_ratio_pair'][0]} / {meta['mem_ratio_pair'][1]} "
+             f"(run means) | anchor gates use: {gates['anchor_metric']}")
+    L.append("")
+    if meta.get("validity"):
+        L.append("## Data validity (rows with valid is True, complete arm triplets only)")
+        L.append("")
+        L += ["    " + x for x in validity_lines(meta["validity"])]
+        L.append("")
+    L.append(f"clean_anchor_hit = anchor_hit AND NOT primed_hit, where primed_hit marks a raw "
+             f"anchor hit whose gold anchor is absent from the arm's own visible_context "
+             f"(question-primed reconstruction). defined on {meta.get('ctx_records', 0)}/{meta['records']} "
+             f"records (needs --judge-input / visible_context); raw anchor_hit is kept alongside, "
+             f"labeled (raw).")
+    L.append("")
+    L.append("## Per-arm means")
+    L.append("")
+    rows = []
+    for arm in sorted(summary):
+        s = summary[arm]
+        rows.append([arm, s["n"], s["n_answerable"], s["n_unanswerable"],
+                     fmt(s["score"]), fmt(s["anchor_hit"]), fmt(s["clean_anchor_hit"]),
+                     s["primed_hits"], fmt(s["hallucination"]),
+                     fmt(s["abstained"]),
+                     fmt(s["abstain_on_unanswerable"]),
+                     fmt(s["latency_median"], 2),
+                     fmt(s["memory_tokens_median"], 0),
+                     fmt(s["persisted_compaction_rate"]),
+                     fmt(s["cost_per_question"], 5)])
+    L += table(["arm", "n", "n_ans", "n_unans", "score", "anchor_hit (raw)",
+                "clean_anchor_hit", "primed", "halluc",
+                "abstained", "abstain@UNANS", "lat_med_s", "mem_tok_med",
+                "persisted", "cost/q"], rows)
+    L.append("")
+    L.append("")
+    L.append("## Hallucination by answerability (judge verdict; k/n of items)")
+    L.append("")
+    rows = []
+    for arm in sorted(summary):
+        s_ = summary[arm]
+        hc = s_.get("halluc_counts") or {}
+        cell_ = lambda key, mean_: ("n/a" if not hc.get(key) or not hc[key][1]  # noqa: E731
+                                    else f"{fmt(mean_)} ({hc[key][0]:g}/{hc[key][1]})")
+        rows.append([arm, s_["n_answerable"], cell_("answerable", s_["hallucination_answerable"]),
+                     s_["n_unanswerable"], cell_("unanswerable", s_["hallucination_unanswerable"]),
+                     fmt(s_["abstain_on_unanswerable"])])
+    L += table(["arm", "n answerable", "halluc@ANSWERABLE", "n unanswerable", "halluc@UNANSWERABLE (false answers)",
+                "abstain@UNANS"], rows)
+    L.append("")
+    L.append("A hallucination on an answerable item is a wrong concrete answer; on an unanswerable probe it is any "
+             "non-abstaining answer. Paired deltas below: hallucination_answerable and false_answer (unanswerable).")
+    L.append("")
+    L.append("score / anchor_hit (raw) / clean_anchor_hit are answerable items only; "
+             "hallucination and abstained cover all items (abstain@UNANS is the "
+             "correct-abstention rate on the adversarial items). primed = answerable records "
+             "with primed_hit (raw hits not backed by the arm's visible context).")
+    L.append("")
+    L.append(f"## Paired per-question deltas (cluster bootstrap over {meta['cluster']}s)")
+    L.append("")
+    rows = []
+    for pair, d in deltas.items():
+        for metric, m in d["metrics"].items():
+            rows.append([pair, metric, fmt(m["point"]), fmt(m["ci_lo"]), fmt(m["ci_hi"]),
+                         m["n_chains"], fmt(m["wilcoxon_p"]), fmt(m["wilcoxon_W"], 1),
+                         m["wilcoxon_method"], d["n_questions"]])
+    L += table(["pair (A-B)", "metric", "delta", "CI2.5", "CI97.5", "chains",
+                "wilcoxon p", "W", "method", "paired q"], rows)
+    L.append("")
+    L.append("chains column = clusters with data for that metric; false_answer = "
+             "hallucination delta on the unanswerable probes only.")
+    L.append("")
+    L.append("## Slices")
+    L.append("")
+    rows = []
+    for arm in sorted(slice_data):
+        for key, v in slice_data[arm].items():
+            rows.append([arm, key, v["n"], fmt(v["score"]), fmt(v["anchor_hit"]),
+                         fmt(v["clean_anchor_hit"])])
+    L += table(["arm", "slice", "n", "score", "anchor_hit (raw)", "clean_anchor_hit"], rows)
+    L.append("")
+    suspicious = suspicious or []
+    if suspicious:
+        L.append("## Suspicious reconstruction (primed_hit, not hallucinated)")
+        L.append("")
+        rows = [[s["qid"], s["arm"], s["chain_id"], (s["anchor"] or "")[:48],
+                 fmt(s["hallucinated"])] for s in suspicious]
+        L += table(["qid", "arm", "chain", "gold_anchor", "hallucinated"], rows)
+        L.append("")
+        L.append("These raw anchor hits are flagged primed_hit: the gold anchor is absent "
+                 "from the arm's visible_context (C3 summary/note + injected recall + "
+                 "post-compaction messages), i.e. plausibly reconstructed from the "
+                 "question's own phrasing rather than recalled from memory.")
+        L.append("")
+    L.append("## Numeric gates")
+    L.append("")
+    L.append(f"**verdict: {gates['verdict']}** ({gates['why']})")
+    if gates["underpowered"]:
+        L.append("")
+        L.append(f"note: {gates['n_sessions']} sessions is below {MIN_CHAINS} -> the result is "
+                 "underpowered; no directional WIN/FAIL verdict is claimed "
+                 "(INCONCLUSIVE; the rule tables above are diagnostics only).")
+    L.append("")
+    st = {True: "PASS", False: "FAIL", None: "n/a"}
+    rows = [[g["name"], st[g["ok"]], g["rule"], g["observed"]]
+            for g in gates["win_rules"]]
+    L += table(["WIN rule", "status", "rule", "observed"], rows)
+    L.append("")
+    st = {True: "FIRED", False: "clear", None: "n/a"}
+    rows = [[g["name"], st[g["ok"]], g["rule"], g["observed"]]
+            for g in gates["fail_rules"]]
+    L += table(["FAIL rule", "status", "rule", "observed"], rows)
+    L.append("")
+    L.append(f"Verdict precedence: underpowered (< {MIN_CHAINS} distinct sessions) -> "
+             "INCONCLUSIVE, no directional label; else any FAIL rule fired -> FAIL; else all "
+             "WIN rules PASS and no FAIL rule n/a -> WIN; otherwise INCONCLUSIVE (never "
+             "reported as a directional win). n/a = input missing; it never counts as FAIL.")
+    return "\n".join(L) + "\n"
+
+
+def render_extra(views: dict, primary_b: int, sec: dict | None, diag: dict, treat: str,
+                 legacy: bool, meta: dict) -> str:
+    L = []
+    if len(views) > 1 or not legacy:
+        L.append("## Budget sweep (descriptive; the verdict above is B=%d only)" % primary_b)
+        L.append("")
+        rows = []
+        for B in sorted(views, reverse=True):
+            for arm, v in sorted(views[B]["summary"].items()):
+                rows.append([B, arm, v["n_answerable"], fmt(v["score"]),
+                             fmt(v["clean_anchor_hit"]), fmt(v["hallucination"]),
+                             fmt(v["abstain_on_unanswerable"]), fmt(v["memory_tokens_mean"], 0),
+                             fmt(v["latency_median"], 2), fmt(v["cost_per_question"], 5)])
+        L += table(["B", "arm", "n_ans", "score", "clean_anchor_hit", "halluc",
+                    "abstain@UNANS", "mem_tok_mean", "lat_med_s", "cost/q"], rows)
+        L.append("")
+        rows = []
+        for B in sorted(views, reverse=True):
+            for pair, d in views[B]["deltas"].items():
+                for metric in ("clean_anchor_hit", "anchor_hit", "score", "hallucination"):
+                    m = d["metrics"].get(metric)
+                    if m:
+                        rows.append([B, pair, metric, fmt(m["point"]), fmt(m["ci_lo"]),
+                                     fmt(m["ci_hi"]), m["n_chains"]])
+        L += table(["B", "pair (A-B, same B)", "metric", "delta", "CI2.5", "CI97.5",
+                    "sessions"], rows)
+        L.append("")
+    if sec:
+        L.append("## Secondary hypotheses (pre-registered family of %d, Holm-corrected%s)"
+                 % (len(sec["family"]), "; long-session track" if sec.get("track") == "longsession" else ""))
+        L.append("")
+        L.append(f"Cluster bootstrap over sessions; one-sided p for H0 delta <= theta0 "
+                 f"(non-inferiority: theta0 = -margin; intersection-union over anchor and "
+                 f"score, p = max); Holm step-down at one-sided alpha {sec['alpha_one_sided']} "
+                 f"(= the two-sided 95% CIs). A cell with no data counts as p = 1 in the "
+                 f"correction. Test metric: {sec.get('metric', sec['anchor_metric'])}. Margins: "
+                 + (f"score {NI_MARGIN_SCORE:.2f} only (long-session track)" if sec.get("track") == "longsession"
+                    else f"anchor {NI_MARGIN_ANCHOR:.2f}, score {NI_MARGIN_SCORE:.2f}") + ".")
+        L.append("")
+        rows = []
+        for tid in list(sec["family"]) + list(sec.get("descriptive") or []):
+            t = sec["tests"][tid]
+            if t["kind"] == "superiority":
+                obs = (f"d={fmt(t['point'])} CI[{fmt(t['ci_lo'])}, {fmt(t['ci_hi'])}] "
+                       f"score d={fmt(t['score_point'])}"
+                       + (f" | {t['label']}" if t.get("label") else ""))
+            else:
+                obs = "; ".join(
+                    f"{k}: d={fmt(v['point'])} lo={fmt(v['ci_lo'])} (margin -{v['margin']})"
+                    for k, v in t["legs"].items() if v) or "n/a"
+            rows.append([tid, t["contrast"], obs, fmt(t["p"], 4), fmt(t["p_holm"], 4),
+                         t["decision"]])
+        L += table(["id", "contrast", "observed", "p", "p_holm", "decision"], rows)
+        L.append("")
+    ed = meta.get("enrich_diag") or {}
+    if any(ed.values()):
+        L.append("## nc-enriched diagnostics (mechanism, descriptive)")
+        L.append("")
+        rows = []
+        for B in sorted(ed, reverse=True):
+            d = ed[B]
+            if d:
+                rows.append([B, d["n"], d["n_anchored_answerable"], fmt(d["anchor_in_enriched_raw"]),
+                             fmt(d["anchor_in_enriched_budgeted"]), fmt(d["p_hit_given_in_block"]),
+                             fmt(d["p_hit_given_not_in_block"]), fmt(d["keywords_rate"]),
+                             fmt(d["graph_branch_enabled_rate"]), fmt(d["queries_mean"], 1), fmt(d["unique_chunks_mean"], 1),
+                             fmt(d["duplicates_removed_mean"], 1), fmt(d["block_tokens_mean"], 0),
+                             d["rows_reused_from_old_run"]])
+        L += table(["B", "n", "n anchored", "anchor in raw recall", "anchor in budgeted block", "P(hit|in block)",
+                    "P(hit|not in block)", "keywords rate", "graph branch on", "queries", "unique chunks", "dups removed",
+                    "block tok", "rows reused (all arms)"], rows)
+        L.append("")
+    if diag and any(diag.values()):
+        L.append("## nc-graph diagnostics (mechanism, descriptive)")
+        L.append("")
+        rows = []
+        for B in sorted(diag, reverse=True):
+            d = diag[B]
+            if d:
+                rows.append([B, d["n"], json.dumps(d["keyword_source"]),
+                             json.dumps(d["session_graph_status"]), fmt(d["kg_empty_rate"]),
+                             "YES" if d["graph_not_exercised"] else "no",
+                             fmt(d["anchor_in_recall"]), fmt(d["anchor_in_kg_recall"]),
+                             fmt(d["anchor_in_chunk_recall"]), d["anchor_only_in_kg"],
+                             fmt(d["p_hit_given_anchor_only_in_kg"]),
+                             d["cost_estimated_rows"]])
+        L += table(["B", "n", "keyword_source", "status", "kg_empty_rate", "not exercised",
+                    "anchor_in_recall", "in KG", "in chunks", "KG-only n",
+                    "P(hit|KG-only)", "kw cost estimated rows"], rows)
+        L.append("")
+    xs = [r for r in views[primary_b]["records"]
+          if r.get("qtype") == QT.XSPAN_LOCATOR and r["arm"] == treat]
+    gm = [r for r in views[primary_b]["records"]
+          if r.get("qtype") in QT.GENUINE_MULTIHOP and r["arm"] == treat]
+    L.append(f"xspan_locator stratum at B={primary_b} (OpenHands items stored as 'multihop'; Amendment "
+             f"C.2: a locator in an old span + a fact in a newer one, NOT cross-compaction reasoning): "
+             f"{len(xs)} {treat} items ({len({r['cluster_session'] for r in xs})} sessions), "
+             f"descriptive only. Genuine multi-hop (multi_session_reasoning): {len(gm)} {treat} items "
+             f"({len({r['cluster_session'] for r in gm})} sessions).")
+    L.append("")
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------------- driver
+
+def main() -> int:
+    global QTYPE_LEGACY
+    saved = QTYPE_LEGACY
+    try:
+        return _main()
+    finally:
+        QTYPE_LEGACY = saved          # --legacy-qtypes must not leak into later in-process calls
+
+
+def _main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--records", nargs="+", required=True,
+                    help="runner records (jsonl / json list / glob)")
+    ap.add_argument("--judge", default="", help="judge_v2 output JSONL (joined on rid)")
+    ap.add_argument("--mapping", default="", help="judge_v2 mapping JSON (optional)")
+    ap.add_argument("--judge-input", dest="judge_input", default="",
+                    help="export_judge_input output (joined on rid; supplies "
+                         "visible_context for the deterministic primed_hit / "
+                         "clean_anchor_hit flags, and qtype when the records lack it)")
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                  "metrics_v2.md"))
+    ap.add_argument("--json", default="", help="also write the summary as JSON")
+    ap.add_argument("--boot", type=int, default=BOOT_N, help="bootstrap resamples")
+    ap.add_argument("--seed", type=int, default=SEED, help="bootstrap seed")
+    ap.add_argument("--cluster", choices=("session", "chain"), default="session",
+                    help="bootstrap cluster unit (default session: c0/c1 chains of one "
+                         "session share 2 of 3 spans); 'chain' is for comparison only -- "
+                         "the power check always counts distinct sessions")
+    ap.add_argument("--track", choices=("auto", "chains", "longsession"), default="auto",
+                    help="chains = run_chainreplay records; longsession = run_longsession records "
+                         "(auto: longsession when records carry base_qid)")
+    ap.add_argument("--ls-family", choices=("full", "oh"), default="full",
+                    help="long-session secondary family: full = L1-L5 (m = 5, BEAM / Claude Code); "
+                         "oh = L1-L3 (m = 3, Amendment C.6-3a: OpenHands has no multi_session_reasoning)")
+    ap.add_argument("--include-sid", default="", metavar="REGEX",
+                    help="analysis set: only chain_id/sid matching REGEX (e.g. '^beam-1M-')")
+    ap.add_argument("--exclude-sid", default="", metavar="REGEX")
+    ap.add_argument("--end-only", action="store_true",
+                    help="long-session: analyse only the END-checkpoint rows (C.2: the primary and "
+                         "the L-family use every question once per session; mid rows are exploratory)")
+    ap.add_argument("--legacy-qtypes", action="store_true",
+                    help="pre-C.2 reading: stored qtype 'multihop' stays 'multihop' (default: "
+                         "xspan_locator, see qtypes.py)")
+    ap.add_argument("--mem-ratio-arms", default="",
+                    help="arms whose run-mean memory_tokens form the realized mem-token "
+                         "ratio, 'treatment,baseline' (default: nc-graph,baseline; legacy "
+                         "3-arm runs: nc-chunks,baseline)")
+    args = ap.parse_args()
+
+    raw = []
+    for pat in args.records:
+        raw.extend(load_json_records(pat))
+    if not raw:
+        raise SystemExit("no records loaded")
+    global QTYPE_LEGACY
+    QTYPE_LEGACY = bool(args.legacy_qtypes)
+    track = args.track if args.track != "auto" else (
+        "longsession" if any("base_qid" in r for r in raw) else "chains")
+    raw, sid_filter = filter_sids(raw, args.include_sid, args.exclude_sid)
+    n_mid = 0
+    if args.end_only:
+        kept_end = [r for r in raw if not _CP_RE.search(str(pick(r, "qid")))
+                    and r.get("is_end") is not False]
+        n_mid, raw = len(raw) - len(kept_end), kept_end
+        print(f"[end-only] dropped {n_mid} mid-checkpoint row(s)", file=sys.stderr)
+    if not raw:
+        raise SystemExit(f"no records left after --include-sid/--exclude-sid {sid_filter}")
+    raw, validity = validate_rows(raw)
+    for line in validity_lines(validity):
+        print(f"[validity] {line}", file=sys.stderr)
+    if not raw:
+        raise SystemExit("no valid records left after the validity filter")
+    legacy = bool(validity.get("legacy_arm_set"))
+    enriched = bool(validity.get("enriched_arm_set"))
+    # attach visible_context (and a missing qtype) from the export file (joined on rid)
+    if args.judge_input:
+        ctx_by_rid, qtype_by_rid = {}, {}
+        for r in load_json_records(args.judge_input):
+            rid = r.get("rid") or f"{r.get('qid')}::{r.get('arm')}"
+            if isinstance(r.get("visible_context"), str) and r["visible_context"].strip():
+                ctx_by_rid[rid] = r["visible_context"]
+            if r.get("qtype"):
+                qtype_by_rid[rid] = r["qtype"]
+        joined = 0
+        for r in raw:
+            rid = r.get("rid") or f"{r.get('qid')}::{r.get('arm')}"
+            if rid in ctx_by_rid and not r.get("visible_context"):
+                r["visible_context"] = ctx_by_rid[rid]
+                joined += 1
+            if rid in qtype_by_rid and not r.get("qtype"):
+                r["qtype"] = qtype_by_rid[rid]
+        print(f"[judge-input] visible_context joined on rid: {joined}/{len(raw)} records")
+    records = [normalize(r) for r in raw]
+    judged = load_json_records(args.judge) if args.judge else []
+    mapping = json.load(open(args.mapping)) if args.mapping else None
+    merged = merge_judge(records, judged, mapping)
+    recs = list(merged.values())
+
+    arms_present = sorted({r["arm"] for r in recs})
+    for need in ("baseline", ENRICHED_ARM if enriched else "nc-chunks"):
+        if need not in arms_present:
+            raise SystemExit(f"arm '{need}' missing (have: {arms_present})")
+    treat = ENRICHED_ARM if enriched else ("nc-chunks" if legacy else "nc-graph")
+    views = budget_views(recs, treat, legacy, args.cluster, args.boot, args.seed, enriched)
+    primary_b = PRIMARY_B if PRIMARY_B in views else max(views)
+    pv = views[primary_b]
+    prec = pv["records"]
+    mem_pair = (tuple(canon_arm(x.strip()) for x in args.mem_ratio_arms.split(","))
+                if args.mem_ratio_arms else (treat, "baseline"))
+    # anchor gates use clean_anchor_hit (question-primed hits excluded) when it is
+    # defined on EVERY answerable record with an anchor verdict; partial coverage
+    # would drop exactly the hits, so it falls back to raw anchor_hit -- loudly.
+    warn = []
+    if legacy:
+        warn.append("LEGACY ARM SET (no nc-graph rows): nc-chunks is chunk-RAG over the "
+                    "compaction documents (M2); exploratory only, excluded from the decision "
+                    "set by Amendment C")
+    if primary_b != PRIMARY_B:
+        warn.append(f"no B={PRIMARY_B} cell: gates evaluated on B={primary_b} (not the "
+                    "pre-registered decision cell)")
+    undefined = sum(1 for r in prec if r["answerable"] is not False
+                    and r["anchor_hit"] is not None and r.get("clean_anchor_hit") is None)
+    anchor_key = "clean_anchor_hit"
+    if undefined:
+        anchor_key = "anchor_hit"
+        warn.append(f"clean_anchor_hit undefined on {undefined} answerable record(s) "
+                    f"(no visible_context; pass --judge-input) -> anchor gates FELL BACK "
+                    f"to raw anchor_hit (may count question-primed reconstructions)")
+        print(f"WARNING {warn[-1]}", file=sys.stderr)
+    n_sessions = len({r["cluster_session"] for r in prec})
+    gates = evaluate_gates(pv["deltas"], pv["summary"], pv["summary"], mem_pair, anchor_key,
+                           n_sessions, warn, treat=treat)
+    sec = None
+    if enriched:
+        sec = secondary_family_enriched(recs, anchor_key, args.cluster, args.boot, args.seed, n_sessions, primary_b, track)
+    elif not legacy:
+        sec = secondary_family(recs, anchor_key, args.cluster, args.boot, args.seed,
+                               n_sessions, primary_b, track, args.ls_family)
+    diag = {B: graph_diag(recs, B) for B in views} if not legacy else {}
+    ediag = {B: enrich_diag(recs, B) for B in views} if enriched else {}
+    suspicious = [
+        {"qid": r["qid"], "arm": r["arm"], "chain_id": r["chain_id"],
+         "anchor": r.get("gold_anchor") or "", "hallucinated": r["hallucination"]}
+        for r in prec
+        if r.get("primed_hit") is True and r["hallucination"] is not None
+        and not r["hallucination"]]
+    meta = {"records": len(prec), "chains": len({r["chain_id"] for r in prec}),
+            "sessions": n_sessions, "cluster": args.cluster, "seed": args.seed,
+            "questions": len({r["qid"] for r in prec}), "boot_n": args.boot,
+            "mem_ratio_pair": mem_pair, "validity": validity,
+            "ctx_records": sum(1 for r in prec if r.get("ctx_present")),
+            "judge_model": (mapping or {}).get("judge_model") or (mapping or {}).get("model"),
+            "judge_same_family": ((mapping or {}).get("judge_same_family")
+                                  if mapping and "judge_same_family" in mapping
+                                  else (True if any(j.get("judge_same_family") for j in judged)
+                                        else (False if judged and any("judge_same_family" in j
+                                                                      for j in judged) else None))),
+            "judge_same_family_reason": (mapping or {}).get("judge_same_family_reason"),
+            "treatment": treat, "primary_b": primary_b, "legacy": legacy, "enriched": enriched, "enrich_diag": ediag,
+            "budgets": sorted(views, reverse=True), "track": track,
+            "sid_filter": (f"include={sid_filter['include']} exclude={sid_filter['exclude']}"
+                           if (sid_filter["include"] or sid_filter["exclude"]) else None),
+            "end_only": bool(args.end_only), "mid_rows_dropped": n_mid,
+            "qtype_mapping": "legacy (stored labels)" if QTYPE_LEGACY else "C.2 (multihop -> xspan_locator)"}
+    md = render(pv["summary"], pv["deltas"], pv["slices"], gates, meta, suspicious)
+    md += "\n" + render_extra(views, primary_b, sec, diag, treat, legacy, meta)
+    ls_views = None
+    if track == "longsession" and not legacy:
+        ls_views = longsession_views(recs, treat, primary_b, args.cluster, args.boot, args.seed, enriched)
+        md += "\n" + render_longsession(ls_views, treat, meta)
+    print(md)
+    with open(args.out, "w") as w:
+        w.write(md)
+    if args.json:
+        json.dump({"meta": meta,
+                   "by_budget": {str(B): {"summary": v["summary"], "deltas": v["deltas"],
+                                          "slices": v["slices"]} for B, v in views.items()},
+                   "summary": pv["summary"], "deltas": pv["deltas"], "gates": gates,
+                   "slices": pv["slices"], "secondary": sec, "graph_diag": diag, "enrich_diag": ediag,
+                   "longsession": ls_views},
+                  open(args.json, "w"), indent=1, default=str)
+    print(f"\n[written] {args.out}" + (f" and {args.json}" if args.json else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

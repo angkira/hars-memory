@@ -9,9 +9,13 @@ Index path: extractor LLM (GPU) — gate with gpu_guard.assert_gpu_free() first.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import contextvars
 import logging
 import os
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Final
 
@@ -44,6 +48,93 @@ BYTE_FALLBACK_TOKEN_RATIO: Final[int] = 4
 #: process (provider-reported usage). Logged by the indexer at the end of a run
 #: so the real cost of a synchronous build can be compared with a Batch build.
 LLM_USAGE: Final[dict[str, int]] = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+
+
+#: Characters per token used ONLY when a provider response carries no ``usage`` object; such calls are flagged as
+#: estimated in ``ExtractUsage`` (never mixed silently with measured tokens).
+ESTIMATE_CHARS_PER_TOKEN: Final[float] = 3.6
+
+
+class ExtractUsage:
+    """Per-scope accumulator of extractor LLM usage (``make_llm_func`` calls), safe under concurrency.
+
+    Counted per successful completion: ``calls``; ``prompt_tokens`` / ``completion_tokens`` from the OpenAI-compatible
+    ``usage`` when present, otherwise an estimate from the text length (``ESTIMATE_CHARS_PER_TOKEN``) that is also
+    counted in ``estimated_*`` and flips ``estimated`` to true. A completion that raises (endpoint error, timeout) has
+    no usage and is not counted. Updates are lock-protected: LightRAG runs extraction calls from many tasks (and its
+    worker threads) at once.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.calls_estimated = 0
+        self.estimated_prompt_tokens = 0
+        self.estimated_completion_tokens = 0
+
+    def add(self, prompt_tokens: int, completion_tokens: int, *, estimated: bool) -> None:
+        with self._lock:
+            self.calls += 1
+            self.prompt_tokens += int(prompt_tokens)
+            self.completion_tokens += int(completion_tokens)
+            if estimated:
+                self.calls_estimated += 1
+                self.estimated_prompt_tokens += int(prompt_tokens)
+                self.estimated_completion_tokens += int(completion_tokens)
+
+    def to_dict(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "calls": self.calls,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.prompt_tokens + self.completion_tokens,
+                "calls_estimated": self.calls_estimated,
+                "estimated": self.calls_estimated > 0,
+                "estimated_prompt_tokens": self.estimated_prompt_tokens,
+                "estimated_completion_tokens": self.estimated_completion_tokens,
+            }
+
+
+_EXTRACT_USAGE: contextvars.ContextVar[ExtractUsage | None] = contextvars.ContextVar("hars_extract_usage", default=None)
+
+
+@contextlib.contextmanager
+def track_extract_usage() -> Iterator[ExtractUsage]:
+    """Count the extractor LLM usage of everything awaited inside the ``with`` block.
+
+    A context variable carries the accumulator, so concurrent ``track_extract_usage`` blocks (several inserts in one
+    server process) each see only their own calls: asyncio tasks created inside the block, and LightRAG's queued
+    worker calls (which run under the enqueuer's captured context), inherit it. Known limit: a document that
+    LightRAG queues behind ANOTHER insert's already-running pipeline of the same index is processed by that insert's
+    tasks and counted there; the sum over inserts stays right, and ``LLM_USAGE`` (process-global) is the cross-check.
+    """
+    acc = ExtractUsage()
+    token = _EXTRACT_USAGE.set(acc)
+    try:
+        yield acc
+    finally:
+        _EXTRACT_USAGE.reset(token)
+
+
+def _record_extract_usage(usage: object, messages: list[dict[str, str]], output_text: str) -> None:
+    """Add one completion to the active accumulator and the process-global counters."""
+    pt = getattr(usage, "prompt_tokens", None)
+    ct = getattr(usage, "completion_tokens", None)
+    estimated = pt is None or ct is None
+    if estimated:
+        prompt_chars = sum(len(str(m.get("content", ""))) for m in messages)
+        pt = max(1, round(prompt_chars / ESTIMATE_CHARS_PER_TOKEN)) if pt is None else pt
+        ct = max(0, round(len(output_text) / ESTIMATE_CHARS_PER_TOKEN)) if ct is None else ct
+    pt, ct = int(pt or 0), int(ct or 0)
+    LLM_USAGE["calls"] += 1
+    LLM_USAGE["prompt_tokens"] += pt
+    LLM_USAGE["completion_tokens"] += ct
+    acc = _EXTRACT_USAGE.get()
+    if acc is not None:
+        acc.add(pt, ct, estimated=estimated)
 
 #: Valid HARS_MEMORY_CHUNKER values (see create_lightrag).
 CHUNKER_MODES: Final[frozenset[str]] = frozenset({"token", "markdown", "md_struct"})
@@ -252,6 +343,13 @@ def make_llm_func(
     # the library's public API.  If chunks are still timing out under very heavy
     # load, lower HARS_MEMORY_MAX_PARALLEL_INSERT (default 2) to reduce contention.
     timeout_seconds = float(os.environ.get("HARS_MEMORY_LLM_TIMEOUT_SECONDS", "300"))
+    # The httpx timeout above is per socket operation (connect / each read), so
+    # an endpoint that accepts the request and then trickles or stalls
+    # keep-alives can hold one call forever. HARD is a total wall-clock cap per
+    # attempt (default 2x the per-op timeout); 0 disables it.
+    hard_timeout_seconds = float(
+        os.environ.get("HARS_MEMORY_LLM_HARD_TIMEOUT_SECONDS", str(2 * timeout_seconds))
+    )
 
     # Bounded retry/backoff for transient endpoint failures (see
     # _is_retryable_llm_error and the make_llm_func docstring above for why
@@ -287,6 +385,16 @@ def make_llm_func(
         stop_sequences = [
             part.strip() for part in _stop_env.split(",") if part.strip()
         ] or None
+
+    # HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS (1/true/yes/on; default off): leave
+    # ``temperature`` and ``top_p`` out of every request. Anthropic's
+    # OpenAI-compatible endpoint answers 400 for ``temperature`` on
+    # claude-haiku-5-5 / claude-sonnet-5-5. Applies to the configured value, to
+    # per-call values forwarded by LightRAG and to static extra_body entries.
+    omit_sampling_params = os.environ.get(
+        "HARS_MEMORY_LLM_OMIT_SAMPLING_PARAMS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    _SAMPLING_PARAMS = ("temperature", "top_p")
 
     # llama-server (llama.cpp) does not check bearer auth at all, but
     # create_openai_async_client falls back to os.environ["OPENAI_API_KEY"]
@@ -366,20 +474,34 @@ def make_llm_func(
             **{k: v for k, v in forwarded.items() if k not in _NAMED_PARAMS},
         }
 
+        request_kwargs: dict[str, object] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": call_max_tokens,
+            "stop": call_stop,
+        }
+        if omit_sampling_params:
+            extra_body = {k: v for k, v in extra_body.items() if k not in _SAMPLING_PARAMS}
+        else:
+            request_kwargs["temperature"] = call_temperature
+        request_kwargs["extra_body"] = extra_body or None
+
         async def _complete_once() -> str:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=call_max_tokens,
-                temperature=call_temperature,
-                stop=call_stop,
-                extra_body=extra_body or None,
-            )
+            try:
+                if hard_timeout_seconds > 0:
+                    response = await asyncio.wait_for(
+                        client.chat.completions.create(**request_kwargs),
+                        timeout=hard_timeout_seconds,
+                    )
+                else:
+                    response = await client.chat.completions.create(**request_kwargs)
+            except (asyncio.TimeoutError, TimeoutError):
+                raise RuntimeError(
+                    f"LLM call to '{model}' at {endpoint} exceeded the hard "
+                    f"{hard_timeout_seconds:.0f}s deadline (HARS_MEMORY_LLM_HARD_TIMEOUT_SECONDS)"
+                ) from None
             message = response.choices[0].message
             usage = getattr(response, "usage", None)
-            LLM_USAGE["calls"] += 1
-            LLM_USAGE["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
-            LLM_USAGE["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
             content = str(message.content or "")
             # Thinking models may leave content empty and put everything in
             # reasoning_content (server-side reasoning parsing), or emit
@@ -387,6 +509,9 @@ def make_llm_func(
             # OpenRouter names the same field ``reasoning``.
             reasoning_content = getattr(message, "reasoning_content", None) or getattr(
                 message, "reasoning", None
+            )
+            _record_extract_usage(
+                usage, messages, content + (str(reasoning_content) if reasoning_content and not content.strip() else "")
             )
             if not content.strip() and reasoning_content:
                 content = str(reasoning_content)
@@ -440,6 +565,86 @@ def resolve_chunker() -> str:
             f"expected one of {sorted(CHUNKER_MODES)}"
         )
     return chunker
+
+
+# ---------------------------------------------------------------------------
+# Per-instance namespace isolation inside ONE process.
+#
+# LightRAG keeps every storage's in-memory data in process-global shared
+# dicts keyed by "<workspace>:<namespace>" (lightrag.kg.shared_storage,
+# get_final_namespace). The workspace defaults to "" for every instance, so all
+# LightRAG instances of one server process (the default project, every other
+# project, split-session stores, session-graph readers) bound to the SAME
+# full_docs / text_chunks / doc_status / graph / vector dicts and the SAME
+# pipeline_status: the second instance does not even read its own files
+# (try_initialize_namespace returns False), it sees the first one's data, and
+# its flush writes that mixed data into its own directory. Symptoms: documents
+# of one project in another project's index; documents marked processed with
+# no graph built in their own project; an insert queued behind another
+# project's busy pipeline.
+#
+# Fix: every instance whose working dir is not the default index gets its own
+# workspace, unique per real directory. File-based storages put their files in
+# os.path.join(working_dir, workspace), so the instance gets
+# working_dir=<process link root> and workspace=<unique name>, where
+# <link root>/<unique name> is a symlink to the real index directory: the files
+# stay exactly where they always were, and no two directories can collide.
+# ---------------------------------------------------------------------------
+_LINK_ROOT_ENV = "HARS_MEMORY_WORKSPACE_LINK_ROOT"
+
+
+def _default_index_dir() -> str:
+    return os.path.realpath(os.path.expanduser(os.environ.get("HARS_MEMORY_INDEX_DIR", DEFAULT_WORKING_DIR)))
+
+
+def _workspace_link_root() -> str:
+    import tempfile
+
+    root = os.environ.get(_LINK_ROOT_ENV) or os.path.join(
+        tempfile.gettempdir(), f"hars-lightrag-workspaces-{os.getuid() if hasattr(os, 'getuid') else 'u'}"
+    )
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    return root
+
+
+def isolated_workspace(working_dir: str) -> tuple[str, str]:
+    """Return ``(lightrag_working_dir, workspace)`` for an index directory.
+
+    The default index keeps workspace ``""`` (unchanged namespace keys). An
+    operator-set ``WORKSPACE`` env var is respected as is.
+    """
+    if os.environ.get("WORKSPACE", "").strip():
+        return working_dir, os.environ["WORKSPACE"].strip()
+    real = os.path.realpath(os.path.expanduser(working_dir))
+    if real == _default_index_dir():
+        return working_dir, ""
+    import hashlib
+    import re as _re
+
+    base = _re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(real.rstrip(os.sep)) or "index").strip(".") or "index"
+    ws = f"{base[:48]}-{hashlib.sha1(real.encode()).hexdigest()[:12]}"
+    os.makedirs(real, exist_ok=True)
+    root = _workspace_link_root()
+    link = os.path.join(root, ws)
+    if os.path.realpath(link) != real:
+        tmp = f"{link}.{os.getpid()}.tmp"
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        os.symlink(real, tmp)
+        os.replace(tmp, link)          # atomic: concurrent creators agree on the same target
+    return root, ws
+
+
+def rag_index_dir(rag: object) -> str | None:
+    """The directory that actually holds *rag*'s files (``working_dir/workspace`` when a
+    workspace is set, see ``isolated_workspace``). Use this, never ``rag.working_dir``."""
+    wdir = getattr(rag, "working_dir", None)
+    if wdir is None:
+        return None
+    ws = getattr(rag, "workspace", "") or ""
+    return os.path.realpath(os.path.join(wdir, ws)) if isinstance(ws, str) and ws else wdir
 
 
 def create_lightrag(
@@ -574,7 +779,12 @@ def create_lightrag(
             os.environ["QDRANT_URL"] = _qdrant_url
         # QDRANT_WORKSPACE isolates data within a shared collection; map our
         # collection config to it so multi-tenant separation is preserved.
-        if not os.environ.get("QDRANT_WORKSPACE"):
+        # An EXPLICIT per-instance collection (multi-project server: registry.get_rag,
+        # subgraph compaction) must win over a value an earlier instance left in the
+        # process environment, otherwise every project after the first would read and
+        # write the first project's workspace. Without an explicit collection the
+        # operator's own QDRANT_WORKSPACE (or the env-derived default) is kept.
+        if qdrant_collection or not os.environ.get("QDRANT_WORKSPACE"):
             os.environ["QDRANT_WORKSPACE"] = _qdrant_coll
 
     Path(_wdir).mkdir(parents=True, exist_ok=True)
@@ -676,8 +886,10 @@ def create_lightrag(
                 "this Qdrant container (isolated only by workspace_id)."
             )
 
+    _lr_wdir, _workspace = isolated_workspace(_wdir)
     rag = LightRAG(
-        working_dir=_wdir,
+        working_dir=_lr_wdir,
+        workspace=_workspace,
         vector_storage=_vector_storage,
         graph_storage=_graph_storage,
         tokenizer=Tokenizer(_tokenizer_name, _tokenizer_impl),

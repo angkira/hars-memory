@@ -16,7 +16,6 @@ Usage: python gpu_smoke_test.py --mode fp8 [--seq-len 4096]
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import os
 import sys

@@ -159,7 +159,14 @@ local answer LLM entirely), `context_priority` (`lightrag`|`merged`, default
 omitting both silently falls back to `naive` mode. The response always
 includes a top-level `hybrid` block (additive dense+BM25 fusion,
 `identifier_matches` for exact codes/ids, and a `confidence.low_confidence`
-marker — check that before treating results as reliable).
+marker — check that before treating results as reliable). `max_chars` (int,
+optional — hard budget on the rendered context; omit for the server default
+15K). **Size it to the corpus, not to politeness:** the server often finds
+36-46K chars of relevant material and the cap silently cuts it. Measured on a
+91K-entity standing KB: recall at `max_chars=6000` delivered 0.17 accuracy /
+63% honest abstain; the SAME queries at `max_chars=32000` delivered 0.42
+accuracy / 25% abstain (answerer + judge unchanged). 6K is a tight session-eval
+budget, not a recommendation — for standing project KBs pass 16-32K.
 
 ```json
 {"question": "What broke the Qdrant migration?",

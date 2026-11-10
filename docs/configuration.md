@@ -76,6 +76,27 @@ Timeout, retries and concurrency reuse `HARS_MEMORY_LLM_TIMEOUT_SECONDS`, `HARS_
 | `HARS_MEMORY_BM25_INDEX_PATH` | — | Path to BM25 sparse index. Auto-detected under `HARS_MEMORY_INDEX_DIR` if unset |
 | `HARS_MEMORY_BM25_INDEX_ID` | — | BM25 index identifier for multi-tenant BM25. Defaults to `default` |
 
+## Session compaction memory
+
+Agent sessions persist every compaction (summary + dropped-context facts) through
+`memory_compact`. In `split` mode each session writes to its own LightRAG working
+directory and is consolidated into the main index later by `memory_merge_session`;
+`subgraph` mode indexes compactions straight into the main graph. See
+`docs/mcp-reference.md` for the tools.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HARS_MEMORY_SESSION_MODE` | `split` | `split` (per-session isolated working dir, merged on demand) or `subgraph` (ingest compactions directly into the main graph) |
+| `HARS_MEMORY_SESSION_GRAPH` | off | Default for `memory_recall`'s `session_graph` flag (`1`/`true`/`on`/`yes` = on). A per-call `session_graph` always wins. Off keeps the recall payload byte-identical |
+| `HARS_MEMORY_SESSION_GRAPH_KEYWORD_TIMEOUT_SECONDS` | `30` | Timeout of the single extractor-model keyword call (no caller keywords); on failure/timeout the question text is used and `keyword_source` is `question_fallback` |
+| `HARS_MEMORY_SESSIONS_DIR` | `<HARS_MEMORY_INDEX_DIR>/sessions` | Root directory holding one sub-directory per session id (split mode). Session ids are validated against `[A-Za-z0-9._-]{1,128}` |
+| `HARS_MEMORY_SESSION_INDEX_BS` | `25` | Documents per ingest batch for compaction indexing, clamped to `1..256`. Also used as the session embedding batch size |
+| `HARS_MEMORY_SESSION_MIN_SCORE` | `0.2` | `memory_recall` session-channel cutoff: chunks scoring below this (max of cosine and lexical F1) are dropped |
+
+Split-mode session ingests always force `NanoVectorDBStorage` + `NetworkXStorage`
+for the session directory, even when the main index uses Qdrant, so session data
+can never collide with the main collections.
+
 ## Indexing
 
 | Variable | Default | Description |

@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import sys
 
-import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import load_jsonl, dump_jsonl
 
